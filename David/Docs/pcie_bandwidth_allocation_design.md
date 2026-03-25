@@ -1,0 +1,215 @@
+# PCIe Bandwidth Allocation Design
+
+## The Contention
+
+Both weight offloading and attention offloading use a three-way split (f_gpu, f_prefetch, f_cpu). The f_gpu and f_cpu components are **orthogonal** — they use GPU memory and CPU compute respectively, with no PCIe contention. Only f_prefetch competes:
+
+```
+Orthogonal (no contention):
+  f_gpu_weight   ↔  f_gpu_kv      : both use GPU memory, no PCIe
+  f_cpu_weight   ↔  f_cpu_kv      : both use CPU compute, no PCIe
+
+Contention (shared resource):
+  f_prefetch_weight  ↔  f_prefetch_kv  : both need PCIe H2D (22 GB/s on RTX 4090)
+```
+
+The question: how should the limited PCIe H2D bandwidth be allocated between weight prefetch and KV prefetch?
+
+---
+
+## Key Insight: Prefetch Serves Different Purposes at Different Scales
+
+Prefetch can replace two different components, depending on what's available:
+
+**Replaces f_gpu** (takes from permanent GPU storage): 1 MB prefetched = 1 MB of GPU memory freed. The freed memory is fungible — available for KV cache (more beams). This applies to both weight and KV prefetch equally: **at the memory level, they are equivalent**.
+
+**Replaces f_cpu** (takes from CPU compute): no GPU memory is freed. The benefit is **latency reduction** — work moves from the slow CPU path to fast GPU compute via streaming. Here, weight and KV prefetch are **not equivalent**: weight prefetch reduces per-layer latency unconditionally (every step, every layer), while KV prefetch only helps when CPU attention is already the bottleneck.
+
+Which replacement happens depends on the model size — and in both cases, weight prefetch is preferred.
+
+---
+
+## Weight Prefetch by Model Size
+
+### Small model (weights mostly fit on GPU)
+
+Prefetch **replaces f_gpu** — moves weight from permanent GPU storage to on-demand streaming. GPU still computes it, but the permanent memory is freed for KV.
+
+```
+f_gpu: 90% → 80%  (freed 10% of weight memory → more KV → more beams)
+f_prefetch: 0% → 10%  (still computed on GPU, just not permanently stored)
+f_cpu: 10% → 10%  (unchanged, layer time similar)
+```
+
+Purpose: **free GPU memory for KV**. Layer time barely changes (GPU still computes the prefetched portion). The gain is more beams.
+
+### Large model (weights don't fit on GPU)
+
+Prefetch **replaces f_cpu** — moves weight from slow CPU compute to fast GPU compute via streaming. f_gpu can't increase (no room), so no GPU memory is freed.
+
+```
+f_gpu: 30% → 30%  (unchanged, can't increase — no room)
+f_prefetch: 0% → 10%  (shifted from CPU to GPU compute)
+f_cpu: 70% → 60%  (less CPU bottleneck → faster layers)
+```
+
+Purpose: **reduce latency**. GPU memory is unchanged, but each layer is faster because less work falls on the slow CPU path. This compounds over every decode step across every layer.
+
+### Summary
+
+| | Small model | Large model |
+|---|---|---|
+| Prefetch replaces | f_gpu | f_cpu |
+| What's gained | GPU memory (→ more KV) | Faster layers (→ less CPU bottleneck) |
+| What's unchanged | Layer time (~same) | GPU memory (~same) |
+
+---
+
+## Why Weight Prefetch Over KV Prefetch
+
+### 1. Batch size is our control variable
+
+The f_cpu_kv bottleneck (CPU suffix attention) scales with B × S. But batch size B is **our choice** — if CPU attention becomes too slow, we reduce B (more scheduling rounds, each faster). The bottleneck is not a hard constraint; it's a dial we control.
+
+Weight f_cpu penalty, on the other hand, hits **every decode step regardless of batch size**. There is no knob to dial it away.
+
+### 2. KV prefetch cannot match weight prefetch at either scale
+
+- **Small models**: KV prefetch frees GPU KV space, but so does weight prefetch (freed weight memory → KV space). Both achieve the same goal. But weight prefetch doesn't increase CPU attention load, while KV prefetch provides no additional benefit over weight prefetch.
+- **Large models**: KV prefetch frees KV space, enabling larger batch — but larger batch increases f_cpu_kv load, worsening the CPU attention bottleneck. Weight prefetch directly attacks the latency problem without this feedback loop.
+
+### 3. Weight offloading is often mandatory; KV prefetch is always optional
+
+For models that don't fit on GPU (14B+), weight offloading is a **necessity to run at all**. PCIe for weight prefetch reduces the latency penalty of this mandatory offloading.
+
+KV prefetch is never mandatory — suffix KV can always fall back to f_cpu_kv (CPU attention), with batch size as the release valve.
+
+| Model | Total weight | Fits on 24 GB GPU? | Weight offloading |
+|---|---|---|---|
+| 7B | 13.0 GB | Yes | Optional |
+| 14B | 26.5 GB | No | Mandatory |
+| 32B | 62.4 GB | No | Mandatory (massive) |
+
+### 4. Weight prefetch benefit is universal; KV prefetch is situational
+
+- **Weight prefetch**: benefits every decode step from step 1, regardless of batch size or suffix length
+- **KV prefetch**: only matters when suffix is long enough AND batch is large enough that CPU attention is the bottleneck. Early in generation (short suffix), CPU attention is cheap — KV prefetch provides no benefit
+
+---
+
+## Design Decision: No KV Prefetch
+
+**All PCIe H2D bandwidth is allocated to weight prefetch. Suffix KV uses f_cpu_kv (CPU attention) exclusively.**
+
+The attention split simplifies to:
+- **GPU**: prefix attention (f_gpu_kv, always GPU-resident)
+- **CPU**: suffix attention (f_cpu_kv, computed on CPU in parallel)
+- **Merge**: online softmax via `merge_attn_states` (exact, no approximation)
+
+### What this eliminates
+
+- No KV prefetch scheduling (per-step decisions about which blocks to transfer)
+- No per-slot weight-vs-KV PCIe assignment
+- No GPU buffer for prefetched suffix KV
+- No split block table management (GPU-resident vs CPU-resident suffix blocks)
+
+### What remains
+
+- Weight three-way split (f_gpu, f_prefetch, f_cpu) with full PCIe for prefetch pipeline
+- CPU suffix attention with batch size as the release valve for CPU bottleneck
+- GPU prefix attention (unchanged from existing cascade pattern)
+
+---
+
+## Prefetch Distance
+
+Partition granularity (see `weight_offload_design.md`) determines **how** weights are split. Prefetch distance determines **when** prefetched data is transferred. These are two independent dimensions of the PCIe scheduling design.
+
+### The Spectrum
+
+| Prefetch distance | Hiding time | What's happening |
+|---|---|---|
+| **Tensor-ahead** | Preceding tensor's compute | Prefetch next tensor during current tensor's compute |
+| **Layer-ahead** | 1 full layer's compute | Prefetch next layer during current layer's compute |
+| **Multi-layer-ahead (K)** | K layers' compute | Prefetch K layers in advance (vLLM: K = G−1) |
+
+Longer prefetch distance = more hiding time = can prefetch more data. But also = larger buffer (must hold prefetched data until consumed).
+
+### Constraint: Partition Limits Minimum Prefetch Distance
+
+Coarser partition forces longer minimum prefetch distance — you can't start consuming a unit until the entire unit has arrived:
+
+| Partition | Minimum prefetch distance | Why |
+|---|---|---|
+| Group | Multi-layer-ahead | Entire layer is the unit — must arrive before layer executes. Need (G−1) layers of hiding. |
+| Layer | Layer-ahead | Whole tensors are the unit — all CPU-placed tensors must arrive before layer starts. Could also do tensor-ahead if tensors are executed individually. |
+| Tensor | Tensor-ahead | Column slices are the unit — only need to arrive before that tensor's compute. |
+
+**Finer partition enables shorter prefetch distance, but doesn't require it.** You can always prefetch farther ahead than the minimum.
+
+### Combinations Used by Each System
+
+| System | Partition | Prefetch distance |
+|---|---|---|
+| vLLM PrefetchOffloader | Group | Multi-layer-ahead (G−1 layers) |
+| FlexGen | Layer | Layer-ahead |
+| **Ours** | Tensor | Tensor-ahead **or** layer-ahead **or** multi-layer-ahead |
+
+### Tensor Partition: Prefetch Distance Options
+
+#### Option A: Tensor-Ahead
+
+Prefetch next tensor's f_prefetch during current tensor's compute.
+
+```
+Layer N:
+GPU :  WQKV compute → (QK^T)V attn  → WO compute   → MLP1 compute  → MLP2 compute
+PCIe:  (idle)       → WO prefetch   → MLP1 prefetch → MLP2 prefetch → WQKV prefetch (N+1)
+CPU :  WQKV compute → (QK^T)V attn  → WO compute   → MLP1 compute  → MLP2 compute
+```
+
+- **Per-tensor budget**: f_prefetch_i × W_i ≤ preceding_phase_time × PCIe_BW
+- **Buffer**: max(f_prefetch_i × W_i) — reused between phases
+- **Bottleneck**: WO phase is tiny (0.018 ms) → MLP1 gets almost no prefetch budget (~0.4 MB). Forces self-bootstrapping: MLP1 mostly f_cpu → long phase → MLP2 gets large budget.
+
+#### Option B: Layer-Ahead
+
+Prefetch ALL of next layer's f_prefetch portions during entire current layer's compute.
+
+```
+Layer N:   GPU+CPU compute all 5 phases │ PCIe: prefetch layer N+1's f_prefetch (all tensors)
+Layer N+1: GPU+CPU compute (uses prefetched) │ PCIe: prefetch layer N+2's f_prefetch
+```
+
+- **Global budget**: sum(f_prefetch_i × W_i) ≤ layer_time × PCIe_BW
+- **Buffer**: sum(f_prefetch_i × W_i) — all must be resident when layer starts
+- **No per-tensor bottleneck**: MLP1 can get meaningful f_prefetch because the budget is shared across the full layer time, not gated by WO's tiny phase.
+
+#### Option C: Multi-Layer-Ahead (K layers)
+
+Same as layer-ahead but start K layers in advance.
+
+- **Budget**: sum(f_prefetch_i × W_i) ≤ K × layer_time × PCIe_BW
+- **Buffer**: sum(f_prefetch_i × W_i) × num_buffer_slots (vLLM's `prefetch_step` concept)
+- **Use case**: when even 1 layer's compute time isn't enough to prefetch the desired f_prefetch.
+
+### Prefetch Distance Comparison (Tensor Partition, Qwen2.5-7B)
+
+| | Tensor-ahead | Layer-ahead | 2-layer-ahead |
+|---|---|---|---|
+| PCIe budget | Per-phase (0.018–3.34 ms × 22 GB/s) | Full layer (0.72–5 ms × 22 GB/s) | 2× layer time × 22 GB/s |
+| MLP1 f_prefetch | ~0% (WO too short) | Meaningful (global budget) | Large |
+| Buffer size | max(f_prefetch_i × W_i) | sum(f_prefetch_i × W_i) | sum × 2 |
+| Per-tensor bottleneck | Yes (WO→MLP1) | No | No |
+| Scheduling | Per-phase events | Per-layer overlap | Per-layer + prefetch_step |
+
+---
+
+## Summary
+
+1. **Prefetch serves different purposes by scale**: replaces f_gpu (frees memory) for small models; replaces f_cpu (reduces latency) for large models
+2. **Weight prefetch wins at both scales**: when replacing f_gpu, weight and KV prefetch are equivalent — but weight is simpler. When replacing f_cpu, weight prefetch is strictly better (unconditional latency reduction vs situational)
+3. **KV prefetch has no regime where it's preferred**: at best equivalent (small models), at worst inferior (large models)
+4. **Batch size controls f_cpu_kv cost** — CPU attention bottleneck is a dial, not a wall
+5. **Design simplification**: all PCIe → weight prefetch. Suffix attention → CPU only. Merge via online softmax.
+6. **Prefetch distance is independent of partition granularity**: tensor partition can use tensor-ahead (small buffer, per-tensor bottleneck), layer-ahead (larger buffer, no bottleneck), or multi-layer-ahead (largest buffer, most hiding time). Coarser partition forces longer minimum distance.

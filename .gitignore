@@ -1,0 +1,33 @@
+# Reference framework clones (nested git repos)
+Offloading_Frameworks/
+Locality_aware_Beam_Scheduling/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.eggs/
+*.so
+*.o
+build/
+dist/
+
+# Model files
+*.ckpt
+*.bin
+*.safetensors
+
+# Environment / secrets
+.env
+.env.*
+
+# Logs
+*.log
+wandb/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

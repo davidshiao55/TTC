@@ -1,0 +1,134 @@
+#!/usr/bin/env python
+# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from setuptools import setup, find_packages
+
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
+setup(
+    name="fasttts",
+    version="0.1.0",
+    author="FastTTS Team",
+    author_email="fasttts@example.com",
+    description="Fast Test Time Search with async generator and verifier models",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
+    url="https://github.com/example/fasttts",
+    packages=find_packages(),
+    classifiers=[
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: Developers",
+        "Intended Audience :: Science/Research",
+        "License :: OSI Approved :: Apache Software License",
+        "Operating System :: OS Independent",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+        "Topic :: Software Development :: Libraries :: Python Modules",
+    ],
+    python_requires=">=3.8",
+    install_requires=[
+        "torch==2.7.0",
+        "vllm==0.9.2",
+        "transformers==4.53.0",
+        "numpy==2.2.6",
+        "tqdm==4.67.1",
+        "datasets==3.6.0",
+        "accelerate==1.8.1",
+        "safetensors==0.5.3",
+        "tokenizers==0.21.2",
+        "protobuf==5.29.5",
+        "requests==2.32.4",
+        "huggingface-hub==0.33.1",
+        "fastapi==0.115.14",
+        "uvicorn==0.34.3",
+        "ray==2.47.1",
+        "psutil==7.0.0",
+        "rich==14.0.0",
+        "typer==0.16.0",
+        "python-dotenv==1.1.1",
+        "python-json-logger==3.3.0",
+        "prometheus-client==0.22.1",
+        "prometheus-fastapi-instrumentator==7.1.0",
+        "opentelemetry-api==1.34.1",
+        "opentelemetry-sdk==1.34.1",
+        "watchfiles==1.1.0",
+        "websockets==15.0.1",
+        "uvloop==0.21.0",
+        "httpx==0.28.1",
+        "aiohttp==3.12.13",
+        "msgspec==0.19.0",
+        "msgpack==1.1.1",
+        "xxhash==3.5.0",
+        "fastrlock==0.8.3",
+        "einops==0.8.1",
+        "xformers==0.0.30",
+        "triton==3.3.0",
+        "numba==0.61.2",
+        "llvmlite==0.44.0",
+        "pycuda==2025.1.1",
+        "cupy-cuda12x==13.4.1",
+        "compressed-tensors==0.10.2",
+        "depyf==0.18.0",
+        "cloudpickle==3.1.1",
+        "dill==0.3.8",
+        "diskcache==5.6.3",
+        "multiprocess==0.70.16",
+        "pebble==5.1.1",
+        "py-cpuinfo==9.0.0",
+        "pyarrow==20.0.0",
+        "pybase64==1.4.1",
+        "pycountry==24.6.1",
+        "pytools==2025.2.1",
+        "pytz==2025.2",
+        "pyyaml==6.0.2",
+        "pyzmq==27.0.0",
+        "referencing==0.36.2",
+        "regex==2024.11.6",
+        "rpds-py==0.25.1",
+        "scipy==1.16.0",
+        "sentencepiece==0.2.0",
+        "shellingham==1.5.4",
+        "siphash24==1.7",
+        "sniffio==1.3.1",
+        "starlette==0.46.2",
+        "sympy==1.14.0",
+        "tiktoken==0.9.0",
+        "typing-inspection==0.4.1",
+        "tzdata==2025.2",
+        "urllib3==2.5.0",
+        "yarl==1.20.1",
+        "zipp==3.23.0",
+    ],
+    extras_require={
+        "dev": [
+            "pytest==7.0.0",
+            "pytest-asyncio==0.21.0",
+            "black==22.0.0",
+            "isort==5.0.0",
+            "flake8==5.0.0",
+            "mypy==1.0.0",
+        ],
+    },
+    entry_points={
+        "console_scripts": [
+            "fasttts=FastTTS.example:main",
+        ],
+    },
+) 
