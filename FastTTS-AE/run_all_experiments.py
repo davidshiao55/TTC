@@ -67,7 +67,7 @@ def run_experiments(data_dir: Path):
                     # Override output_dir via environment or modify config dynamically
                     output_dir = data_dir / combo / dataset / method
                     output_dir.mkdir(parents=True, exist_ok=True)
-                    cmd = ["python", "run_benchmarks.py", config_path]
+                    cmd = [sys.executable, "run_benchmarks.py", config_path]
                     env = os.environ.copy()
                     env["BENCHMARK_OUTPUT_DIR"] = str(output_dir)
                     try:

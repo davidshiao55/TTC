@@ -28,6 +28,7 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/example/fasttts",
     packages=find_packages(),
+    py_modules=["fasttts", "core", "config"],
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
@@ -48,6 +49,8 @@ setup(
         "vllm==0.9.2",
         "transformers==4.53.0",
         "numpy==2.2.6",
+        "matplotlib==3.10.3",
+        "seaborn",
         "tqdm==4.67.1",
         "datasets==3.6.0",
         "accelerate==1.8.1",
