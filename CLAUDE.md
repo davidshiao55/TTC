@@ -24,8 +24,8 @@ The ~40× PCIe:GPU ratio (BF16, small-batch decode) is the fundamental constrain
 | `FastTTS-thesis/` | Modified FastTTS for thesis work. No version pins — uses vllm fork. |
 | `vllm/` | Fork of vLLM (latest main). **Primary modification target.** Thesis changes on `thesis` branch. |
 | `David/` | Working notes and experiments for the thesis. |
-| `Offloading_Frameworks/` | Reference implementations: FlexLLMGen, llama.cpp, NEO, PowerInfer. |
-| `Offloading_Papers/` | Related papers: Doppeladler, FlexGen, NEO, PowerInfer, TwinPilots. |
+| `Offloading_Frameworks/` | Reference implementations |
+| `Papers/` | Reference Papers |
 
 ## Development Environment
 

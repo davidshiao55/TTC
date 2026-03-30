@@ -1,324 +1,377 @@
-# FastTTS-AE Architecture Analysis
+# FastTTS Architecture Analysis
 
-> Analysis of the FastTTS artifact evaluation codebase, its architecture, how it maps to the paper's claims, and paths forward for V1 migration.
+## Overview
 
----
+FastTTS is a two-model test-time search framework for math reasoning:
 
-## 1. Repository Structure
+- **Generator** (`Qwen/Qwen2.5-Math-1.5B-Instruct`) — produces candidate reasoning steps
+- **Verifier / PRM** (`Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B`) — scores each step with a Process Reward Model
 
-| File/Directory | Purpose |
-|---|---|
-| `fasttts.py` | Top-level `FastTTS` class. Entry point for search. |
-| `core.py` | Alternate `FastTTS` class (async version, uses `fasttts.` package imports). |
-| `config.py` | `FastTTSConfig` (model/engine params) and `SearchConfig` (per-request search params). |
-| `models/vllm_wrapper.py` | `GeneratorVLLMModelWrapper`, `VerifierVLLMModelWrapper` — multiprocess wrappers around vLLM. |
-| `models/tts_llm.py` | `TTSLLM` — extends vLLM's `LLM` class. Selects engine (V0/V1), dispatches scoring. |
-| `models/generator_engine.py` | `GeneratorLLMEngine` — extends V0 `LLMEngine` with Speculative Beam Extension. |
-| `models/generator_engine_v1.py` | `GeneratorLLMEngineV1` — V1 stub, speculative beam extension is **not implemented** (placeholder). |
-| `models/verifier_engine.py` | `VerifierLLMEngine` — minimal V0 `LLMEngine` extension, injects `CustomScheduler`. |
-| `models/custom_scheduler.py` | `CustomScheduler` — extends V0 `Scheduler`, aborts spec-finished sequences from waiting/swapped queues. |
-| `models/spec_stopchecker.py` | `SpecStopChecker` — suppresses sequence finishing on stop strings to enable speculative continuation. |
-| `models/reward_utils.py` | `prepare_input`, `sigmoid` — utilities for Skywork PRM scoring. |
-| `search/beam_search.py` | Core beam search algorithm (`_beam_search`, `beam_search`). |
-| `search/dvts.py` | DVTS search strategy. |
-| `search/best_of_n.py` | Best-of-N search strategy. |
-| `search/dynamic_branching.py` | Dynamic branching search strategy. |
-| `search/vg_search.py` | Verifier-guided search strategy. |
-| `search/beam.py` | `Beam` dataclass — per-beam state (text, scores, future_texts, etc.). |
-| `search/utils.py` | Utilities: `build_conversation`, `aggregate_scores`, `split_string_by_separator`, `truncate_sentence_by_tokens`, `assign_prefix_priorities`. |
+The search loop generates one step at a time, has the PRM score it, keeps the top-k beams, and repeats. The stop string `\n\n` marks the boundary between reasoning steps.
 
 ---
 
-## 2. Execution Flow
+## Core Search Loop (Beam Search)
 
-### 2.1 Top-Level API
-
-```
-FastTTS(config).search(problems)
-  -> initialize()  # creates generator + verifier wrappers
-  -> _process_batch(problems, search_config)
-     -> dispatches to search strategy (beam_search / dvts / best_of_n / etc.)
-```
-
-### 2.2 Two-Model System
-
-FastTTS uses two models:
-- **Generator**: produces candidate solution steps (e.g., `Qwen2.5-Math-1.5B-Instruct`)
-- **Verifier (PRM)**: scores each step to guide search (e.g., `Skywork-o1-Open-PRM-Qwen-2.5-1.5B`)
-
-### 2.3 Process Architecture
+**File:** `search/beam_search.py` → `_beam_search()`
 
 ```
-Main Process
-  |-- FastTTS.search()
-  |     |-- beam_search() / dvts() / best_of_n() / ...
-  |     |     |-- generator.generate() --> Pipe --> Generator Process (CUDA ctx 1)
-  |     |     |                                      |-- TTSLLM + GeneratorLLMEngine (V0)
-  |     |     |-- verifier.score()    --> Pipe --> Verifier Process (CUDA ctx 2)
-  |     |                                          |-- TTSLLM + VerifierLLMEngine (V0/V1)
+for each iteration k:
+    1. Duplicate survivors back to n beams
+    2. Build prompts: [system_prompt + question + step_1 + ... + step_k]
+    3. Generator extends each beam by one step (stop at \n\n)
+    4. Verifier scores all beams
+    5. Prune to top (n // beam_width) beams
+    6. Repeat
 ```
 
-Both models run in **separate processes** via `multiprocessing.Process` for CUDA context isolation. Communication uses `mp.Pipe` with a request/response protocol (actions: `generate`, `score`, `apply_chat_template`, `encode`, `decode`, `shutdown`).
-
-### 2.4 Engine Selection
-
-- **Generator**: Always uses **V0** (`VLLM_USE_V1=0`, set in `vllm_wrapper.py:110`)
-- **Verifier**: Uses **V1** (`VLLM_USE_V1=1`, set in `vllm_wrapper.py:112`)
-
-The generator uses V0 because Speculative Beam Extension depends on V0-specific internals (see Section 5).
-
-### 2.5 Sleep Mode (Model Swapping)
-
-When `offload_enabled=True`:
-```
-generator.generate():
-    model.wake_up()    # restore weights from CPU -> GPU
-    model.generate_text(prompts)
-    model.sleep()      # offload weights GPU -> CPU, discard KV cache
-```
-
-This allows both models to time-share the same GPU. Each model gets `gpu_memory_utilization=0.95` when active.
-
----
-
-## 3. Beam Search Algorithm
-
-The core algorithm (`search/beam_search.py:_beam_search`):
-
-```
-Initialize n beams per problem
-For each iteration (up to num_iterations):
-  1. Duplicate active beams to fill n slots (with random truncation for diversity)
-  2. Handle speculative beam extension (consume future_texts if available)
-  3. Build chat conversations -> apply chat template
-  4. generate_beam() -> get next step text + optional lookahead steps
-  5. score_beam() -> get PRM scores from verifier
-  6. Aggregate scores (last/min/prod/mean strategy)
-  7. Prune: keep top n/beam_width beams by aggregated score
-  8. Move completed beams to completed_beams list
-  9. Early exit if n completions collected
-Return completed beams sorted by score
-```
-
-Key details:
-- Stop token is `\n\n` (step boundary in math reasoning)
-- `generate_beam()` generates one step per beam, plus optional greedy lookahead steps
-- `score_beam()` calls `verifier.score(prompts, completions)` for per-step PRM scores
-- Score aggregation strategies: `last` (default), `min`, `prod`, `mean`
-
----
-
-## 4. Paper Claims vs. Implementation
-
-The paper (FastTTS, ASPLOS '26) claims three optimizations:
-
-### 4.1 Speculative Beam Extension
-
-**Paper**: Generates speculatively to hide latency of irregular workloads (stragglers).
-
-**Implementation**: **Implemented** in `generator_engine.py:_process_model_outputs_spec`. When a sequence hits `\n\n`, instead of finishing it, the engine keeps it alive for speculative continuation by:
-- Setting `stop_reason` but NOT changing `status` to `FINISHED_STOPPED` (in `SpecStopChecker`)
-- Assigning `SPEC_BEAM_CANDIDATE_PRIORITY` to speculative sequences
-- Only truly finishing when all sequences in the batch are done or queue exceeds 256
-
-### 4.2 Dynamic Prefix-Aware Scheduling
-
-**Paper**: Reorders execution to maximize KV cache reuse from dynamic prefix sharing.
-
-**Implementation**: **Partially implemented / disabled**. The code exists but is commented out:
-- `assign_prefix_priorities()` in `search/utils.py` is implemented but never called (commented out in `beam_search.py:111-116` and `custom_scheduler.py:38-55`)
-- The beam duplication logic in `_beam_search` has a prefix-aware path (`if getattr(generator.config, 'prefix_aware_scheduling', False)`) that places duplicate beams adjacent for better prefix locality
-- Config flag `enable_prefix_aware_scheduling` exists but the scheduler-level implementation is commented out
-
-### 4.3 Asymmetric Multi-Model Memory Allocation
-
-**Paper Section 4.3.1**: Roofline-guided KV allocation — dynamically partition KV cache between generator and verifier to minimize total execution time.
-
-**Implementation**: **Not implemented as described**. The implementation uses:
-- **Baseline mode**: Static split — generator gets 19%, verifier gets 71% GPU memory (for 1.5B+7B)
-- **Offload mode**: Each model gets 95% when active (time-sharing via sleep/wake)
-- There is no roofline model, no dynamic allocation searcher, no runtime partition adjustment
-
-**Paper Section 4.3.2**: "Extended Search Space with Offloading" — "the KV cache of the inactive model is offloaded to CPU memory, enabling a single model to fully utilize the GPU cache space."
-
-**Implementation**: **Does NOT match the paper's claim**. What actually happens:
-
-| Component | Paper claims | Code does |
+**Key config defaults** (`config.py`):
+| Parameter | Generator | Verifier |
 |---|---|---|
-| **What's offloaded** | KV cache of inactive model | **Model weights** of inactive model |
-| **KV cache** | Preserved on CPU | **Discarded** (freed, not saved) |
-| **Mechanism** | Custom FastTTS optimization | **Stock vLLM sleep mode** (`CuMemAllocator.sleep/wake_up`) |
-| **On wake_up** | Reload KV from CPU (skip recomputation) | Reallocate empty KV cache (must recompute) |
+| `gpu_memory_utilization` | 0.45 | 0.45 |
+| `enable_prefix_caching` | True | True |
+| `max_model_len` | 4096 | 4096 |
+| `beam_width` | — | 2 |
+| `n` (total beams) | — | 8 |
 
-The sleep mode implementation chain:
-```
-FastTTSConfig.offload_enabled
-  -> enable_sleep_mode=True (passed to model wrappers)
-  -> model.sleep()  (in child process, after each inference call)
-  -> vLLM gpu_worker.sleep(level=1)
-  -> CuMemAllocator.sleep(offload_tags=("weights",))
-     -> Copies weight tensors to CPU pinned memory (cudaMemcpy GPU->CPU)
-     -> Unmaps and releases ALL GPU memory (weights backed up, KV cache discarded)
-```
+Beam prompts are built via `build_conversation()` (`search/utils.py`):
 
-This is entirely stock vLLM functionality. FastTTS adds no custom offloading logic.
+```python
+conversation = [
+    {"role": "system",    "content": system_prompt},
+    {"role": "user",      "content": question},
+    {"role": "assistant", "content": steps_so_far},  # omitted at step 0
+]
+```
 
 ---
 
-## 5. Why the Generator Uses V0 (Not V1)
+## Three FastTTS Optimizations
 
-Speculative Beam Extension requires fine-grained control over sequence lifecycle that only V0 provides:
+### Optimization 1 — Speculative Beam Extension (SBE)
 
-### V0 hooks exploited by FastTTS
+**Problem:** In standard beam search, generating step k+1 cannot begin until the verifier has scored step k and the pruning decision is made. The generator is idle during verifier scoring.
 
-1. **`_process_model_outputs()` override** — `GeneratorLLMEngine` overrides this 200+ line method to inspect every sequence after each decode step and selectively keep sequences alive past stop strings.
+**Solution:** Overlap generator and verifier work. While the verifier scores step k, the generator keeps running past the `\n\n` stop boundary, producing a speculative head start into step k+1. When the verifier finishes and pruning is done, surviving beams already have partial step k+1 tokens in context — the generator resumes mid-step rather than from scratch.
 
-2. **`SpecStopChecker`** — Custom `StopChecker` that sets `seq.stop_reason` but deliberately does NOT set `seq.status = FINISHED_STOPPED` (lines 86, 101 commented out). This keeps sequences alive in the scheduler for speculative continuation.
-
-3. **Direct scheduler queue access** — `SpecStopChecker` checks `len(self.scheduler.waiting) == 0` to decide whether to use speculative mode. `CustomScheduler.schedule()` iterates `self.waiting` and `self.swapped` to abort spec-finished sequences.
-
-4. **Per-sequence status/priority manipulation** — Sets `seq_group.priority = SPEC_BEAM_CANDIDATE_PRIORITY` for speculative sequences, directly sets `seq.status = SequenceStatus.FINISHED_STOPPED` when done, calls `scheduler.free_seq()`.
-
-5. **`SingleStepOutputProcessor` replacement** — Replaces the default output processor with one using the custom `SpecStopChecker`.
-
-### V1 architectural differences that prevent direct porting
-
-| V0 | V1 |
-|---|---|
-| `LLMEngine` directly owns `Scheduler` and `OutputProcessor` | Scheduler runs inside `EngineCore` (potentially separate process) |
-| Can access `scheduler.waiting`, `scheduler.running` queues directly | Scheduler is behind `EngineCoreClient` API boundary |
-| `_process_model_outputs()` gives per-sequence-group control | `OutputProcessor.process_outputs()` processes flat `EngineCoreOutput` structs |
-| `Sequence` / `SequenceGroup` objects with mutable `status`, `stop_reason` | `Request` objects with `priority` field, but finishing is via `finish_requests()` / `abort_requests()` |
-| Custom `StopChecker` can suppress finishing | Stop detection is in detokenizer, automatically triggers abort |
-
-### `GeneratorLLMEngineV1` — the V1 stub
-
-`models/generator_engine_v1.py` exists but is a **placeholder**:
-- `enable_spec_beam_extension()` just sets a flag (line 134)
-- `_apply_spec_beam_extension_v1()` returns outputs unchanged (lines 182-192)
-- Comments say "This is a placeholder implementation"
+**Paper claim location:** §6.3, §6.5.1 (ablation, blue bars in Fig. 16). The speedup comes from amortising the generator's idle time during verifier scoring.
 
 ---
 
-## 6. vLLM KV Cache Offloading Capabilities
+#### Layer 1 — `SpecStopChecker`: deferred stop
 
-vLLM has multiple KV cache management systems. FastTTS uses almost none of them intentionally.
+**File:** `models/spec_stopchecker.py`
 
-### 6.1 V0 Swap Space (Preemption)
+Normal vLLM `StopChecker.maybe_stop_sequence()` on a stop string match: truncates output to before the stop string, sets `seq.status = FINISHED_STOPPED`. The sequence then exits the scheduler's running queue.
 
-- **What**: When GPU KV cache is full, scheduler preempts low-priority sequences by swapping KV blocks to CPU pinned memory.
-- **Config**: `swap_space=4` GiB (default in `TTSLLM.__init__`, never overridden by FastTTS)
-- **How**: Reactive — only triggers on GPU KV cache pressure. Not proactive capacity extension.
-- **FastTTS usage**: Passively available via default. Never configured or tuned.
+`SpecStopChecker` overrides this with a two-phase dispatch, keyed on `len(self.scheduler.waiting)`:
 
-### 6.2 V1 KV Offload System (`vllm/v1/kv_offload/`)
+- **Phase 1** (`waiting` non-empty): beams are still being submitted as prefill requests. Normal stop applies — sequences exit the batch as usual.
+- **Phase 2** (`waiting` empty): all beams are in-flight. Stop is deferred:
 
-- **What**: Proactive CPU<->GPU KV cache offloading framework. Uses CPU memory as secondary KV cache storage with managed eviction.
-- **Key components**:
-  - `OffloadingManager` — scheduler-side tracking (lookup, prepare_load, prepare_store, complete_load, complete_store)
-  - `CPUOffloadingSpec` — configures CPU memory pool with `cpu_bytes_to_use`, LRU or ARC eviction
-  - `CpuGpuOffloadingHandlers` — allocates pinned CPU tensors, async block transfers via `ops.swap_blocks()` on dedicated CUDA streams
-  - `LRUOffloadingManager` / `ARCOffloadingManager` — eviction policies
-- **Config**: Activated via `kv_transfer_config` with `spec_name="CPUOffloadingSpec"`
-- **Marked as**: Experimental
-- **FastTTS usage**: **Not used**. Generator forces V0 (`VLLM_USE_V1=0`), and `kv_transfer_config` is never set.
-
-### 6.3 Distributed KV Transfer (`vllm/distributed/kv_transfer/`)
-
-- **What**: Transfer KV caches between vLLM instances (e.g., disaggregated prefill/decode across machines).
-- **Not relevant** to single-GPU scenarios.
-
-### 6.4 Weight Offloaders (`vllm/model_executor/offloader/`)
-
-- `PrefetchOffloader` — streams model weights layer-by-layer CPU->GPU with double-buffering
-- `UVAOffloader` — keeps weights in pinned CPU memory, GPU accesses via Unified Virtual Addressing
-- **These offload weights, not KV cache.**
-- **FastTTS usage**: Not used (`cpu_offload_gb=0` default, never changed).
-
-### 6.5 Sleep Mode (`vllm/device_allocator/cumem.py`)
-
-- **What**: Offloads model weights to CPU, discards KV cache. For time-sharing GPU between models or RLHF weight updates.
-- **FastTTS usage**: **This is what `offload_enabled` triggers.** The only offloading mechanism FastTTS actually uses.
-
-### Summary
-
-| System | FastTTS uses? | Would benefit FastTTS? |
+| Trigger | Normal `StopChecker` | `SpecStopChecker` (Phase 2) |
 |---|---|---|
-| V0 Swap Space | Passively (default 4GB) | Minimal — reactive only |
-| V1 KV Offload | No (generator is V0) | **Yes** — extend KV cache capacity to CPU |
-| KV Transfer | No | No (single GPU) |
-| Weight Offloaders | No | Potentially (for thesis offloading work) |
-| Sleep Mode | Yes (`offload_enabled`) | Already used, but discards KV cache |
+| EOS token | truncate + `FINISHED_STOPPED` | **same** — EOS is always a hard stop |
+| Stop token | truncate + `FINISHED_STOPPED` | truncate, `seq.stop_reason = token_id`, status stays `RUNNING` |
+| Stop string (`\n\n`) | truncate + `FINISHED_STOPPED` | `seq.stop_reason = stop_str`, **no truncation**, status stays `RUNNING` |
+| Max length | `FINISHED_LENGTH_CAPPED` | `FINISHED_LENGTH_CAPPED` |
+
+In `SingleStepOutputProcessor._process_sequence_group_outputs()` (original vLLM 0.9.2):
+```python
+self.stop_checker.maybe_stop_sequence(seq, new_char_count, sampling_params, ...)
+if seq.is_finished():
+    scheduler.free_seq(seq)
+```
+A deferred-stop sequence has `status = RUNNING` → `is_finished() = False` → NOT freed → stays in the running queue → keeps generating past `\n\n`.
+
+The **no truncation** on stop string is intentional: the tokens after `\n\n` are the speculative head start and must be preserved in the sequence's output.
+
+`SpecStopChecker` holds a live reference to `self.scheduler[0]` passed at construction time, which is how it checks the waiting queue state on every token step.
+
+**Injection** (`generator_engine.py:99-129`, `enable_spec_beam_extension()`):
+```python
+self.output_processor = SingleStepOutputProcessor(
+    ...
+    stop_checker=SpecStopChecker(self.scheduler_config.max_model_len,
+                                  get_tokenizer_for_seq,
+                                  self.scheduler[0]),)
+```
+This replaces the engine's output processor in-place. The `scheduler_config.policy` is also set to `"priority"` here so the priority-based ordering in `_process_model_outputs_spec` takes effect.
+
+The helper predicate used throughout:
+```python
+def is_finished_stopped_with_stop(seq: Sequence) -> bool:
+    return not seq.is_finished() and seq.stop_reason is not None
+```
+Identifies sequences that have hit `\n\n` (or a stop token) but are still physically running.
 
 ---
 
-## 7. V1 Migration Analysis
+#### Layer 2 — `_process_model_outputs_spec`: tracking, flushing, and the memory valve
 
-### 7.1 Would V1 KV Offload benefit FastTTS?
+**File:** `models/generator_engine.py`
 
-**Yes, significantly**, in two scenarios:
+`_process_model_outputs` dispatches here only when `spec_beam_extension_enabled=True` AND the current batch has `sampling_params.stop` set (the generator call with `\n\n` stopping). Verifier calls (no stop params) go through the normal path.
 
-**Baseline (no offload) mode** — generator gets ~19% GPU memory (for 1.5B+7B). KV cache space is tiny. With n=8+ beams each needing up to 4096 tokens of KV, beams get preempted frequently. V1 KV offload would spill evicted blocks to CPU and reload instead of recompute.
+Per sequence group, after `process_outputs()` runs `SpecStopChecker`:
 
-**Offload (sleep) mode** — currently all KV cache is destroyed on every model swap. The ideal flow (matching the paper's Section 4.3.2 claim):
-1. Generator finishes -> offload KV cache to CPU (not discard)
-2. Verifier wakes -> uses full GPU
-3. Verifier finishes -> offload verifier KV to CPU
-4. Generator wakes -> reload KV from CPU (skip prefix recomputation)
+1. **Priority assignment** (line 237-238): any newly deferred-stop sequence gets `seq_group.priority = SPEC_BEAM_CANDIDATE_PRIORITY`. This high priority ensures it is scheduled ahead of regular beams by the priority scheduler in subsequent steps — speculative candidates get GPU time to keep building their head start.
 
-This would preserve prefix cache across model swaps, which is a huge win for beam search with heavy prefix sharing.
+2. **`all_finished` accumulator** (line 239):
+   ```python
+   all_finished &= is_finished_stopped_with_stop(seq) or seq.is_finished()
+   ```
+   `True` iff every sequence in the batch is either deferred-stop or truly finished. This is the termination signal for the SBE generation phase.
 
-### 7.2 What V1 offers for Speculative Beam Extension
+3. **Memory pressure valve** (lines 255-263): if `len(spec_beam_extension_now) + len(running_now) > 256`, forcibly finish deferred-stop sequences (FIFO) until the batch is within limit. Prevents unbounded batch growth when many beams converge on `\n\n` simultaneously.
 
-| Requirement | V1 support |
-|---|---|
-| Priority-based scheduling | **Supported** — `Request.priority` field, `SchedulingPolicy.PRIORITY` for preemption |
-| Request abortion | **Supported** — `abort_requests(request_ids)`, can be queued during execution |
-| Pause/resume scheduling | **Supported** — `pause_scheduler()` with `abort`/`keep`/`wait` modes |
-| Stop string suppression | **Requires workaround** — don't use stop strings in SamplingParams; detect `\n\n` externally |
-| Scheduler queue inspection | **Limited** — `get_num_unfinished_requests()` available, but no direct queue access |
-| Per-sequence mid-batch manipulation | **Not supported** — can only abort/finish between `step()` calls |
-| Custom output processing | **Possible** — subclass `OutputProcessor` |
+4. **`all_finished` flush** (lines 265-275): when every sequence is deferred-stop, force-set `status = FINISHED_STOPPED` and `free_seq()` for all. This releases the speculative sequences from the scheduler and returns their outputs (including the post-`\n\n` tokens) to the caller.
 
-### 7.3 Recommended V1 migration approach
+State transitions:
+```
+[normal running]
+    → generate token → hit \n\n
+    → SpecStopChecker: stop_reason = "\n\n", status = RUNNING (deferred)
+    → _process_model_outputs_spec: priority = SPEC_BEAM_CANDIDATE_PRIORITY
+    → stays in running queue, keeps generating
 
-Rather than porting V0 hacks, **reimplement using V1's paradigm**:
-
-1. **Don't use stop strings at vLLM level.** Generate with `max_tokens` only. Detect `\n\n` step boundaries in a custom `OutputProcessor` subclass or in the FastTTS search loop.
-
-2. **Use `abort_requests()` for beam management.** After each `step()`, inspect returned `RequestOutput`s. Track which requests hit step boundaries. Abort speculative sequences that should be pruned.
-
-3. **Use `request.priority` for scheduling.** Set priority when adding requests. Speculative continuations get lower priority.
-
-4. **Use V1 KV Offload.** Configure `CPUOffloadingSpec` with `cpu_bytes_to_use` to extend KV cache capacity to CPU memory.
-
-5. **Move beam coordination to search layer.** The search loop (`beam_search.py`) already manages beam state (current_text, scores, pruning). Push more control there instead of embedding it in the engine.
-
-### 7.4 Blockers and risks
-
-- **V1 KV Offload is experimental** — API may change
-- **No mid-step intervention** — cannot abort a sequence during a forward pass, only between steps
-- **Separate process boundary** — if `EngineCore` runs in a separate process (multiprocess mode), all communication is via serialized messages
-- **V1 may not support reward models** — `vllm_wrapper.py:18` sets `VLLM_USE_V1=0` globally with comment "Force V0 since reward models are not supported in V1" (though the verifier override to V1 at line 112 contradicts this)
+[all sequences deferred-stop]
+    → all_finished = True
+    → flush: status = FINISHED_STOPPED, free_seq() for all
+    → RequestOutput with full post-\n\n text returned to caller
+```
 
 ---
 
-## 8. Key Configurations
+#### Layer 3 — `split_string_by_separator` and `future_texts`
 
-### Default models
-- Generator: `Qwen/Qwen2.5-Math-1.5B-Instruct`
-- Verifier: `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B`
+**File:** `search/beam_search.py` (lines 374-379), `search/utils.py` (lines 21-48)
 
-### Benchmark configurations (1.5B+7B, AIME)
+After `generate_beam()` returns, the raw output `gen_result.next_texts[0]` contains the completed step plus everything the model generated after `\n\n` (the speculative tokens). For example:
 
-| Config | Generator GPU% | Verifier GPU% | offload | spec_beam | prefix_sched |
-|---|---|---|---|---|---|
-| `baseline/` | 0.19 | 0.71 | No | No | No |
-| `offload/` | 0.95 | 0.95 | Yes | No | No |
-| `spec_offload_prefix/` | 0.95 | 0.95 | Yes | Yes | Yes |
+```
+"To solve this, multiply both sides by x.\n\nNext, factor the result."
+                                           ^^^^
+                                           SpecStopChecker kept going past here
+```
 
-### Search defaults
-- `beam_width=4`, `n=8`, `num_iterations=10` (benchmarks); `num_iterations=40` (default)
-- `temperature=0.8`, `top_p=1.0`, `max_tokens=2048`
-- `stop="\n\n"`, `agg_strategy="last"`
-- `batch_size=1` (one problem at a time for beam search)
+`split_string_by_separator(text, "\n\n")` splits this into:
+- `current_text` = `"To solve this, multiply both sides by x.\n\n"` — the confirmed step
+- `future_texts` = `[("Next, factor the result.", False)]` — stored on the beam
+
+Each `future_texts` entry is a `(text, is_finished_this_step)` tuple:
+- `is_finished_this_step = True`: this chunk itself ends with `\n\n` — a complete additional step that can be consumed directly without a generator call
+- `is_finished_this_step = False`: a partial step (no trailing `\n\n`) — gives a head start but the generator still needs to complete this step
+
+If the model ran long enough to produce multiple complete steps before being flushed, `future_texts` can contain several `(step, True)` entries followed by one `(partial, False)`.
+
+---
+
+#### Layer 4 — Verifier call: scoring confirmed vs. speculative text
+
+**File:** `search/beam_search.py` (lines 397-404)
+
+The verifier is always called with `current_text` (confirmed steps), not speculative tokens. However, there is one exception: if `future_texts[0][1] = True` (the first queued future step is a complete step), the verifier scores `current_text + future_texts[0][0]`. This scores a step that hasn't been "officially" confirmed yet, allowing the pruning decision to incorporate the already-generated next step.
+
+Beams that already have a score for this iteration (from a previous SBE hit) skip the verifier call entirely — their stored `all_scores` are reused.
+
+This matches the paper's description: "Verifier evaluates `B`" (all beams), not just speculative candidates `sp`.
+
+---
+
+#### Layer 5 — `DuplicateThenTruncate`: creating diversity in duplicates
+
+**File:** `search/beam_search.py` (lines 256-284)
+
+When survivors (n // beam_width beams) are expanded back to n, each survivor produces `repeats` copies. The **original** beam keeps its `future_texts` intact. Each **duplicate** has `truncate_sentence_by_tokens` applied to `future_texts[-1][0]` (the last, partial speculative chunk):
+
+```python
+truncate_sentence_by_tokens(text, tokenizer, mean_ratio=0.85, std_ratio=0.1)
+# draws ratio ~ N(0.85, 0.1), clipped to [0, 1]
+# returns the first (ratio × total_tokens) tokens of the text
+```
+
+The duplicate's head start is truncated to ~85% of the original's length (with random variation). This forces divergence: if original and duplicate had identical prompts (including identical speculative tokens), they would generate identical next steps. The truncation gives them different starting points, so their generations diverge — maintaining beam diversity.
+
+Only `future_texts[-1]` (the partial chunk at the end) is truncated. Complete steps in earlier `future_texts` entries (where `is_finished_this_step=True`) are preserved — confirmed steps need no diversity manipulation.
+
+---
+
+#### Layer 6 — Head start consumption
+
+**File:** `search/beam_search.py` (lines 291-315)
+
+At the top of each iteration, before building generator prompts:
+
+```python
+for beam in active_beams:
+    if beam.future_texts:
+        next_text, is_finished_this_step = beam.future_texts[0]
+        if is_finished_this_step:
+            beam.skipped_this_step = True   # full step available, skip generator
+        else:
+            beam.current_text += next_text  # pre-pend partial head start
+            beam.future_texts.pop(0)
+```
+
+Beams with `skipped_this_step=True` are excluded from the generator call entirely — their next step came from the previous SBE run for free. Beams with a partial head start call the generator but with a longer `current_text` — the model continues from mid-step rather than from the beginning of a new step.
+
+Beams that are skipped still go through the verifier path (line 354-363): they pop the next `future_texts` entry, append it to `current_text`, and participate in scoring normally.
+
+---
+
+#### Full SBE data flow (one iteration cycle)
+
+```
+Iteration k, survivors = n // beam_width beams:
+
+1. DuplicateThenTruncate:
+   n // bw survivors → n beams
+   Original: future_texts intact
+   Duplicate: future_texts[-1] truncated to ~N(0.85, 0.1) of original length
+
+2. Head start consumption:
+   Partial head start pre-pended to beam.current_text
+   → generator prompt starts mid-step k+1
+
+3. Generator call (non-skipped beams):
+   SpecStopChecker (Phase 2) defers stop at \n\n, keeps generating
+   Returns: full step k+1 + \n\n + partial step k+2
+
+4. split_string_by_separator:
+   current_text ← step k+1 (appended to beam.current_text)
+   future_texts ← [(partial_step_k+2, False)] (stored for next iteration)
+
+5. Verifier: scores all n beams on current_text
+   Beams with a complete future step: scored on current_text + future_texts[0][0]
+
+6. Prune to top n // beam_width survivors by verifier score
+   → goto 1, next iteration starts with speculative head start already loaded
+```
+
+The core savings: step k+1 tokens are generated while the verifier scores step k (overlapped work), and those tokens are already in context when step k+2's generator call begins — a free head start worth ~R=0.85 of a full step's tokens.
+
+---
+
+### Optimization 2 — Dynamic Prefix-Aware Scheduling
+
+**Problem:** When n beams are submitted as a batch, they share varying amounts of prefix. With random scheduling order, a beam's KV blocks may be evicted before its duplicate is processed, forcing full prefix recomputation.
+
+**Paper's solution:** Order request scheduling so that beams sharing the longest prefix are served consecutively, keeping shared KV blocks hot in cache throughout the group. The paper evaluates this in terms of **KV cache memory efficiency** (Fig. 18) — smaller peak KV footprint across the batch — with goodput gain as a downstream effect (Fig. 16, most significant in memory-constrained configs like 1.5B+7B).
+
+**Paper claim location:** §6.5.1 (ablation, green bars in Fig. 16) and §6.5.3 (Fig. 18, compared against Random and Worst-Case scheduling baselines).
+
+#### What is actually implemented in the open-source code
+
+There are two distinct parts in the code:
+
+**Part 1 — Adjacent beam placement** (`beam_search.py`, duplication logic):
+
+When `prefix_aware_scheduling=True`, after pruning survivors are expanded back to n by placing each beam and all its copies adjacent in the list:
+```
+# prefix_aware_scheduling=False (original): [A, B, C, D, A', B', C', D']
+# prefix_aware_scheduling=True:             [A, A', B, B', C, C', D, D']
+```
+A and its copy A' are now consecutive → KV blocks for A's full history are guaranteed hot when A' is processed. This is an O(n) rearrangement with zero tokenization overhead.
+
+**Part 2 — Priority assignment** (`search/utils.py` → `assign_prefix_priorities`):
+
+A general O(n²×L) algorithm that finds the largest group of sequences sharing the longest common prefix, assigns them a priority tier, then repeats for remaining sequences. This handles partial prefix sharing between non-identical sibling beams — the "dynamic" part of the name.
+
+**This part is commented out in the upstream repo and never runs.** Both call sites in `beam_search.py` have the priority assignment code commented out. This is upstream dead code from the original FastTTS authors, not disabled by us.
+
+#### Benchmark configs
+
+The experiment runner (`run_all_experiments.py`) only tests `["baseline", "spec_prefix"]` — both SBE and prefix-aware scheduling are always bundled together in the published results. A standalone `prefix/` config folder exists (used for the paper's ablation) but is not part of the main experiment script.
+
+The `prefix/` configs use deliberately low `gpu_memory_utilization: 0.20` to amplify KV eviction pressure, making the scheduling effect measurable.
+
+#### What `prefix_aware_scheduling=True` actually enables
+
+Only adjacent beam placement. The priority-based scheduling (which the paper's Fig. 18 evaluates) is not active. When documenting experimental setup, note that only adjacent placement is used, not the full priority-based variant.
+
+---
+
+### Optimization 3 — Asymmetric Multi-Model Memory Allocation
+
+**Problem:** Generator and verifier have different memory demands depending on model sizes and workload phases. Giving each a fixed, equal share of GPU memory is suboptimal — the bottleneck model is starved while the other has idle headroom.
+
+**Solution:** Dynamically balance GPU memory between generator and verifier rather than splitting it statically. 
+
+#### Subsection: Offloading (sleep/wake)
+
+The optimization space can be extended with an offloading strategy for cases where GPU memory 𝑀 is extremely constrained.
+**Implementation:** `vllm/device_allocator/cumem.py` — `CuMemAllocator` (singleton)
+
+Uses CUDA virtual memory API (`cuMemCreate`, `cuMemMap`, `cuMemUnmap`, `cuMemRelease`) to manage all GPU allocations by tag ("weights", "kv_cache"):
+
+- `sleep(level=1)` in `vllm/v1/worker/gpu_worker.py`:
+  - Weights → `cudaMemcpy` GPU→CPU pinned RAM, then `cuMemUnmap + cuMemRelease` (physical GPU pages freed)
+  - KV cache → physical pages released with NO CPU backup (discarded — stale across model alternation anyway)
+  - Virtual address space preserved; on `wake_up()`, new physical pages remapped to same addresses and weights copied back H2D
+- `sleep(level=2)`: discards everything, saves nothing
+
+**Initialization sequence:**
+```
+Generator inits (0.45 GPU) → sleeps → signals ready
+Verifier inits (0.45 GPU) → sleeps → signals ready
+Search loop: wake generator → generate → sleep generator → wake verifier → score → sleep verifier → …
+```
+
+Combined `gpu_memory_utilization` can exceed 100% (e.g. 60% + 60% = 120%) because only one is awake at a time.
+
+**Note — paper vs code discrepancy:** The paper describes "KV cache offloaded to CPU"; the actual code offloads *weights* and discards KV cache. Effect on available memory is identical.
+
+**V1 CPU KV offload** (`vllm/v1/kv_offload/`) is a separate, independent vLLM feature — not used by FastTTS by default.
+
+---
+
+## Prefix Cache Behavior Analysis
+
+**`enable_prefix_caching: True`** is set for both models. This uses a radix tree to deduplicate identical prefix token blocks.
+
+### Within a single generator call (strong hits)
+
+After pruning to `n // beam_width` survivors and duplicating back to `n`, pairs of identical beams are submitted simultaneously:
+- Each duplicate pair has **100% identical prompts** → guaranteed prefix cache hit for the duplicate
+- Sibling beams (different survivors) share `[system_prompt + question]` → partial hit
+
+### Cross-iteration without sleep (KV stays GPU-resident)
+
+When sleep mode is OFF, KV cache blocks from iteration `k` are not freed immediately. With `enable_prefix_caching`, finished-request blocks are returned to the radix tree as *evictable* (cached) blocks and remain on GPU until evicted by memory pressure.
+
+Iteration `k+1` sends prompts that are exactly `[previous_k_steps + new_step]`. vLLM finds the prefix in the radix tree, marks those blocks in-use, and **skips prefill entirely for the matched tokens**. Only the new step tokens are prefilled.
+
+This compounds with depth: by iteration 20, only 1 step's worth of tokens is prefilled per call, regardless of total context length.
+
+### Cross-iteration with V1 KV offload enabled
+
+When GPU memory is tight, the radix tree's evictable blocks can be moved to CPU RAM instead of discarded. On a prefix hit for a CPU-resident block, vLLM triggers an H2D transfer before decode.
+
+Cost comparison for a 4096-token prefix (Qwen-1.5B, BF16):
+- Recompute: full prefill (slow, quadratic-ish)
+- CPU-resident hit: ~512 MB × PCIe H2D @ ~32 GB/s ≈ **~16 ms transfer** (much faster than recompute)
+- GPU-resident hit: **~0 ms** (just attend to cached KV)
+
+KV offload trades PCIe bandwidth for avoiding recompute — worthwhile for long contexts.
+
+### Cross-iteration with sleep mode
+
+Sleep discards GPU KV cache (physical pages freed). Cross-iteration KV reuse is **impossible** — cold cache on every wake_up, even with `enable_prefix_caching`. Within-call duplicate hits still work (they're within the same wake period).
+
+### Summary table
+
+| Scenario | Cross-iter prefix hit? | Cost |
+|---|---|---|
+| No sleep, GPU-resident block | Yes | 0 — KV already on GPU |
+| No sleep, CPU-resident block (KV offload) | Yes | PCIe H2D transfer |
+| Sleep mode (any) | No | Full prefill recompute |
+| Duplicate beams, same wake period | Always | 0 |
+| Sibling beams, same wake period | Partial | New-step tokens only |
+
+### Relevance to thesis attention offloading
+
+The prefix cache structure aligns naturally with the attention offloading design:
+- **Shared prefix KV** (`[system_prompt + question + all_shared_steps]`) stays GPU-resident — exactly the hot path of the prefix cache
+- **Per-beam suffix KV** (the unique steps of each beam after the last branch point) moves to CPU — ephemeral, written once, read once
+- GPU handles the multiply-reused prefix; CPU handles the per-beam unique suffix
