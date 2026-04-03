@@ -50,21 +50,30 @@ def build_benchmark_config_from_yaml(yaml_dict: Dict[str, Any]) -> BenchmarkConf
     verifier_gpu_memory_utilization = verifier_config.get("gpu_memory_utilization", 0.45)
     
     # Build FastTTS config with model settings
+    # Build vllm configs — pass through max_model_len if specified
+    gen_vllm_config = {
+        "model": generator_config.get("model", "Qwen/Qwen2.5-Math-1.5B-Instruct"),
+        "gpu_memory_utilization": generator_gpu_memory_utilization,
+        "tensor_parallel_size": generator_config.get("tensor_parallel_size", 1),
+        "enable_prefix_caching": generator_config.get("enable_prefix_caching", True),
+        "seed": generator_config.get("seed", 42),
+    }
+    if "max_model_len" in generator_config:
+        gen_vllm_config["max_model_len"] = generator_config["max_model_len"]
+
+    ver_vllm_config = {
+        "model": verifier_config.get("model", "peiyi9979/math-shepherd-mistral-7b-prm"),
+        "gpu_memory_utilization": verifier_gpu_memory_utilization,
+        "tensor_parallel_size": verifier_config.get("tensor_parallel_size", 1),
+        "enable_prefix_caching": verifier_config.get("enable_prefix_caching", True),
+        "seed": verifier_config.get("seed", 42),
+    }
+    if "max_model_len" in verifier_config:
+        ver_vllm_config["max_model_len"] = verifier_config["max_model_len"]
+
     fasttts_config = create_fasttts_config(
-        generator_vllm_config={
-            "model": generator_config.get("model", "Qwen/Qwen2.5-Math-1.5B-Instruct"),
-            "gpu_memory_utilization": generator_gpu_memory_utilization,
-            "tensor_parallel_size": generator_config.get("tensor_parallel_size", 1),
-            "enable_prefix_caching": generator_config.get("enable_prefix_caching", True),
-            "seed": generator_config.get("seed", 42),
-        },
-        verifier_vllm_config={
-            "model": verifier_config.get("model", "peiyi9979/math-shepherd-mistral-7b-prm"),
-            "gpu_memory_utilization": verifier_gpu_memory_utilization,
-            "tensor_parallel_size": verifier_config.get("tensor_parallel_size", 1),
-            "enable_prefix_caching": verifier_config.get("enable_prefix_caching", True),
-            "seed": verifier_config.get("seed", 42),
-        },
+        generator_vllm_config=gen_vllm_config,
+        verifier_vllm_config=ver_vllm_config,
         offload_enabled=offload_enabled,
         spec_beam_extension=enable_spec_diff,
         prefix_aware_scheduling=enable_prefix_aware_scheduling,

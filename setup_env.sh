@@ -8,6 +8,8 @@ conda create -y -n baseline python=3.11
 conda activate baseline
 pip install -e /TTC/FastTTS-AE
 pip install -e /TTC/FastTTS-AE/modified-skywork-o1-prm-inference
+# latex2sympy must be installed from local source (accuracy evaluation dep)
+pip install -e /TTC/FastTTS-AE/accuracy_evaluation/evaluation/latex2sympy
 conda deactivate
 
 # --- Thesis: modified FastTTS-thesis + vllm fork ---
@@ -39,6 +41,7 @@ cd -
 
 pip install -e /TTC/FastTTS-thesis
 pip install -e /TTC/FastTTS-thesis/modified-skywork-o1-prm-inference
+pip install -e /TTC/FastTTS-thesis/accuracy_evaluation/evaluation/latex2sympy
 conda deactivate
 
 echo "=== Verifying ==="

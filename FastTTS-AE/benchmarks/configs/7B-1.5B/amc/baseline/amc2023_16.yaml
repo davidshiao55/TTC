@@ -21,7 +21,7 @@ generator_model:
 verifier_model:
   model: "Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B"
 
-  gpu_memory_utilization: 0.22
+  gpu_memory_utilization: 0.21
   tensor_parallel_size: 1
   enable_prefix_caching: true
   seed: 42

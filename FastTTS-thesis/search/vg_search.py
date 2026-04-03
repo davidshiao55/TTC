@@ -40,7 +40,7 @@ def beam_is_completed(beam: Beam, token_length: int) -> bool:
     return beam.stop_reasons[0] == "EOS" or beam.stop_reasons[0] == "length" or beam.next_texts[0] == "" or token_length >= 4096 or (beam.stop_reasons[0] != "\n\n")
 
 
-def score_beam(verifier: VerifierVLLMModelWrapper, prompts: List[str], completions: List[List[str]], tokenizer=None):
+def score_beam(verifier: VerifierVLLMModelWrapper, prompts: List[str], completions: List[List[str]], tokenizer=None, prev_scores=None, skipped_beam_context=None):
     """Score a beam of completions."""
     # Prefix-aware scheduling: assign priorities if enabled
     prefix_priorities = None
@@ -49,10 +49,11 @@ def score_beam(verifier: VerifierVLLMModelWrapper, prompts: List[str], completio
     #     from search.utils import assign_prefix_priorities
     #     prefix_priorities = assign_prefix_priorities(tokenized_prompts)
     #     prefix_priorities = [-p for p in prefix_priorities]
-    
+
     # Score with verifier
     verifier_time = time.time()
-    scores = verifier.score(prompts, completions, priority=prefix_priorities)
+    scores = verifier.score(prompts, completions, priority=prefix_priorities,
+                            prev_scores=prev_scores, skipped_beam_context=skipped_beam_context)
     verifier_time = time.time() - verifier_time
     return scores, verifier_time
 
@@ -283,8 +284,9 @@ def _vg_search(
                     for _ in range(repeats_for_this_beam-1):
                         duplicate = copy.deepcopy(beam)
                         if beam.future_texts:
-                            last_text = truncate_sentence_by_tokens(beam.future_texts[-1][0], tokenizer)
-                            duplicate.future_texts[-1] = (last_text, False)
+                            first_text = truncate_sentence_by_tokens(beam.future_texts[0][0], tokenizer)
+                            duplicate.future_texts = [(first_text, False)]
+                            duplicate.all_scores = beam.all_scores[:i]
                         duplicates.append(duplicate)
                     final_beams.extend([beam] + duplicates)
                 active_beams = final_beams
@@ -295,8 +297,9 @@ def _vg_search(
                 ]
                 for b in extended_active_beams:
                     if b.future_texts:
-                        last_text = truncate_sentence_by_tokens(b.future_texts[-1][0], tokenizer)
-                        b.future_texts[-1] = (last_text, False)
+                        first_text = truncate_sentence_by_tokens(b.future_texts[0][0], tokenizer)
+                        b.future_texts = [(first_text, False)]
+                        b.all_scores = b.all_scores[:i]
                 active_beams = (active_beams + extended_active_beams)[:search_config.n]
             
             if len(active_beams) != search_config.n:
@@ -368,8 +371,9 @@ def _vg_search(
             total_generator_latency_s += gen_time
 
         # Process generation results more efficiently
-        prompts, completions = [], []
-        skipped_beams = 0 
+        prompts, completions, beam_prev_scores = [], [], []
+        skipped_beam_context = []
+        skipped_beams = 0
         verified_beams = 0
         counter = 0
         for beam in active_beams:
@@ -409,7 +413,7 @@ def _vg_search(
                 beam.total_completion_tokens += beam.completion_tokens
                 beam.current_text += current_text
                 beam.history.append(gen_result.next_texts[0])
-            
+
             # Common completion check
             if is_completed:
                 if not beam.completed:
@@ -417,20 +421,25 @@ def _vg_search(
                     beam.completion_time = total_generator_latency_s + total_verifier_latency_s
                 if not beam.future_texts:
                     completed_beams.append(beam)
-            
+
             if len(beam.all_scores) >= i + 1 and i < search_config.num_iterations - 1:
                 verified_beams += 1
+                skipped_beam_context.append((beam.prompt, beam.current_text, beam.all_scores))
             elif beam.future_texts and beam.future_texts[0][1]:
                 prompts.append(beam.prompt)
                 completions.append([beam.current_text + beam.future_texts[0][0]])
+                beam_prev_scores.append(beam.all_scores)
             else:
                 prompts.append(beam.prompt)
                 completions.append([beam.current_text])
-        
+                beam_prev_scores.append(beam.all_scores)
+
         extended_tokens_list.append(extended_tokens)
-        
+
         if prompts:
-            scores, verifier_time = score_beam(verifier, prompts, completions, tokenizer)
+            scores, verifier_time = score_beam(verifier, prompts, completions, tokenizer,
+                                               prev_scores=beam_prev_scores,
+                                               skipped_beam_context=skipped_beam_context if skipped_beam_context else None)
             total_verifier_latency_s += verifier_time
         else:
             scores = []

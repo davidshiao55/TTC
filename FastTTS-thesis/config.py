@@ -90,7 +90,6 @@ class FastTTSConfig:
         "tensor_parallel_size": 1,
         "enable_prefix_caching": True,
         "seed": 42,
-        "enable_chunked_prefill": False,
         "disable_log_stats": False,
     })
     verifier_vllm_config: Optional[Dict] = field(default_factory=lambda: {

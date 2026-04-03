@@ -177,11 +177,12 @@ def test_sbe_speculative_continuation(prompt):
         if text.count(STOP) > 1:
             multi_step_count += 1
 
-    if multi_step_count == 0:
-        print("  WARNING: no beam generated past the first stop string.")
-        print("  Check manually — model may have hit EOS before second step.")
-    else:
-        print(f"  {multi_step_count}/{N_BEAMS} beams have multi-step speculative text")
+    assert multi_step_count > 0, (
+        f"FAIL: no beam generated past the first stop string. "
+        f"SBE should produce at least one multi-step beam with "
+        f"temperature={params.temperature} and {N_BEAMS} beams."
+    )
+    print(f"  {multi_step_count}/{N_BEAMS} beams have multi-step speculative text")
 
     print("[2] PASS")
     return llm, outputs
@@ -203,10 +204,11 @@ def test_multi_step_speculation(outputs):
         if count >= 2:
             print(f"  beam {i}: {count} stop-string occurrences")
 
-    if max_stops < 2:
-        print(f"  WARNING: max stop count = {max_stops}, multi-step not observed")
-    else:
-        print(f"  max stop-string count = {max_stops}")
+    assert max_stops >= 2, (
+        f"FAIL: max stop count = {max_stops}, expected >= 2. "
+        f"SBE should produce at least one beam with multiple stop-string occurrences."
+    )
+    print(f"  max stop-string count = {max_stops}")
 
     print("[3] PASS")
 
@@ -253,8 +255,8 @@ def test_priority_scheduling(llm):
     assert scheduler.policy == SchedulingPolicy.PRIORITY, (
         f"FAIL: expected PRIORITY policy, got {scheduler.policy}"
     )
-    assert SPEC_BEAM_CANDIDATE_PRIORITY == 1e9, (
-        f"FAIL: SPEC_BEAM_CANDIDATE_PRIORITY={SPEC_BEAM_CANDIDATE_PRIORITY}, expected 1e9"
+    assert SPEC_BEAM_CANDIDATE_PRIORITY == 1_000_000_000, (
+        f"FAIL: SPEC_BEAM_CANDIDATE_PRIORITY={SPEC_BEAM_CANDIDATE_PRIORITY}, expected 1_000_000_000"
     )
 
     print(f"  scheduler.policy = {scheduler.policy.value}")
@@ -325,14 +327,16 @@ def test_two_phase_scheduling(prompt):
     print(f"  Phase 2 (speculative text):  {phase2_count}/{N_PHASE_BEAMS}")
     print(f"  Natural finish (EOS/max):    {natural_count}/{N_PHASE_BEAMS}")
 
+    assert phase1_count > 0 or phase2_count > 0, (
+        f"FAIL: neither phase observed (all {N_PHASE_BEAMS} beams finished naturally). "
+        f"Two-phase scheduling requires at least one beam to hit a stop string."
+    )
     if phase1_count > 0 and phase2_count > 0:
         print("  Both phases observed — two-phase scheduling confirmed")
-    elif phase1_count > 0 and phase2_count == 0:
-        print("  WARNING: only Phase 1 observed")
-    elif phase1_count == 0 and phase2_count > 0:
-        print("  WARNING: only Phase 2 observed")
+    elif phase1_count > 0:
+        print(f"  Phase 1 observed ({phase1_count} beams), Phase 2 not triggered")
     else:
-        print("  WARNING: neither phase observed (all beams finished naturally)")
+        print(f"  Phase 2 observed ({phase2_count} beams), Phase 1 not triggered")
 
     for i, out in enumerate(outputs):
         assert out.finished, f"FAIL: output {i} not finished"
@@ -367,8 +371,10 @@ def test_text_preservation(outputs):
         )
         print(f"  beam {i}: {len(after_first_stop)} chars after first stop string")
 
-    if tested == 0:
-        print("  WARNING: no multi-step beams to verify text preservation")
+    assert tested > 0, (
+        f"FAIL: no multi-step beams to verify text preservation. "
+        f"Test 2 should guarantee at least one multi-step beam."
+    )
     print(f"[7] PASS ({tested} beams tested)")
 
 
@@ -418,8 +424,10 @@ def test_split_string_by_separator(outputs):
                 f"FAIL: beam {i} future chunk {j} not marked finished"
             )
 
-    if tested == 0:
-        print("  WARNING: no beams had stop strings to test splitting")
+    assert tested > 0, (
+        f"FAIL: no beams had stop strings to test splitting. "
+        f"SBE output should contain at least one beam with stop strings."
+    )
     print(f"[8] PASS ({tested} beams tested)")
 
 

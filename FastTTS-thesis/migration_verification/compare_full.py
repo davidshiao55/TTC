@@ -41,7 +41,7 @@ DEFAULT_N_VALUES = [8, 16, 32, 64]
 
 SPEC_BEAM_EXTENSION = True
 GEN_GPU_MEM = 0.25
-VER_GPU_MEM = 0.15
+VER_GPU_MEM = 0.20
 
 
 def load_dataset():

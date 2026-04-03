@@ -40,7 +40,7 @@ def beam_is_completed(beam: Beam, token_length: int) -> bool:
     return beam.stop_reasons[0] == "EOS" or beam.stop_reasons[0] == "length" or beam.next_texts[0] == "" or token_length >= 4096 or (beam.stop_reasons[0] != "\n\n")
 
 
-def score_beam(verifier: VerifierVLLMModelWrapper, prompts: List[str], completions: List[List[str]], tokenizer=None):
+def score_beam(verifier: VerifierVLLMModelWrapper, prompts: List[str], completions: List[List[str]], tokenizer=None, prev_scores=None, skipped_beam_context=None):
     """Score a beam of completions."""
     # Prefix-aware scheduling: assign priorities if enabled
     prefix_priorities = None
@@ -49,10 +49,11 @@ def score_beam(verifier: VerifierVLLMModelWrapper, prompts: List[str], completio
     #     from search.utils import assign_prefix_priorities
     #     prefix_priorities = assign_prefix_priorities(tokenized_prompts)
     #     prefix_priorities = [-p for p in prefix_priorities]
-    
+
     # Score with verifier
     verifier_time = time.time()
-    scores = verifier.score(prompts, completions, priority=prefix_priorities)
+    scores = verifier.score(prompts, completions, priority=prefix_priorities,
+                            prev_scores=prev_scores, skipped_beam_context=skipped_beam_context)
     verifier_time = time.time() - verifier_time
     return scores, verifier_time
 
@@ -106,7 +107,17 @@ def generate_beam(
             gen_result["initial_prompt"] + gen_result["lookahead_text"]
             for gen_result in current_gen
         ]
-        
+
+        # DEBUG: log prompt lengths to catch overflow
+        if tokenizer is not None:
+            for j, prompt in enumerate(gen_prompts):
+                tok_len = len(tokenizer.encode(prompt))
+                if tok_len >= 4000:  # warn when approaching limit
+                    logger.warning(
+                        f"generate_beam step {i}: prompt {j} has {tok_len} tokens "
+                        f"(max_model_len=4096, headroom={4096 - tok_len})"
+                    )
+
         # Prefix-aware scheduling: assign priorities if enabled
         prefix_priorities = None
         # if getattr(generator.config, 'prefix_aware_scheduling', False) and len(gen_prompts) >= 256:
@@ -114,7 +125,7 @@ def generate_beam(
         #     from search.utils import assign_prefix_priorities
         #     prefix_priorities = assign_prefix_priorities(tokenized_prompts)
             # prefix_priorities = [-p for p in prefix_priorities]
-        
+
         # NVTX profiling for generation
         start_time = time.time()
         nvtx.range_push("generate")
@@ -125,15 +136,29 @@ def generate_beam(
         # Process results more efficiently
         for gen_result, output in zip(current_gen, llm_outputs):
             gen_text = output.outputs[0].text
+            out_tokens = len(output.outputs[0].token_ids)
+            finish_reason = output.outputs[0].finish_reason
+            stop_reason = output.outputs[0].stop_reason
+
+            # DEBUG: log when generation hits length cap
+            if tokenizer is not None and finish_reason == "length":
+                prompt_tok = len(tokenizer.encode(
+                    gen_result["initial_prompt"] + gen_result["lookahead_text"]))
+                logger.warning(
+                    f"generate_beam step {i}: beam {gen_result['index']} hit length cap. "
+                    f"prompt={prompt_tok}, output={out_tokens}, total={prompt_tok + out_tokens}, "
+                    f"finish_reason={finish_reason}, stop_reason={stop_reason}"
+                )
+
             if i == 0:
                 gen_result["first_step_text"] = gen_text
-                gen_result["first_step_stop_reason"] = output.outputs[0].stop_reason
+                gen_result["first_step_stop_reason"] = stop_reason
                 if gen_result["first_step_stop_reason"] is None:
                     gen_result["first_step_stop_reason"] = "EOS"
-                gen_result["completion_tokens"] = len(output.outputs[0].token_ids) 
+                gen_result["completion_tokens"] = out_tokens
 
             gen_result["lookahead_text"] = gen_result["lookahead_text"] + gen_text
-            gen_result["stop_reason"] = output.outputs[0].stop_reason
+            gen_result["stop_reason"] = stop_reason
             if gen_result["stop_reason"] is None:
                 gen_result["stop_reason"] = "EOS"
         
@@ -267,8 +292,11 @@ def _beam_search(
                     for _ in range(repeats_for_this_beam-1):
                         duplicate = copy.deepcopy(beam)
                         if beam.future_texts:
-                            last_text = truncate_sentence_by_tokens(beam.future_texts[-1][0], tokenizer)
-                            duplicate.future_texts[-1] = (last_text, False)
+                            # Paper Algorithm 1, line 19: truncate first
+                            # speculative step, clear rest → immediate divergence
+                            first_text = truncate_sentence_by_tokens(beam.future_texts[0][0], tokenizer)
+                            duplicate.future_texts = [(first_text, False)]
+                            duplicate.all_scores = beam.all_scores[:i]
                         duplicates.append(duplicate)
                     final_beams.extend([beam] + duplicates)
                 active_beams = final_beams
@@ -279,8 +307,9 @@ def _beam_search(
                 ]
                 for b in extended_active_beams:
                     if b.future_texts:
-                        last_text = truncate_sentence_by_tokens(b.future_texts[-1][0], tokenizer)
-                        b.future_texts[-1] = (last_text, False)
+                        first_text = truncate_sentence_by_tokens(b.future_texts[0][0], tokenizer)
+                        b.future_texts = [(first_text, False)]
+                        b.all_scores = b.all_scores[:i]
                 active_beams = (active_beams + extended_active_beams)[:search_config.n]
             
             if len(active_beams) != search_config.n:
@@ -344,8 +373,9 @@ def _beam_search(
             total_generator_latency_s += gen_time
 
         # Process generation results more efficiently
-        prompts, completions = [], []
-        skipped_beams = 0 
+        prompts, completions, beam_prev_scores = [], [], []
+        skipped_beam_context = []
+        skipped_beams = 0
         verified_beams = 0
         counter = 0
         for beam in active_beams:
@@ -385,7 +415,7 @@ def _beam_search(
                 beam.total_completion_tokens += beam.completion_tokens
                 beam.current_text += current_text
                 beam.history.append(gen_result.next_texts[0])
-            
+
             # Common completion check
             if is_completed:
                 if not beam.completed:
@@ -393,20 +423,27 @@ def _beam_search(
                     beam.completion_time = total_generator_latency_s + total_verifier_latency_s
                 if not beam.future_texts:
                     completed_beams.append(beam)
-            
+
             if len(beam.all_scores) >= i + 1 and i < search_config.num_iterations - 1:
                 verified_beams += 1
+                skipped_beam_context.append((beam.prompt, beam.current_text, beam.all_scores))
             elif beam.future_texts and beam.future_texts[0][1]:
                 prompts.append(beam.prompt)
                 completions.append([beam.current_text + beam.future_texts[0][0]])
+                beam_prev_scores.append(beam.all_scores)
             else:
                 prompts.append(beam.prompt)
                 completions.append([beam.current_text])
-        
+                beam_prev_scores.append(beam.all_scores)
+
         extended_tokens_list.append(extended_tokens)
-        
+
         if prompts:
-            scores, verifier_time = score_beam(verifier, prompts, completions, tokenizer)
+            scores, verifier_time = score_beam(
+                verifier, prompts, completions, tokenizer,
+                prev_scores=beam_prev_scores,
+                skipped_beam_context=skipped_beam_context if skipped_beam_context else None,
+            )
             total_verifier_latency_s += verifier_time
         else:
             scores = []
@@ -457,6 +494,26 @@ def _beam_search(
         stop_reasons = [beam.stop_reasons[0] for beam in active_beams if not beam.pruned]
         logger.info(f"-" * 100)
         logger.info(f"Iteration {i} completed beams: {len(completed_beams)}, skipped beams: {skipped_beams}, extended beams: {extended_beams}, verifier beams: {verified_beams}, total latency: {total_generator_latency_s + total_verifier_latency_s:.2f}s, length of agg_scores: {agg_scores_length}, num_steps: {num_steps}, stop reasons: {stop_reasons}")
+
+        # DEBUG: dump all beam states for debugging overflow
+        for x, beam in enumerate(active_beams):
+            ct_tokens = len(tokenizer.encode(beam.current_text)) if beam.current_text else 0
+            # Compute actual prompt tokens using the same path as generation
+            conv = build_conversation(beam.prompt, beam.current_text, search_config.system_prompt)
+            templated = tokenizer.apply_chat_template(
+                conv, add_generation_prompt=False,
+                continue_final_message=True, tokenize=True,
+            )
+            prompt_tokens_actual = len(templated)
+            n_future = len(beam.future_texts) if beam.future_texts else 0
+            future_tokens = sum(len(tokenizer.encode(ft[0])) for ft in beam.future_texts) if beam.future_texts else 0
+            logger.info(
+                f"  beam {x}: completed={beam.completed}, pruned={beam.pruned}, "
+                f"ct_tokens={ct_tokens}, templated_prompt={prompt_tokens_actual}, "
+                f"future_texts={n_future} ({future_tokens} tokens), "
+                f"stop={beam.stop_reasons[0] if beam.stop_reasons else '?'}"
+            )
+
         for x, beam in enumerate([b for b in active_beams if not b.pruned]):
             if num_steps[x] != i + 1:
                 logger.warning(f"Beam {x} has {num_steps[x]} steps, expected {i + 1}")

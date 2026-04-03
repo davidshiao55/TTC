@@ -24,7 +24,7 @@ from matplotlib.patches import ConnectionPatch, Patch, Rectangle
 
 # Configuration
 # MODEL_COMBOS = ["1.5B-1.5B", "1.5B-7B", "7B-1.5B"]
-MODEL_COMBOS = ["1.5B-1.5B"]
+MODEL_COMBOS = ["7B-1.5B"]
 DATASETS = ["aime"]
 METHODS = ["baseline", "spec_prefix"]
 N_VALUES = [8, 16, 32, 64, 128, 256, 512]

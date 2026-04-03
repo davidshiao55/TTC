@@ -306,6 +306,7 @@ class VerifierVLLMModelWrapper(BaseVLLMModelWrapper):
             pooling_type="STEP",
             step_tag_id=12902,
             returned_token_ids=[648, 387],
+            use_activation=True,
         ) if self.config.verifier_vllm_config["model"] == "peiyi9979/math-shepherd-mistral-7b-prm" else None
         return {
             **self.config.verifier_vllm_config,

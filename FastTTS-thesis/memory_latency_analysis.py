@@ -382,7 +382,10 @@ def main():
     parser = argparse.ArgumentParser(description='Memory-Latency Analysis for FastTTS')
     parser.add_argument('--output-dir', type=str, default='./memory_analysis/7B-1.5B/',
                        help='Output directory for results and plots')
-    parser.add_argument('--total-memory', type=float, default=0.9,
+    # NOTE: AE used 0.9 with vllm 0.9.2. Reduced to 0.89 for vllm v0.18.1
+    # due to higher memory overhead (CUDA graphs, torch.compile caches)
+    # causing OOM during verifier forward pass.
+    parser.add_argument('--total-memory', type=float, default=0.89,
                        help='Total memory to allocate')
     parser.add_argument('--gen-memory-alloc', type=float, nargs='+', 
                        default=[ 0.70],

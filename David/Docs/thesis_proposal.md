@@ -298,13 +298,7 @@ Heavy offload. Max ~23 resident layers (887 MB each).
 
 ### 8.3 Roadmap
 
-| Phase | Goal | Impact |
-|---|---|---|
-| 1. Resident hybrid | f_cpu≈9% on all layers, column-parallel split | Free ~1.2 GB, zero cost |
-| 2. Attention offloading | Suffix KV → CPU, CPU attention with LSE, online softmax merge | Free GPU KV for more beams |
-| 3. Tensor-granularity offloading | Per-sub-module three-way split with sub-layer pipeline | Enable 14B+ models, all PCIe for weight |
-| 4. CUDA Graph integration | `cudaLaunchHostFunc` for CPU compute in CUDA Graphs | Production-ready vLLM integration |
-| 5. Benchmarking | RTX 4090: 7B / 14B / 32B | Validate analysis |
+See `implementation_roadmap.md` for the detailed, up-to-date implementation plan.
 
 ---
 
@@ -328,7 +322,7 @@ Heavy offload. Max ~23 resident layers (887 MB each).
 | **Hybrid weight computation** | Column-parallel GPU/CPU split. f_cpu≈9%: CPU computes ~9% of weights for free (hides within GPU idle time). Saves ~1.2 GB. Universal. |
 | **PCIe weight prefetch** | All PCIe → weight prefetch. Small models: replaces f_gpu (frees memory). Large models: replaces f_cpu (reduces latency). No KV prefetch. |
 | **Performance model** | Determines optimal partition fractions (f_gpu, f_prefetch, f_cpu) per sub-module, accounting for generator vs. verifier characteristics. |
-| **Implementation** | (1) Resident hybrid → (2) Attention offloading → (3) Tensor-granularity offloading → (4) CUDA Graph integration → (5) Benchmarking |
+| **Implementation** | See `implementation_roadmap.md` |
 
 ---
 
@@ -336,6 +330,7 @@ Heavy offload. Max ~23 resident layers (887 MB each).
 
 | Document | Scope |
 |---|---|
+| `implementation_roadmap.md` | Phased implementation plan with benchmarking, dependencies, and design decisions |
 | `weight_offload_design.md` | Granularity comparison (group/layer/tensor), three-way split, sub-layer pipeline, buffer sizing, CUDA Graph compatibility |
 | `attention_offload_design.md` | KV three-way split, CPU suffix attention, batch size tradeoff, implementation gaps (CPU attention LSE) |
 | `pcie_bandwidth_allocation_design.md` | Why all PCIe goes to weight prefetch — equivalence analysis, model size regimes, no KV prefetch rationale |

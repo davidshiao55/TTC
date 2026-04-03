@@ -168,7 +168,7 @@ class GeneratorLLMEngineV1(V1LLMEngine):
                 tracker.speculative.add(req_id)
                 request = self._scheduler.requests.get(req_id)
                 if request is not None:
-                    request.priority = int(SPEC_BEAM_CANDIDATE_PRIORITY)
+                    request.priority = SPEC_BEAM_CANDIDATE_PRIORITY
 
         # 4) Check already-speculative beams that now see a waiting queue
         #    (Phase 2 → Phase 1 transition for new stop hits is handled

@@ -144,16 +144,19 @@ These are the existing building blocks in vLLM relevant to the thesis:
 
 ## Implementation Phases
 
-0. **CUDA Graph Integration** — `cudaLaunchHostFunc` callbacks to embed CPU task submission in CUDA Graphs (KTransformers approach). Done first so all subsequent phases are CUDA-Graph-compatible from the start rather than needing a retrofit.
-1. **Resident Hybrid** — f_cpu≈9% column-parallel split on all layers. Zero latency cost; frees ~1.2 GB (7B).
-2. **Attention Offloading** — Suffix KV → CPU; CPU attention kernel returning per-head LSE; online softmax merge via `merge_attn_states.py`.
-3. **Tensor-Granularity Offloading** — Per-sub-module three-way split (permanent/prefetch/cpu) with sub-layer pipeline. Enables 14B+ models.
-4. **Benchmarking** — RTX 4090: 7B / 14B / 32B across all configurations.
+See `David/Docs/implementation_roadmap.md` for the full plan. Summary:
+
+0. **Pre-Implementation Benchmarking** — Validate CPU GEMM throughput, GPU layer timing, PCIe bandwidth, CPU attention latency. Gates all subsequent phases.
+1a. **Resident Hybrid (WO, MLP1, MLP2)** — Column-parallel split at f_cpu≈9%. Python `CpuComputeDispatcher` prototype + `enforce_eager=True`. Frees ~1.2 GB (7B).
+1b+2. **WQKV Split + Attention Offloading** — Split WQKV along Q|K|V dimension: Q on GPU (prefix attention), K/V on CPU (suffix KV cache). CPU attention with LSE + online softmax merge.
+3. **Tensor-Granularity Prefetch** — Per-sub-module three-way split (permanent/prefetch/cpu) with sub-layer pipeline. All PCIe for weight prefetch. Enables 14B+.
+4. **End-to-End Benchmarking** — RTX 4090: 7B / 14B across all configurations.
+5. **CUDA Graph Integration** — Port KTransformers `CPUInfer` + `cudaLaunchHostFunc` pattern. Swap `CpuComputeDispatcher` internals; forward pass unchanged.
 
 ### Engineering Gaps (not yet in vLLM)
-- `cudaLaunchHostFunc` glue for CUDA Graph + CPU task co-scheduling
 - Column-parallel weight split + CPU matmul + partial result concat at tensor granularity
 - CPU attention kernel returning per-head LSE values
+- `cudaLaunchHostFunc` glue for CUDA Graph + CPU task co-scheduling (Phase 5)
 
 ## Key Technical Constraints
 
@@ -161,7 +164,7 @@ These are the existing building blocks in vLLM relevant to the thesis:
 - Optimal resident `f_cpu` ≈ 9% — universal across all model sizes; CPU compute hides within GPU idle time (GPU is memory-BW-bound). Beyond ~10%, latency increases sharply.
 - Column-parallel weight splits are mathematically exact — verify with unit tests.
 - All PCIe H2D bandwidth goes to weight prefetch; no KV prefetch (see `David/Docs/pcie_bandwidth_allocation_design.md`).
-- CUDA Graph compatibility via `cudaLaunchHostFunc` is implemented first (Phase 0); all offloading phases build on top of it.
+- CUDA Graph compatibility via `cudaLaunchHostFunc` is deferred to Phase 5; prototype with `enforce_eager=True`. `CpuComputeDispatcher` abstraction ensures the retrofit is localized.
 
 ## Design Documents
 
@@ -169,7 +172,8 @@ Detailed analysis lives in `David/Docs/`:
 
 | Document | Scope |
 |---|---|
-| `thesis_proposal.md` | Full proposal: problem, approach, analysis, roadmap |
+| `thesis_proposal.md` | Full proposal: problem, approach, analysis |
+| `implementation_roadmap.md` | Phased implementation plan, dependencies, design decisions |
 | `weight_offload_design.md` | Granularity comparison, three-way split, sub-layer pipeline, buffer sizing |
 | `attention_offload_design.md` | KV topology split, CPU suffix attention, batch size tradeoff |
 | `pcie_bandwidth_allocation_design.md` | Why all PCIe goes to weight prefetch |

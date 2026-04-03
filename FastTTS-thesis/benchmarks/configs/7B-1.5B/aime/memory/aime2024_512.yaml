@@ -11,7 +11,7 @@ dataset:
 generator_model:
   model: "Qwen/Qwen2.5-Math-7B-Instruct"
 
-  gpu_memory_utilization: 0.75
+  gpu_memory_utilization: 0.73
   tensor_parallel_size: 1
   enable_prefix_caching: true
   seed: 42
@@ -20,7 +20,7 @@ generator_model:
 verifier_model:
   model: "Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B"
 
-  gpu_memory_utilization: 0.15
+  gpu_memory_utilization: 0.16
   tensor_parallel_size: 1
   enable_prefix_caching: true
   seed: 42
