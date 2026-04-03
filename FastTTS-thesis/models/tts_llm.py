@@ -209,12 +209,10 @@ class TTSLLM(LLM):
         output_scores = [[output.outputs.data[:, 0].tolist()] for output in request_outputs] if len(outputs) > 0 else []
         return output_scores
 
-    _score_call_counter = 0  # TODO(debug): remove after investigation
-
     def _score_outputs_skywork(self, questions, outputs, _, prev_scores=None, skipped_beam_context=None, **kwargs):
-        # TODO(debug): remove after investigation
-        TTSLLM._score_call_counter += 1
-        call_id = TTSLLM._score_call_counter
+        from search.score_propagation import (
+            lock_prev_scores, propagate_within_batch, validate_no_missing,
+        )
 
         all_scores = []
         tokenizer = self.get_tokenizer()
@@ -247,11 +245,10 @@ class TTSLLM(LLM):
             prompts,
             pooling_params=PoolingParams(skip_reading_prefix_cache=False),
         )
-        # Reconstruct the nested structure.
-        # With prefix caching, reward_embedding may be shorter than reward_flag
-        # because cached prefix tokens skip the forward pass. Use None
-        # placeholders for missing scores, then fill from prev_scores and
-        # within-batch propagation.
+
+        # Extract raw step scores from reward embeddings.
+        # With prefix caching, cached prefix tokens produce no hidden states
+        # — those step boundaries get None placeholders, filled by propagation.
         flat_step_rewards = []
         idx = 0
         for num_outputs in boundaries:
@@ -279,94 +276,22 @@ class TTSLLM(LLM):
                 flat_step_rewards.append(step_reward)
                 idx += 1
 
-        # Layer 1: Prefer prev_scores over fresh computation.
-        # Once a step is scored, its value is locked — fresh recomputation
-        # is ignored to ensure consistent scores across iterations and
-        # duplicates (avoids BF16 noise from different computation contexts).
-        for idx, step_reward in enumerate(flat_step_rewards):
-            prev = flat_prev_scores[idx]
-            for j in range(min(len(step_reward), len(prev))):
-                if prev[j] is not None:
-                    step_reward[j] = prev[j]
+        # Score propagation: fill Nones from available sources.
+        # See search/score_propagation.py for when each layer is needed.
+        lock_prev_scores(flat_step_rewards, flat_prev_scores)
 
-        # Layer 2: Within-batch propagation (fill from batch + skipped beams)
-        has_nones = any(None in sr for sr in flat_step_rewards)
-        if has_nones:
-            self._propagate_scores_within_batch(
+        if any(None in sr for sr in flat_step_rewards):
+            propagate_within_batch(
                 flat_step_rewards, flat_input_ids, flat_reward_flags,
                 skipped_beam_context=skipped_beam_context,
                 tokenizer=tokenizer,
+                prepare_input_fn=prepare_input,
             )
 
-        # Layer 3: Remaining Nones indicate a bug — abort with diagnostics
-        for idx, step_reward in enumerate(flat_step_rewards):
-            if any(s is None for s in step_reward):
-                n_missing = sum(1 for s in step_reward if s is None)
-                reward_flag = flat_reward_flags[idx]
-                reward_embedding = rewards[idx].outputs.data.tolist()
-                offset = len(reward_flag) - len(reward_embedding)
-                flag_positions = [i for i, f in enumerate(reward_flag) if f == 1]
-                none_positions = [j for j, s in enumerate(step_reward) if s is None]
-                prev = flat_prev_scores[idx] if idx < len(flat_prev_scores) else []
-                problem_text = tokenizer.decode(flat_input_ids[idx])
-                raise RuntimeError(
-                    f"PRM score propagation failed at call {call_id}: "
-                    f"{n_missing}/{len(step_reward)} step scores still None "
-                    f"(prompt idx={idx}).\n"
-                    f"  offset={offset}, input_ids len={len(flat_input_ids[idx])}\n"
-                    f"  flag_positions={flag_positions}\n"
-                    f"  none_positions={none_positions}\n"
-                    f"  prev_scores len={len(prev)}\n"
-                    f"\nFULL TEXT:\n{problem_text}"
-                )
-
-        # TODO(debug): dump post-merge state to debug file
-        import os as _os
-        _debug_path = _os.path.join(_os.getcwd(), "experiments/results/score_debug_dump.txt")
-        with open(_debug_path, "a") as _dbg:
-            _dbg.write(f"\n{'='*80}\n")
-            _dbg.write(f"Score call {call_id}: {len(flat_step_rewards)} beams (POST-MERGE)\n")
-            _dbg.write(f"{'='*80}\n")
-            for b_idx, sr in enumerate(flat_step_rewards):
-                ids = flat_input_ids[b_idx]
-                emb_len = len(rewards[b_idx].outputs.data.tolist())
-                offset = len(ids) - emb_len
-                flags = [i for i, f in enumerate(flat_reward_flags[b_idx]) if f == 1]
-                prev = flat_prev_scores[b_idx]
-                _dbg.write(
-                    f"\n--- beam {b_idx}: tokens={len(ids)} cached={offset} "
-                    f"computed={emb_len} prev={len(prev)} ---\n"
-                )
-                _step_bounds = [0] + flags + [len(ids)]
-                for j in range(len(_step_bounds) - 1):
-                    start, end = _step_bounds[j], _step_bounds[j + 1]
-                    step_text = tokenizer.decode(ids[start:end])
-                    if end <= offset:
-                        region = "CACHED"
-                    elif start >= offset:
-                        region = "COMPUTED"
-                    else:
-                        region = f"SPLIT@{offset}"
-                    if j < len(sr):
-                        if sr[j] is None:
-                            score = "NONE"
-                        else:
-                            # Show source: prev, propagated, or computed
-                            in_cached = (flags[j] < offset) if j < len(flags) else False
-                            if in_cached and j < len(prev) and prev[j] is not None:
-                                score = f"{sr[j]:.4f} (from prev)"
-                            elif in_cached:
-                                score = f"{sr[j]:.4f} (propagated)"
-                            else:
-                                score = f"{sr[j]:.4f} (computed)"
-                    else:
-                        score = "n/a"
-                    _dbg.write(
-                        f"  [step {j}] tokens {start}-{end} ({region}) "
-                        f"score={score}\n"
-                        f"    {step_text}\n"
-                    )
-        # END TODO(debug)
+        validate_no_missing(
+            flat_step_rewards, flat_input_ids, flat_reward_flags,
+            flat_prev_scores, rewards, tokenizer,
+        )
 
         # Rebuild nested structure
         idx = 0
@@ -377,55 +302,3 @@ class TTSLLM(LLM):
                 idx += 1
             all_scores.append(step_rewards)
         return all_scores
-
-    @staticmethod
-    def _propagate_scores_within_batch(flat_step_rewards, flat_input_ids, flat_reward_flags,
-                                       skipped_beam_context=None, tokenizer=None):
-        """Copy missing scores from batch neighbors and skipped beams.
-
-        If beam A and beam B share the same token prefix up to a step boundary,
-        then the PRM score at that boundary is identical (same tokens → same
-        hidden state). This lets us copy scores from whichever beam computed them.
-
-        Skipped beams (SBE skip logic) are not in the current scoring batch
-        but their scores are available via skipped_beam_context. Their entries
-        are added to the bank so sibling beams can find matching prefixes.
-
-        Only runs when Nones exist (not on the critical path).
-        """
-        bank = {}
-
-        # Add entries from skipped beams (not in current batch but have scores)
-        if skipped_beam_context and tokenizer:
-            for question, completion, all_scores in skipped_beam_context:
-                input_ids, _, reward_flags = prepare_input(
-                    question, completion, tokenizer=tokenizer, step_token="\n\n"
-                )
-                flag_positions = [i for i, f in enumerate(reward_flags) if f == 1]
-                for j, pos in enumerate(flag_positions):
-                    if j < len(all_scores) and all_scores[j] is not None:
-                        prefix_key = tuple(input_ids[:pos + 1])
-                        bank[prefix_key] = all_scores[j]
-
-        # Add entries from current batch
-        for idx, step_scores in enumerate(flat_step_rewards):
-            flags = flat_reward_flags[idx]
-            ids = flat_input_ids[idx]
-            flag_positions = [i for i, f in enumerate(flags) if f == 1]
-            for j, pos in enumerate(flag_positions):
-                if j < len(step_scores) and step_scores[j] is not None:
-                    prefix_key = tuple(ids[:pos + 1])
-                    bank[prefix_key] = step_scores[j]
-
-        # Fill Nones from bank
-        for idx, step_scores in enumerate(flat_step_rewards):
-            if None not in step_scores:
-                continue
-            flags = flat_reward_flags[idx]
-            ids = flat_input_ids[idx]
-            flag_positions = [i for i, f in enumerate(flags) if f == 1]
-            for j, pos in enumerate(flag_positions):
-                if j < len(step_scores) and step_scores[j] is None:
-                    prefix_key = tuple(ids[:pos + 1])
-                    if prefix_key in bank:
-                        step_scores[j] = bank[prefix_key]

@@ -1,13 +1,11 @@
 # FastTTS - Fast Test Time Search
 
 from .config import FastTTSConfig, SearchConfig
-from .core import FastTTS, create_fasttts
+from .fasttts import FastTTS, create_fasttts, create_fasttts_config
 from .models import (
     BaseVLLMModelWrapper,
     GeneratorVLLMModelWrapper,
     VerifierVLLMModelWrapper,
-    AsyncGeneratorVLLMModelWrapper,
-    AsyncVerifierVLLMModelWrapper,
 )
 from .search import Beam, beam_search, build_conversation, aggregate_scores
 
@@ -16,15 +14,12 @@ __all__ = [
     "SearchConfig",
     "FastTTS",
     "create_fasttts",
+    "create_fasttts_config",
     "BaseVLLMModelWrapper",
     "GeneratorVLLMModelWrapper",
-    "VerifierVLLMModelWrapper", 
-    "AsyncGeneratorVLLMModelWrapper",
-    "AsyncVerifierVLLMModelWrapper",
-    "VLLMModelWrapper",
-    "AsyncVLLMModelWrapper",
+    "VerifierVLLMModelWrapper",
     "Beam",
     "beam_search",
     "build_conversation",
     "aggregate_scores",
-] 
+]

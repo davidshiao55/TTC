@@ -762,6 +762,114 @@ uses — are **exactly identical** (Test 4).  Generator output is also
 
 ---
 
+## Part 8 — Codebase Restructuring
+
+### Motivation
+
+Debugging migration issues (score propagation, generator overflow, SBE
+interactions) was increasingly difficult because `_beam_search()` was a
+336-line monolithic function with 8+ interleaved concerns, score
+propagation logic was entangled with debug artifacts in `tts_llm.py`, and
+dead code accumulated during the migration.
+
+### Changes
+
+#### 1. Decomposed `_beam_search()` into named phases (`search/beam_search.py`)
+
+The monolithic loop body was split into 11 functions, each handling one
+concern:
+
+| Function | Responsibility |
+|---|---|
+| `_init_state()` | Create beams, sampling params, compute prompt token length |
+| `_filter_active()` | Remove pruned beams |
+| `_check_n_completion()` | Record metrics when n completions first reached |
+| `_duplicate_beams()` | Expand active beams to `config.n` via duplication |
+| `_consume_future_texts()` | Pop SBE future_texts into current_text |
+| `_generate()` | Build conversations, call generator |
+| `_process_results()` | Process gen results, build `ScoringBatch` |
+| `_score_and_assign()` | Call verifier, assign scores to beams |
+| `_filter_completed_and_prune()` | Remove completed, prune lowest scores |
+| `_log_iteration()` | Structured logging (INFO summary + DEBUG per-beam) |
+| `_finalize()` | Post-loop metrics, sort completed beams |
+
+New dataclasses: `BeamSearchState` (shared mutable state across phases),
+`ScoringBatch` (typed container for verifier inputs).
+
+`beam_is_completed()` rewritten for clarity.  The old expression
+`stop == "EOS" or ... or (stop != "\n\n")` was a tautology for all
+non-`\n\n` stops.  New version inverts the logic: returns False only when
+`stop == "\n\n"` and text is non-empty (normal step boundary, keep going).
+Logically equivalent.
+
+#### 2. Added beam identity tracking (`search/beam.py`)
+
+New fields on `Beam`: `beam_id` (unique, auto-incrementing), `parent_id`
+(set on duplication), `born_at_iteration`.  Module-level counter
+(`_next_beam_id()`, `reset_beam_id_counter()`).
+
+Enables tracing beam lineage through logs: "beam 14 (parent=3, born@2)".
+
+Removed dead methods `add_generation()`, `clone()`, `get_score()` — never
+called by any code.
+
+#### 3. Structured iteration logging
+
+Replaced the ad-hoc debug dump (old lines 498–521, which ran expensive
+per-beam tokenization every iteration at INFO level) with `_log_iteration()`:
+
+- **INFO** (always): one-line summary — beam counts, latencies
+- **DEBUG** (opt-in): per-beam table with ID lineage, token counts, scores,
+  future_texts count, stop reasons.  Expensive tokenization only at DEBUG.
+
+#### 4. Extracted score propagation (`search/score_propagation.py`)
+
+Three-layer score propagation (prev_scores locking, within-batch
+propagation, RuntimeError safety net) extracted from
+`tts_llm.py:_score_outputs_skywork()` into standalone functions:
+
+- `lock_prev_scores()` — Layer 1: always needed with prefix caching
+- `propagate_within_batch()` — Layer 2: only triggered with SBE active
+- `validate_no_missing()` — Layer 3: only triggered with SBE active
+
+Without SBE, Layer 1 fills all Nones (earlier step boundaries are always
+in prev_scores because they were scored when they were the "last" step).
+Layers 2–3 naturally no-op via the `has_nones` check.
+
+Removed from `tts_llm.py`: `_score_call_counter` class variable, 45-line
+debug file dump (`score_debug_dump.txt`), `_propagate_scores_within_batch`
+static method.
+
+#### 5. Removed lookahead dead code (`search/beam_search.py`)
+
+`config.lookahead` defaults to 0 and is never overridden.  The multi-step
+generation loop in `generate_beam` (`for i in range(lookahead_steps + 1)`)
+always ran exactly once.  Collapsed to a single generation call.
+
+Removed: `lookahead_steps` parameter, `lookahead_sampling_params`,
+`lookahead_text` accumulator, `Beam.lookahead_texts` field (only written,
+never read by search logic).
+
+This is unrelated to SBE's `future_texts` (from `split_string_by_separator`),
+which remains unchanged.  The paper's "LookAhead Verification" (§4.1.3)
+refers to scoring `current_text + future_texts[0]` when the next speculative
+step is complete — that works via SBE, not via multi-call generation.
+
+#### 6. Removed dead code
+
+- Deleted `core.py` — imported `AsyncGeneratorVLLMModelWrapper`,
+  `beam_search_async`, neither of which exist.  The live entry point is
+  `fasttts.py`.
+- Fixed `__init__.py` — removed async wrapper exports, imports from
+  `fasttts.py` instead.
+
+### Verification
+
+All changes are pure restructuring — no behavioral changes.  The same
+`migration_verification/` test suite validates correctness.
+
+---
+
 ## TODOs / Open Issues
 
 ### Pruned beam KV cache persistence (unsolvable)
@@ -789,6 +897,67 @@ Iteration N+1:
     → RuntimeError
 ```
 
+### Generator prompt overflow — SBE future_texts dump (pre-existing in AE)
+
+**Status:** Root cause identified, fix not yet implemented.
+
+**Bug:** At the last beam search iteration, all remaining `future_texts` are
+dumped into `current_text` at once (line 328-334 in `beam_search.py`).  If a
+beam accumulated many speculative steps via SBE, this dump can push
+`current_text` far past `max_model_len`.  The subsequent `generate_beam` call
+builds a chat-templated prompt from `current_text` and vLLM rejects it.
+
+**Confirmed identical in AE** — same code at `FastTTS-AE/search/beam_search.py:298-305`.
+Both V0 and V1 reject prompts > `max_model_len` (`verify_gen_overflow.py`).
+The AE doesn't crash in practice because the 1.5B-generator config and typical
+AIME problems rarely accumulate enough text.  With the 7B generator, certain
+problems trigger it reliably (`compare_max_model_len.py` crashes on AIME
+problem 17 at iteration 9).
+
+**Root cause trace** (from debug logging in `compare_max_model_len.py`):
+
+```
+Iteration 0:
+  beam 6: ct_tokens=13, templated_prompt=236, future_texts=23 (788 tokens)
+  ← SBE generated 2048 tokens in one call, split into 23 steps by \n\n
+
+Iteration 6:
+  beam 5: ct_tokens=2288, templated_prompt=2511, future_texts=27 (3666 tokens)
+  ← beam duplicated + generated, accumulated more speculative steps
+
+Iteration 7 (generate_beam):
+  beams 0,1,3,5: prompt=3748, output=348, total=4096 → length cap → completed
+  beams 2,4,6,7: found \n\n before cap → NOT completed, continue
+
+Iteration 8:
+  beam 0: ct_tokens=2323, templated_prompt=2546, future_texts=25 (3631 tokens)
+
+Iteration 9 (LAST — dump-all fires):
+  while beam.future_texts:           ← adds 3631 tokens to current_text
+      beam.current_text += next_text
+  prompt = chat_template(question + 2323 + 3631 tokens) = 6174 tokens
+  → VLLMValidationError: 6174 > 4096
+```
+
+**Why `beam_is_completed` doesn't catch it:**
+- `prompt_token_length` is stale (computed once at start with empty response = ~200)
+- `completion_tokens` only counts the primary generation step, not accumulated text
+- The real prompt is 3748 tokens but the check sees `200 + 348 = 548 < 4096`
+- The `stop_reasons[0] != "\n\n"` condition only catches non-`\n\n` stops
+- Beams that found `\n\n` (normal step boundary) pass all checks and continue
+
+**Why skipped beams don't trigger it:**
+- Skipped beams consume one `future_text` per iteration and ARE scored by the PRM
+- This per-step consumption is correct — each step gets individually scored
+- The bug is only the **excess** future_texts that can't be consumed within
+  `num_iterations` — they're dumped all at once at the last iteration
+
+**Proposed fix:** If a beam's total speculated text (`current_text` + all
+remaining `future_texts`) would exceed `max_model_len` when chat-templated,
+move it to `completed_beams` with its current scores instead of trying to
+dump and generate.  Alternatively, cap `future_texts` so the dump-all at the
+last iteration stays within `max_model_len`.
+
 ### Context length limit (4096)
 
 Qwen2.5-Math-7B-Instruct has `max_position_embeddings=4096` — this is the
@@ -801,7 +970,9 @@ and risks NaN from RoPE extrapolation.  Alternative: switch to
 Qwen2.5-7B-Instruct (128K context, no Math fine-tuning) for longer
 reasoning chains.
 
-### Debug logging cleanup
+### Debug logging cleanup — DONE (Part 8)
 
-Remove `_score_call_counter` and `score_debug_dump.txt` debug logging from
-`models/tts_llm.py` after full benchmark verification is complete.
+Removed `_score_call_counter` and `score_debug_dump.txt` writer from
+`tts_llm.py`.  Replaced ad-hoc beam state dumps in `beam_search.py` with
+structured `_log_iteration()` (INFO summary always, DEBUG per-beam detail
+opt-in).  `generate_beam` token length warnings gated on DEBUG level.
