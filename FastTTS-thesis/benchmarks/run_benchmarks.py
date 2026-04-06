@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import time
 from pathlib import Path
 import yaml
@@ -11,7 +12,8 @@ from fasttts import FastTTS
 from benchmark_config import build_benchmark_config_from_yaml
 from dataset_utils import load_dataset_for_benchmarking
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+_log_level = getattr(logging, os.environ.get("FASTTTS_LOG_LEVEL", "INFO").upper(), logging.INFO)
+logging.basicConfig(level=_log_level, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def run_benchmark_from_config(config_path: str):

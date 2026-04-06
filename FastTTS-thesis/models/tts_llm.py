@@ -209,38 +209,23 @@ class TTSLLM(LLM):
         output_scores = [[output.outputs.data[:, 0].tolist()] for output in request_outputs] if len(outputs) > 0 else []
         return output_scores
 
-    def _score_outputs_skywork(self, questions, outputs, _, prev_scores=None, skipped_beam_context=None, **kwargs):
-        from search.score_propagation import (
-            lock_prev_scores, propagate_within_batch, validate_no_missing,
-        )
-
+    def _score_outputs_skywork(self, questions, outputs, _, **kwargs):
+        """Pure PRM scoring — returns raw per-step scores (may contain Nones
+        from prefix caching). Propagation is done in beam_search._score_and_assign.
+        """
         all_scores = []
         tokenizer = self.get_tokenizer()
         flat_input_ids = []
         flat_reward_flags = []
-        flat_prev_scores = []
-        boundaries = []  # (num_outputs for each question)
-        prev_idx = 0
+        boundaries = []
+        max_model_len = self.model_config.max_model_len
         for question, output in zip(questions, outputs):
-            processed_data = [prepare_input(question, o, tokenizer=tokenizer, step_token="\n\n") for o in output]
+            processed_data = [prepare_input(question, o, tokenizer=tokenizer, step_token="\n\n", max_model_len=max_model_len) for o in output]
             input_ids, steps, reward_flags = zip(*processed_data)
             flat_input_ids.extend(input_ids)
             flat_reward_flags.extend(reward_flags)
-            for _ in output:
-                if prev_scores is not None and prev_idx < len(prev_scores):
-                    flat_prev_scores.append(prev_scores[prev_idx])
-                else:
-                    flat_prev_scores.append([])
-                prev_idx += 1
             boundaries.append(len(output))
         prompts = [TokensPrompt(prompt_token_ids=input_id) for input_id in flat_input_ids]
-        for i, ids in enumerate(flat_input_ids):
-            if len(ids) > 4096:
-                logger.error(
-                    f"prepare_input returned {len(ids)} tokens > 4096 for prompt {i}. "
-                    f"Question len={len(tokenizer.encode(tokenizer.bos_token + questions[0] + chr(10)))}, "
-                    f"response preview=...{str(ids[-10:])}"
-                )
         rewards = self.encode(
             prompts,
             pooling_params=PoolingParams(skip_reading_prefix_cache=False),
@@ -248,7 +233,7 @@ class TTSLLM(LLM):
 
         # Extract raw step scores from reward embeddings.
         # With prefix caching, cached prefix tokens produce no hidden states
-        # — those step boundaries get None placeholders, filled by propagation.
+        # — those step boundaries get None placeholders.
         flat_step_rewards = []
         idx = 0
         for num_outputs in boundaries:
@@ -268,30 +253,13 @@ class TTSLLM(LLM):
                     if flag == 1:
                         local_idx = i - offset
                         if local_idx < 0:
-                            step_reward.append(None)  # cached — fill later
+                            step_reward.append(None)  # cached — fill in beam_search
                         elif local_idx >= len(reward_embedding):
                             break
                         else:
                             step_reward.append(sigmoid(reward_embedding[local_idx][0]))
                 flat_step_rewards.append(step_reward)
                 idx += 1
-
-        # Score propagation: fill Nones from available sources.
-        # See search/score_propagation.py for when each layer is needed.
-        lock_prev_scores(flat_step_rewards, flat_prev_scores)
-
-        if any(None in sr for sr in flat_step_rewards):
-            propagate_within_batch(
-                flat_step_rewards, flat_input_ids, flat_reward_flags,
-                skipped_beam_context=skipped_beam_context,
-                tokenizer=tokenizer,
-                prepare_input_fn=prepare_input,
-            )
-
-        validate_no_missing(
-            flat_step_rewards, flat_input_ids, flat_reward_flags,
-            flat_prev_scores, rewards, tokenizer,
-        )
 
         # Rebuild nested structure
         idx = 0

@@ -191,7 +191,7 @@ class FastTTS:
         
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit."""
-        asyncio.run(self.shutdown())
+        self.shutdown()
 
 
 def create_fasttts_config(
