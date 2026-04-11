@@ -22,18 +22,28 @@ import pandas as pd
 import seaborn as sns
 from matplotlib.patches import ConnectionPatch, Patch, Rectangle
 
-# Configuration
-# MODEL_COMBOS = ["1.5B-1.5B", "1.5B-7B", "7B-1.5B"]
-MODEL_COMBOS = ["7B-1.5B"]
-DATASETS = ["aime"]
-METHODS = ["baseline", "spec_prefix"]
-N_VALUES = [8, 16, 32, 64, 128, 256, 512]
+# ============================================================================
+# Configuration — thesis experimental setup
+# ============================================================================
+#
+# Generators:  7B-instruct, 1.5B-instruct (Qwen2.5-*-Instruct, 32K context)
+# Verifier:    Skywork-PRM-1.5B (fixed)
+# Datasets:    math500 (primary, 500 problems), aime (hard subset, 30 problems)
+# Methods:     fasttts (FastTTS w/ all opts), baseline (vanilla beam search)
+# N sweep:     [4, 16, 64, 256] — matches Liu et al. (compute-optimal-tts)
+# ============================================================================
 
-# Dataset name mapping for config files
-DATASET_CONFIG = {
-    "aime": "aime2024",
-    "amc": "amc2023",
-}
+GENERATORS = ["7B-instruct", "1.5B-instruct"]
+DATASETS = ["math500", "aime"]
+# fasttts is the primary method; baseline is only run at N=64 as a sanity check
+METHODS = ["fasttts", "baseline"]
+N_VALUES = [4, 16, 64, 256]
+
+# N values where the baseline sanity check is run (only one point — confirms
+# fasttts and baseline give equivalent accuracy on the same setup)
+BASELINE_SANITY_N = [64]
+# Restrict baseline runs to math500 only (saves compute on the noisy AIME)
+BASELINE_SANITY_DATASETS = ["math500"]
 
 BENCHMARK_DIR = Path(__file__).parent / "benchmarks"
 DEFAULT_DATA_DIR = BENCHMARK_DIR / "benchmark_results"
@@ -41,40 +51,48 @@ FIGURES_DIR = Path(__file__).parent / "figures"
 ACCURACY_EVAL_DIR = Path(__file__).parent / "accuracy_evaluation"
 
 
+def _planned_runs():
+    """Yield (generator, dataset, method, n) tuples for all planned experiments."""
+    for generator in GENERATORS:
+        for dataset in DATASETS:
+            # fasttts: full sweep
+            for n in N_VALUES:
+                yield (generator, dataset, "fasttts", n)
+            # baseline: only at the sanity-check N values, restricted datasets
+            if dataset in BASELINE_SANITY_DATASETS:
+                for n in BASELINE_SANITY_N:
+                    yield (generator, dataset, "baseline", n)
+
+
 def run_experiments(data_dir: Path):
-    """Run all benchmark experiments."""
+    """Run all benchmark experiments based on the planned configs."""
     print("=" * 60)
     print(f"Running all experiments (saving to {data_dir})...")
     print("=" * 60)
 
     os.chdir(BENCHMARK_DIR)
 
-    for combo in MODEL_COMBOS:
-        for dataset in DATASETS:
-            for method in METHODS:
-                for n in N_VALUES:
-                    config_name = f"{DATASET_CONFIG[dataset]}_{n}.yaml"
-                    config_path = f"configs/{combo}/{dataset}/{method}/{config_name}"
+    for generator, dataset, method, n in _planned_runs():
+        config_path = f"configs/{generator}/{dataset}/{method}/n{n}.yaml"
 
-                    if not Path(config_path).exists():
-                        print(f"Config not found: {config_path}, skipping...")
-                        continue
+        if not Path(config_path).exists():
+            print(f"Config not found: {config_path}, skipping...")
+            continue
 
-                    print(f"\n{'='*60}")
-                    print(f"Running: {combo}/{dataset}/{method}/n={n}")
-                    print(f"{'='*60}")
+        print(f"\n{'='*60}")
+        print(f"Running: {generator}/{dataset}/{method}/n={n}")
+        print(f"{'='*60}")
 
-                    # Override output_dir via environment or modify config dynamically
-                    output_dir = data_dir / combo / dataset / method
-                    output_dir.mkdir(parents=True, exist_ok=True)
-                    cmd = [sys.executable, "run_benchmarks.py", config_path]
-                    env = os.environ.copy()
-                    env["BENCHMARK_OUTPUT_DIR"] = str(output_dir)
-                    try:
-                        subprocess.run(cmd, check=True, env=env)
-                    except subprocess.CalledProcessError as e:
-                        print(f"Error running benchmark: {e}")
-                        continue
+        output_dir = data_dir / generator / dataset / method
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cmd = [sys.executable, "run_benchmarks.py", config_path]
+        env = os.environ.copy()
+        env["BENCHMARK_OUTPUT_DIR"] = str(output_dir)
+        try:
+            subprocess.run(cmd, check=True, env=env)
+        except subprocess.CalledProcessError as e:
+            print(f"Error running benchmark: {e}")
+            continue
 
     print("\n" + "=" * 60)
     print("All experiments completed!")
@@ -91,7 +109,8 @@ def parse_jsonl_folder(folder_path: Path, dataset: str):
 
     results = {}
     n_pattern = re.compile(r"_n(\d+)_")
-    problem_limit = 30 if "aime" in dataset else 40
+    # Expected problem counts for sanity warnings only
+    problem_limit = {"aime": 30, "amc": 40, "math500": 500}.get(dataset, 0)
 
     if not folder_path.exists():
         return results
@@ -170,45 +189,43 @@ def collect_results(data_dir: Path):
     results = {}
     for dataset in DATASETS:
         results[dataset] = {}
-        for combo in MODEL_COMBOS:
-            results[dataset][combo] = {}
+        for generator in GENERATORS:
+            results[dataset][generator] = {}
             for method in METHODS:
-                result_dir = data_dir / combo / dataset / method
+                result_dir = data_dir / generator / dataset / method
                 folder_results = parse_jsonl_folder(result_dir, dataset)
                 if folder_results:
-                    results[dataset][combo][method] = folder_results
+                    results[dataset][generator][method] = folder_results
                 else:
-                    results[dataset][combo][method] = {}
+                    results[dataset][generator][method] = {}
 
     return results
 
 
-TOP_N_VALUES = N_VALUES
-
-
-def run_accuracy_evaluation(eval_script: Path, result_file: Path, top_n: int):
-    """Run accuracy evaluation script and return the accuracy value."""
-    import re
-
+def run_accuracy_evaluation(eval_script: Path, result_file: Path,
+                            agg_strategy: str = "last"):
+    """Run the multi-metric evaluation script on a single result file."""
+    output_path = result_file.with_suffix(".eval.json")
     cmd = [
-        "python",
+        sys.executable,
         str(eval_script),
-        "--data_name",
-        "math",
-        "--file_path",
-        str(result_file),
-        "--top_n",
-        str(top_n),
+        "--data_name", "math",
+        "--file_path", str(result_file),
+        "--agg_strategy", agg_strategy,
+        "--output", str(output_path),
     ]
 
     try:
         result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
+            cmd, capture_output=True, text=True,
             cwd=str(eval_script.parent),
         )
-        return float(result.stdout.strip())
+        if result.returncode != 0:
+            print(f"Evaluation failed: {result.stderr[:500]}")
+            return None
+        if output_path.exists():
+            with open(output_path) as f:
+                return json.load(f)
     except Exception as e:
         print(f"Error evaluating accuracy: {e}")
 
@@ -216,16 +233,18 @@ def run_accuracy_evaluation(eval_script: Path, result_file: Path, top_n: int):
 
 
 def evaluate_accuracy(data_dir: Path):
-    """Evaluate accuracy for all experiments using the accuracy evaluation script.
-    
-    Checks for existing accuracy.json in data_dir. If not found, evaluates
-    accuracy for all combinations, trying all top_n values and picking the highest.
+    """Evaluate accuracy for all experiments.
+
+    Evaluates each N-value result file independently (separate beam search
+    runs), then aggregates into a scaling curve.
+
+    For `fasttts`: sweeps all N_VALUES.
+    For `baseline`: only the BASELINE_SANITY_N values (sanity check).
     """
     print(f"Evaluating accuracy from {data_dir}...")
 
     accuracy_json_path = data_dir / "accuracy.json"
 
-    # Check if accuracy.json already exists
     if accuracy_json_path.exists():
         print(f"Loading existing accuracy data from {accuracy_json_path}")
         with open(accuracy_json_path, "r") as f:
@@ -236,42 +255,45 @@ def evaluate_accuracy(data_dir: Path):
 
     for dataset in DATASETS:
         accuracy_results[dataset] = {}
-        for combo in MODEL_COMBOS:
-            accuracy_results[dataset][combo] = {}
+        for generator in GENERATORS:
+            accuracy_results[dataset][generator] = {}
             for method in METHODS:
-                result_dir = data_dir / combo / dataset / method
+                result_dir = data_dir / generator / dataset / method
 
-                # Use n=512 for the result file (highest n)
-                n = 512
-                pattern = f"{DATASET_CONFIG[dataset]}_bw4_n{n}_iter10"
-                if method == "spec_prefix":
-                    pattern += "_specdiff"
-                pattern += "_results.jsonl"
+                # Decide which N values to evaluate for this method
+                if method == "baseline":
+                    if dataset not in BASELINE_SANITY_DATASETS:
+                        continue
+                    ns_to_eval = BASELINE_SANITY_N
+                else:
+                    ns_to_eval = N_VALUES
 
-                result_file = result_dir / pattern
+                method_results = []
+                for n in ns_to_eval:
+                    pattern = f"{dataset}_bw4_n{n}_iter10"
+                    if method == "fasttts":
+                        pattern += "_specdiff"
+                    pattern += "_results.jsonl"
 
-                if not result_file.exists():
-                    print(f"Result not found for accuracy: {result_file}")
-                    continue
+                    result_file = result_dir / pattern
+                    if not result_file.exists():
+                        print(f"Result not found: {result_file}")
+                        continue
 
-                # Try all top_n values and pick the top-1 accuracy
-                best_acc = None
-                best_top_n = None
+                    eval_data = run_accuracy_evaluation(eval_script, result_file)
+                    if eval_data and "result" in eval_data:
+                        r = eval_data["result"]
+                        method_results.append(r)
+                        print(
+                            f"{dataset}/{generator}/{method} N={r['n']}: "
+                            f"Pass@N={r['pass_at_n']}% "
+                            f"MajVote={r['majority_vote']}% "
+                            f"PRM-Vote={r['prm_vote']}%"
+                        )
 
-                for top_n in TOP_N_VALUES:
-                    acc = run_accuracy_evaluation(eval_script, result_file, top_n)
-                    if acc is not None:
-                        if best_acc is None or acc > best_acc:
-                            best_acc = acc
-                            best_top_n = top_n
-                    else:
-                        print(f"{dataset}/{combo}/{method}: No accuracy found")
+                if method_results:
+                    accuracy_results[dataset][generator][method] = method_results
 
-                if best_acc is not None:
-                    accuracy_results[dataset][combo][method] = best_acc
-                    print(f"{dataset}/{combo}/{method}: {best_acc}% (top_n={best_top_n})")
-
-    # Save accuracy results to accuracy.json
     if accuracy_results:
         os.makedirs(data_dir, exist_ok=True)
         with open(accuracy_json_path, "w") as f:
@@ -288,7 +310,7 @@ def evaluate_accuracy(data_dir: Path):
 
 def plot_goodput(data, output_path):
     """Generate goodput figure similar to main_results.ipynb."""
-    method_map = {"baseline": "Baseline", "spec_prefix": "FastTTS"}
+    method_map = {"baseline": "Baseline", "fasttts": "FastTTS"}
 
     # Parse data to DataFrame
     records = []
@@ -378,13 +400,14 @@ def plot_goodput(data, output_path):
             ax.set_xlabel(combo)
             ax.set_ylabel("Goodput (tokens/s)" if ax_idx == 0 else "")
             ax.set_xscale("log", base=2)
-            ax.set_xticks([8, 32, 128, 512])
+            ax.set_xticks(N_VALUES)
             ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
             ax.tick_params(axis="x", rotation=0)
             ax.grid(True, which="both", ls="--", c="0.7")
 
-            # Inset plot for n=512
-            zoom_data = subset[subset["n"] == 512]
+            # Inset plot for the largest N
+            zoom_n = max(N_VALUES)
+            zoom_data = subset[subset["n"] == zoom_n]
             if not zoom_data.empty:
                 inset_ax = ax.inset_axes([0.5, 0.5, 0.45, 0.45])
                 bar_width = 0.7
@@ -409,11 +432,12 @@ def plot_goodput(data, output_path):
                 inset_ax.set_ylabel("")
                 inset_ax.set_ylim(0, zoom_data["Goodput"].max() * 1.2)
 
-                rect_x = 400
+                rect_x = zoom_n * 0.78
+                rect_width = zoom_n * 0.4
                 rect_height = max(zoom_data["Goodput"]) * 1.5
                 rect = Rectangle(
                     (rect_x, 0),
-                    200,
+                    rect_width,
                     rect_height,
                     edgecolor="gray",
                     facecolor="none",
@@ -424,7 +448,7 @@ def plot_goodput(data, output_path):
                 ax.add_patch(rect)
 
                 arrow = ConnectionPatch(
-                    xyA=(rect_x + 100, rect_height),
+                    xyA=(rect_x + rect_width / 2, rect_height),
                     coordsA=ax.transData,
                     xyB=(0.5, 0.0),
                     coordsB=inset_ax.transAxes,
@@ -477,7 +501,7 @@ def plot_goodput(data, output_path):
 
 def plot_latency(data, output_path):
     """Generate latency figure similar to main_results.ipynb."""
-    method_map = {"baseline": "Baseline", "spec_prefix": "FastTTS"}
+    method_map = {"baseline": "Baseline", "fasttts": "FastTTS"}
 
     records = []
     for dataset, combinations in data.items():
@@ -647,115 +671,76 @@ def plot_latency(data, output_path):
 
 
 def plot_accuracy(accuracy_data, output_path):
-    """Generate accuracy figure similar to acc.ipynb."""
+    """Generate accuracy-vs-N scaling curves.
+
+    Primary thesis figure: shows how accuracy scales with the number of
+    completions N, for each metric (Pass@N, MajVote, PRM-Max, PRM-Vote).
+    """
     plt.rcParams.update(
         {
-            "font.size": 22,
-            "axes.titlesize": 28,
-            "axes.labelsize": 24,
-            "xtick.labelsize": 22,
-            "ytick.labelsize": 22,
-            "legend.fontsize": 22,
-            "legend.title_fontsize": 24,
-            "figure.titlesize": 30,
+            "font.size": 14,
+            "axes.titlesize": 18,
+            "axes.labelsize": 16,
+            "xtick.labelsize": 14,
+            "ytick.labelsize": 14,
+            "legend.fontsize": 12,
         }
     )
 
-    methods = ["baseline", "spec_prefix"]
-    models = ["1.5B-7B", "7B-1.5B", "1.5B-1.5B"]
-    datasets = ["aime", "amc"]
-
-    # Create DataFrame
-    records = []
-    for dataset in datasets:
-        for model in models:
-            for method in methods:
-                if (
-                    dataset in accuracy_data
-                    and model in accuracy_data[dataset]
-                    and method in accuracy_data[dataset][model]
-                ):
-                    value = accuracy_data[dataset][model][method]
-                    records.append(
-                        {
-                            "Dataset": dataset.upper(),
-                            "Model": model,
-                            "Method": method,
-                            "Acc": value,
-                        }
-                    )
-
-    df = pd.DataFrame(records)
-    if df.empty:
-        print("No data for accuracy plot")
-        return
-
-    model_names = {"1.5B-7B": "1.5/7", "7B-1.5B": "7/1.5", "1.5B-1.5B": "1.5/1.5"}
-    method_names = {"baseline": "Baseline", "spec_prefix": "FastTTS"}
-
-    base_color = sns.color_palette()[0]
-    fasttts_color = sns.color_palette()[1]
-    palette = [base_color, fasttts_color]
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6), sharey=False)
-
-    yticks_dict = {
-        "aime": [0, 5, 10, 15, 20, 25],
-        "amc": [0, 20, 40, 60, 80],
+    metric_labels = {
+        "pass_at_n": "Pass@N",
+        "majority_vote": "Majority Vote",
+        "prm_max": "PRM-Max",
+        "prm_vote": "PRM-Vote",
+    }
+    metric_styles = {
+        "pass_at_n": {"color": "tab:gray", "linestyle": "--", "marker": "s"},
+        "majority_vote": {"color": "tab:blue", "linestyle": "-", "marker": "o"},
+        "prm_max": {"color": "tab:orange", "linestyle": "-", "marker": "^"},
+        "prm_vote": {"color": "tab:green", "linestyle": "-", "marker": "D"},
     }
 
-    for ax, dataset in zip(axes, datasets):
-        data_subset = df[df["Dataset"] == dataset.upper()]
-        for i, model in enumerate(models):
-            for j, method in enumerate(methods):
-                acc_vals = data_subset[
-                    (data_subset["Model"] == model) & (data_subset["Method"] == method)
-                ]["Acc"].values
-                if len(acc_vals) > 0:
-                    acc = acc_vals[0]
-                    ax.bar(
-                        i + j * 0.32 - 0.16,
-                        acc,
-                        width=0.32,
-                        color=palette[j],
-                        edgecolor="black",
-                        linewidth=2.5,
-                        label=method_names[method] if i == 0 else None,
-                        zorder=2,
-                    )
-        ax.set_xticks(np.arange(len(models)))
-        ax.set_xticklabels([model_names[m] for m in models], fontsize=28)
-        ax.set_xlabel("", fontsize=28)
-        ax.set_title(dataset.upper(), fontsize=35)
-        ax.grid(axis="y", linestyle="--", alpha=0.7, zorder=0)
-        if ax.get_legend() is not None:
-            ax.get_legend().remove()
-        ax.set_yticks(yticks_dict[dataset])
-        ax.set_yticklabels(yticks_dict[dataset], fontsize=35)
-        ax.set_ylabel("")
+    # Collect all (dataset, combo, method) combinations that have results
+    panels = []
+    for dataset in accuracy_data:
+        for combo in accuracy_data[dataset]:
+            for method in accuracy_data[dataset][combo]:
+                results = accuracy_data[dataset][combo][method]
+                if isinstance(results, list) and results:
+                    panels.append((dataset, combo, method, results))
 
-    fig.text(0.04, 0.5, "Acc (%)", va="center", rotation="vertical", fontsize=35)
+    if not panels:
+        print("No scaling data for accuracy plot")
+        return
 
-    handles = [
-        plt.Rectangle((0, 0), 1, 1, color=base_color, ec="k", lw=2.5, label="Baseline"),
-        plt.Rectangle((0, 0), 1, 1, color=fasttts_color, ec="k", lw=2.5, label="FastTTS"),
-    ]
-    fig.legend(
-        handles,
-        [h.get_label() for h in handles],
-        title="",
-        loc="lower center",
-        bbox_to_anchor=(0.5, -0.05),
-        ncol=len(methods),
-        frameon=False,
-        fontsize=35,
-        title_fontsize=35,
-    )
+    n_panels = len(panels)
+    fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 5), squeeze=False)
+    axes = axes[0]
 
-    plt.tight_layout(rect=[0.05, 0.05, 1, 1])
+    for ax, (dataset, combo, method, results) in zip(axes, panels):
+        n_vals = [r["n"] for r in results]
+
+        for metric_key, label in metric_labels.items():
+            vals = [r[metric_key] for r in results]
+            style = metric_styles[metric_key]
+            ax.plot(n_vals, vals, label=label, linewidth=2, markersize=6, **style)
+
+        ax.set_xscale("log", base=2)
+        ax.set_xlabel("N (completions)")
+        ax.set_ylabel("Accuracy (%)")
+        method_label = "FastTTS" if method == "fasttts" else "Baseline"
+        ax.set_title(f"{dataset.upper()} / {combo} / {method_label}")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="lower right")
+
+        # Set x-ticks to actual N values
+        ax.set_xticks(n_vals)
+        ax.set_xticklabels([str(n) for n in n_vals], rotation=45)
+
+    plt.tight_layout()
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    plt.savefig(output_path, bbox_inches="tight")
-    print(f"Saved accuracy figure to {output_path}")
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"Saved accuracy scaling figure to {output_path}")
     plt.close()
 
 

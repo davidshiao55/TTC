@@ -61,7 +61,7 @@ def run_benchmark_from_config(config_path: str):
         try:
             # --- Run Inference ---
             output_dir = Path(config.output_dir)
-            output_dir.mkdir(exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
             config_suffix = f"_bw{config.search_config.beam_width}_n{config.search_config.n}_iter{config.search_config.num_iterations}"
             if config.enable_spec_diff:
                 config_suffix += "_specdiff"

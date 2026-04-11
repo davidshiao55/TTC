@@ -369,9 +369,83 @@ Sleep discards GPU KV cache (physical pages freed). Cross-iteration KV reuse is 
 | Duplicate beams, same wake period | Always | 0 |
 | Sibling beams, same wake period | Partial | New-step tokens only |
 
-### Relevance to thesis attention offloading
+---
 
-The prefix cache structure aligns naturally with the attention offloading design:
-- **Shared prefix KV** (`[system_prompt + question + all_shared_steps]`) stays GPU-resident — exactly the hot path of the prefix cache
-- **Per-beam suffix KV** (the unique steps of each beam after the last branch point) moves to CPU — ephemeral, written once, read once
-- GPU handles the multiply-reused prefix; CPU handles the per-beam unique suffix
+## Answer Selection and Accuracy Metrics
+
+### How FastTTS selects the final answer
+
+The evaluation pipeline (`accuracy_evaluation/evaluation/evaluate.py`) uses **PRM-weighted majority voting**:
+
+```python
+scores = [np.prod(score) for score in sample['solutions']['scores'][0]]
+max_indices = np.argsort(scores)[-top_n:]
+completions = [sample['solutions']['completions'][0][i] for i in max_indices]
+sample['pred'] = [extract_answer(completion, data_name) for completion in completions]
+sample['pred'] = [max(sample['pred'], key=lambda x: sample['pred'].count(x))]
+```
+
+1. Rank all completed beams by **product of per-step PRM scores**
+2. Select the top `top_n` beams
+3. Extract the `\boxed{}` answer from each
+4. **Majority vote** among those extracted answers
+
+The `top_n` parameter controls the balance between verifier trust and voting:
+- `top_n=1`: Pure verifier selection (highest PRM-product beam wins)
+- `top_n=N`: Majority vote among top-N PRM-ranked beams
+- `top_n=all`: Full majority voting across all beams
+
+### How accuracy is reported (and the problems with it)
+
+**Problem 1 — Test-set hyperparameter tuning.** The original FastTTS codebase (`run_all_experiments.py`) **sweeps** `top_n` over all N values (8, 16, 32, ..., 512) and **reports the maximum accuracy** achieved across the sweep. This is hyperparameter tuning on the test set — the reported number is optimistic.
+
+**Problem 2 — Completion count exceeds n.** FastTTS beam search runs for a fixed `num_iterations` and does **not** abort when n completions are reached. The `_check_n_completion` function (and its AE equivalent at `beam_search.py:249`) only **records a latency timestamp** — it does not stop the search or truncate results. The search continues, accumulating completions beyond n. In practice, n=8 produces ~11 completed beams.
+
+Neither the search loop nor the evaluation pipeline truncates to n. All completions (>n) are passed to `evaluate.py`.
+
+**Problem 3 — Inconsistent latency/accuracy sets.** FastTTS reports:
+- **Latency**: time to reach n completions (`n_gen_latency` snapshot at the iteration where `completed >= n`)
+- **Accuracy**: computed over **all** completions (which is > n)
+
+This makes the system look better than it is — fast latency (measured at n) paired with high accuracy (benefiting from extra completions beyond n). A fair report would use the same set of completions for both metrics.
+
+**Comparison: Liu et al. (compute-optimal-tts) aborts at n.** In contrast, Liu et al.'s beam search (`tree.py:289`) terminates immediately when n completions are reached:
+```python
+if len(end_nodes) == beam_size:
+    break
+```
+They also dynamically reduce expansion width as solutions accumulate (`k = beam_size - len(end_nodes)`). This guarantees exactly n completed solutions, making their pass@N clean.
+
+### Comparison with other TTC frameworks
+
+| Framework | Answer selection | Termination | Reporting |
+|---|---|---|---|
+| **FastTTS** | PRM-product rank → top_n → majority vote | Fixed iterations (no abort at n) | Sweep top_n, report max (optimistic) |
+| **compute-optimal-tts** (Liu et al.) | 7 methods independently | Abort at n completions | Report each method separately (transparent) |
+| **search-and-learn** (Beeching et al.) | 3 methods at multiple N | Fixed iterations | Report all at each N (transparent) |
+
+### Metric definitions
+
+- **Top-1 accuracy**: A single answer is selected from N beams (via voting or verifier ranking). Check if it matches ground truth. This is the deployed-system metric.
+- **Pass@N accuracy**: Does *at least one* of the N beams contain the correct answer? Measures search coverage regardless of selection quality. Always >= Top-1.
+- **Gap (Pass@N − Top-1)**: How much accuracy the verifier/voting leaves on the table. Correct answers exist but aren't selected.
+
+### PRM-Vote vs PRM-Max for answer selection (Liu et al. findings)
+
+Liu et al. ("Can 1B Surpass 405B") explicitly benchmark voting methods for search-based TTS results (Table 2, MATH-500):
+
+| Method | Skywork-PRM-7B | Qwen2.5-Math-PRM-7B |
+|---|---|---|
+| Majority Vote | 86.8 | 87.6 |
+| PRM-Min-Max | 83.0 | 87.4 |
+| PRM-Min-Vote | 86.6 | 87.6 |
+| PRM-Last-Max | 84.4 | 87.6 |
+| **PRM-Last-Vote** | **87.0** | 87.6 |
+| PRM-Avg-Max | 85.8 | **87.8** |
+| PRM-Avg-Vote | 86.8 | 87.6 |
+
+Key findings:
+- **Vote variants consistently match or beat Max variants** — using PRM to weight a majority vote is better than trusting PRM to pick the single best beam
+- **Skywork-PRM is sensitive to voting method**: PRM-Last-Vote (87.0) beats PRM-Last-Max (84.4) by 2.6 points. This is our PRM — so PRM-Max (our `top_n=1`) would underperform
+- **Qwen2.5-Math-PRM is insensitive**: all methods give ~87.6 because it's well-calibrated (trained with LLM-as-judge data cleaning)
+- The gap between PRM-Vote and PRM-Max reflects PRM calibration quality. Poorly calibrated PRMs benefit more from voting as a correction mechanism

@@ -23,17 +23,20 @@ thesis-specific modifications.
 | `models/reward_utils.py` | Rewritten (tokenizer boundary fix) |
 | `search/beam_search.py` | Fully rewritten (decomposed, StepChunk, step-hash propagation) |
 | `search/beam.py` | Restructured (renamed fields, StepChunk, beam identity) |
-| `search/dvts.py` | **Not migrated** -- uses old Beam field names, will crash |
-| `search/best_of_n.py` | **Not migrated** -- uses old Beam field names, will crash |
-| `search/dynamic_branching.py` | **Not migrated** -- uses old Beam field names, will crash |
-| `search/vg_search.py` | **Not migrated** -- uses old Beam field names, will crash |
+| `search/common.py` | New -- shared infrastructure (SearchState, phase functions, generate/score/parse) |
+| `search/dvts.py` | Fully migrated -- uses shared infrastructure + DVTS-specific subtree pruning |
+| `search/best_of_n.py` | Fully migrated -- standalone single-shot generation + scoring |
+| `search/dynamic_branching.py` | Fully migrated -- uses shared infrastructure + score-proportional duplication |
+| `search/vg_search.py` | Fully migrated -- uses shared infrastructure + 3-stage sampling params |
 | PRM plugin (`prm_model.py`) | Migrated to V1 TokenPooler |
+| `accuracy_evaluation/evaluation/evaluate.py` | Rewritten (multi-metric, no test-set tuning) |
+| `run_all_experiments.py` | Updated (removed `top_n` sweep, scaling curve plots) |
 
 The non-migrated search strategies construct `Beam` objects with field names
 that no longer exist (`index`, `next_texts`, `lookahead_texts`, `best_scores`,
 `all_scores`, `previous_text`, `history`, `completion_tokens`,
 `total_completion_tokens`, `completion_time`, `future_texts`). See
-[Section 10](#10-known-limitations--open-issues) for the full field mapping.
+[Section 11](#11-known-limitations--open-issues) for the full field mapping.
 
 ---
 
@@ -197,14 +200,57 @@ return {
 
 ### GPU memory allocation
 
-v0.18.1 has higher memory overhead than v0.9.2 (CUDA graphs, torch.compile).
-Re-profiled with `memory_latency_analysis.py`:
+v0.18.1 has higher memory overhead than v0.9.2 (CUDA graphs, torch.compile,
+per-process CUDA contexts). Each spawned process adds ~0.9–1.4 GiB overhead
+beyond what `gpu_memory_utilization` budgets for. With two processes
+(generator + verifier), the combined overhead is ~2.3 GiB.
 
-- Total memory: 0.90 -> **0.89** (prevent OOM)
-- Verifier minimum: 0.15 -> **0.16** (0.15 has insufficient KV cache for
-  `max_model_len=4096`)
+#### Root cause: PyTorch memory fragmentation
 
-Both AE and thesis configs updated to the same splits for fair comparison.
+The original AE splits (baseline 0.68/0.22=0.90, spec-prefix 0.75/0.15=0.90)
+OOM in v0.18.1 — but not from absolute memory exhaustion. The OOM occurs on
+**activation allocations** (MLP gate_up projection: `max_num_batched_tokens ×
+18944 × 2` bytes = 296 MiB at batch 8192) inside torch.compile/inductor
+compiled code. PyTorch's default caching allocator fragments into "slivers"
+of unusable memory (reported as "reserved but unallocated" in OOM messages,
+observed 187–869 MiB). Two engines on one GPU compounds this: each process
+independently fragments its allocator pool, and the combined waste exceeds
+the ~2.4 GiB headroom at 0.90 total utilization.
+
+This fragmentation is worse in v0.18.1 because CUDA graphs + torch.compile
+create more allocation/deallocation cycles with varying tensor sizes. The
+`memory_latency_analysis.py` profiling (1 problem / 1 iteration) didn't
+reproduce it because fewer cycles = less fragmentation. The full evaluation
+pipeline (30 problems / 10 iterations) fragments far more.
+
+#### Fix: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+
+Set in `models/vllm_wrapper.py` at module level. This tells PyTorch's default
+caching allocator to use growable memory segments instead of fixed-size blocks,
+eliminating fragmentation-induced OOM. This is the documented PyTorch solution
+for workloads with varying allocation sizes (see PyTorch CUDA Memory
+Management docs).
+
+**Compatibility:**
+- **Safe** with kv_offload, prefetch offloader, UVA offloader (they use
+  standard `torch.zeros()`/`torch.empty_strided()`, not custom allocators)
+- **Incompatible** with vLLM's `CuMemAllocator` (sleep mode). Sleep mode
+  replaces PyTorch's default allocator via `cuMemCreate`/`cuMemMap` for
+  tagged memory management. The two allocators cannot coexist. When
+  `offload_enabled=True` enables sleep mode, `expandable_segments` must be
+  removed — but at that point only one model's weights are GPU-resident
+  (the other is sleeping), so fragmentation headroom is not an issue.
+
+#### Updated splits
+
+With `expandable_segments:True`, the original AE total=0.90 is restored:
+
+- Verifier minimum: 0.15 -> **0.16** (0.15 has insufficient KV cache capacity
+  for `max_model_len=4096` due to higher per-process overhead in v0.18.1;
+  this is a capacity constraint, not fragmentation)
+- Baseline split: generator 0.68 / verifier **0.22** (total 0.90)
+- Spec-prefix split: generator **0.74** / verifier 0.16 (total 0.90;
+  original AE was 0.75/0.15, adjusted for verifier minimum 0.16)
 
 ---
 
@@ -342,9 +388,11 @@ for j in range(min(len(score[0]), len(beam.scores))):
         score[0][j] = beam.scores[j]
 ```
 
-**Layer 2 -- step_hash propagation (within-iteration):**
-`_propagate_by_step_hash()` builds a bank from ALL active beams' historical
-scores AND fresh PRM output. Matches by cumulative text hash (encodes full
+**Layer 2 -- step_hash propagation (persistent bank + within-iteration):**
+`state.step_hash_bank` accumulates all scored hash->score pairs across
+iterations (survives pruning). Fresh PRM scores are added to the bank
+between Layer 1 and Layer 2; `_propagate_by_step_hash()` then fills
+remaining Nones from it. Matches by cumulative text hash (encodes full
 prefix). Only runs when Nones exist.
 
 ```
@@ -355,10 +403,15 @@ Within a single score_outputs batch:
     -> Layer 1: prev [s1_Y] fills step1
     -> Layer 2: bank has step2 hash -> s2 from X -> fills step2
     -> result: [s1_Y, s2, s3_Y]
+
+Cross-iteration (pruned beam donor):
+  Iter N: beam A scored -> step_hash_bank[h2] = s2 -> A pruned
+  Iter N+1: beam B generates step2 (same text, KV cache hit -> None)
+    -> Layer 2: persistent bank has h2 -> s2 -> fills step2
 ```
 
-**Layer 3 -- RuntimeError safety net:** If Nones remain (pruned beam's KV
-cache reused -- scores permanently lost), raises RuntimeError.
+**Layer 3 -- RuntimeError safety net:** If Nones remain after all layers,
+raises RuntimeError.
 
 #### Performance
 
@@ -497,7 +550,141 @@ Fix: removed the guard. Completed beams always added to `completed_beams`.
 
 ---
 
-## 7. Code Restructuring
+## 7. Accuracy Evaluation Redesign
+
+### Issues found
+
+Five methodological flaws in the original evaluation pipeline, all
+pre-existing in AE and carried through to the initial thesis migration.
+
+| # | Issue | Severity | Location |
+|---|---|---|---|
+| 1 | **Test-set tuning of `top_n`** | Critical | `run_all_experiments.py:186,257-272` |
+| 2 | **Completion count exceeds n** | Critical | `beam_search.py:_check_n_completion()` |
+| 3 | **Inconsistent latency/accuracy pairing** | Critical | latency at n, accuracy over >n |
+| 4 | **Hardcoded `np.prod` aggregation** | Moderate | `evaluate.py:34` |
+| 5 | **Non-deterministic tie-breaking** | Minor | `evaluate.py:41` |
+
+**Issue 1 -- test-set tuning:** `run_all_experiments.py` swept `top_n`
+over `[8, 16, 32, ..., 512]` and reported the maximum accuracy -- classic
+hyperparameter tuning on the test set. Neither compute-optimal-tts (Liu
+et al.) nor search-and-learn (HuggingFace) do this.
+
+**Issue 2 -- completion overshoot:** `_check_n_completion()` only recorded
+latency metrics when `completed_beams >= n` but never signalled the main
+loop to stop. Search continued until all beams exhausted or max iterations.
+Empirically confirmed: n=8 produced 12 completions.
+
+**Issue 3 -- inconsistent pairing:** `n_gen_latency` was snapshot at the
+moment n completions arrived, but `_finalize()` returned ALL completed
+beams (often >n). `evaluate.py` scored all of them. Result: low latency
+(at n) paired with inflated accuracy (from >n completions).
+
+**Issue 4 -- hardcoded aggregation:** `evaluate.py` used `np.prod(score)`
+regardless of `SearchConfig.agg_strategy`. Both search-and-learn and
+compute-optimal-tts default to `"last"` (last step score), not product.
+This created a mismatch: beam search pruned by `"last"` score but
+evaluation ranked by product.
+
+**Issue 5 -- tie-breaking:** `max(pred, key=lambda x: pred.count(x))`
+returns the first element achieving the max count -- order-dependent.
+
+### Fixes
+
+**Beam search early exit** (`beam_search.py`):
+- `_check_n_completion()` returns `bool` -- `True` when `completed >= n`
+  or no active beams remain
+- `_filter_completed_and_prune()` simplified: no longer returns stop signal
+  (redundant -- `_check_n_completion` covers both conditions)
+- Main loop breaks on `reached_n`
+- `_finalize()` always sorts by aggregate PRM score (descending) and
+  truncates to `[:config.n]`. Handles burst completions from the final
+  iteration fairly (multiple beams complete simultaneously -> keep top-n
+  by score since they share the same compute budget).
+
+**Evaluation pipeline rewrite** (`evaluate.py`):
+- Replaced single-metric pipeline with multi-metric evaluation
+- Four metrics computed at each N:
+  - **Pass@N**: unbiased estimate via OpenAI Codex formula
+  - **Majority Vote**: most common extracted answer (no PRM)
+  - **PRM-Max**: best single completion by aggregate PRM score
+  - **PRM-Vote**: group answers by `math_equal`, sum PRM scores per group,
+    pick highest-sum group (matches Liu et al. `_agg_prm_last_vote`)
+- Ordered subsampling: `completions[:n_eval]` for multi-N curves from a
+  single max-N run (following search-and-learn methodology)
+- Configurable `agg_strategy` (default: `"last"`, matching both reference
+  frameworks)
+- Deterministic tie-breaking (lexicographic on canonical answer form)
+
+**Orchestration** (`run_all_experiments.py`):
+- Removed `TOP_N_VALUES` sweep entirely
+- `evaluate_accuracy()` calls `evaluate.py` once per result file
+- `plot_accuracy()` generates scaling curves (accuracy vs N, log2 x-axis)
+
+### Reference framework alignment
+
+| Aspect | compute-optimal-tts | search-and-learn | FastTTS-thesis |
+|---|---|---|---|
+| Stops at exactly N | Yes | Yes (pad if fewer) | Yes (early exit + truncate) |
+| Score aggregation | Configurable (min/last/avg) | Hardcoded `"last"` | Configurable, default `"last"` |
+| Answer selection | 7 methods, fixed per run | 3 methods, all reported | 4 methods, all reported |
+| Multi-N evaluation | Separate runs per N | Subsample from max-N | Subsample from max-N |
+| Pass@N metric | Not implemented | OpenAI formula | OpenAI formula |
+| Test-set tuning prevention | Config locked before eval | Ordered subsampling | No sweeping |
+
+### Empirical findings: TTC accuracy scaling
+
+After fixing the pipeline, the original FastTTS setup
+(`Qwen2.5-Math-7B-Instruct` + Skywork-PRM on AIME) still showed Pass@N
+scaling but **flat selection metrics**. Confirmed pre-existing in AE
+(not a regression). Three independent root causes:
+
+1. **Context exhaustion** -- `Qwen2.5-Math-*-Instruct` has
+   `max_position_embeddings=4096`. On hard AIME problems, 25-88% of
+   completions hit the limit and degenerate before producing
+   `\boxed{}`. Non-Math `Qwen2.5-*-Instruct` has 32K context.
+2. **PRM miscalibration** -- Skywork-PRM-1.5B systematically ranks
+   wrong answers above correct ones on hard problems (verified: on
+   problem 69 with 75% correct rate, incorrect completions still have
+   higher mean PRM score).
+3. **AIME is too small** -- 30 problems means each flip = 3.3% noise;
+   any scaling signal under ±5% is invisible. Both reference frameworks
+   use **MATH-500** (500 problems) for scaling demonstrations.
+
+**Sweep results** (MajVote, N=8 → N=128, agg_strategy="last"):
+
+| Generator | Dataset | N=8 | N=128 | Δ |
+|---|---|---|---|---|
+| Math-1.5B | MATH-500 | 73.2% | 76.4% | +3.2% (saturated) |
+| Math-1.5B | AIME | 16.7% | 10.0% | noise |
+| Math-7B | AIME | 13.3% | 13.3% | 0% (context exhaustion) |
+| Instruct-1.5B | MATH-500 | 60.8% | 68.8% | **+8.0%** |
+| Instruct-1.5B | AIME | 3.3% | 13.3% | **+10.0%** |
+| Instruct-7B | MATH-500 | 73.0% | 76.4% | +3.4% |
+| Instruct-7B | AIME | 13.3% | 20.0% | **+6.7%** |
+
+**Key insights**:
+
+- **Math-specialized models saturate** (1.5B-Math hits 73.2% MajVote at
+  N=8 on MATH-500 -- close to ceiling).
+- **General-purpose Instruct models scale clearly** on both AIME and
+  MATH-500.
+- **Larger generators help most on hard problems**: 7B-Instruct
+  outperforms 1.5B-Instruct by +6.7% on AIME at N=128, justifying the
+  thesis offloading work.
+- **Beam search makes MajVote ≈ PRM-Vote** -- surviving beams already
+  concentrate on the same answer regardless of PRM weighting. PRM-Max
+  remains the weakest selection method (consistent with Liu et al.'s
+  finding for off-policy PRMs).
+
+**Recommended thesis setup**: `Qwen2.5-7B-Instruct` generator +
+Skywork-PRM-1.5B verifier, `max_model_len=8192`, MATH-500 (primary) +
+AIME 2024 (hard subset). Report all four selection methods (MajVote,
+PRM-Vote, PRM-Max, Pass@N) -- no cherry-picking.
+
+---
+
+## 8. Code Restructuring
 
 ### Decomposed beam search into named phases (`beam_search.py`)
 
@@ -560,7 +747,7 @@ Added: `step_hashes` (cumulative text hash per step, aligned 1:1 with
 
 ---
 
-## 8. Paper Discrepancies (Pre-existing in AE)
+## 9. Paper Discrepancies (Pre-existing in AE)
 
 These discrepancies exist in the **original AE codebase** -- they are NOT
 migration errors. The V1 migration faithfully preserves AE's actual behavior.
@@ -611,7 +798,7 @@ changes are made.
 
 ---
 
-## 9. Verification
+## 10. Verification
 
 Test scripts live in `migration_verification/`. Run from the container with
 `conda activate thesis` and `cd /TTC/FastTTS-thesis`.
@@ -660,7 +847,7 @@ per-step scores are exactly identical (Test 4).
 
 ---
 
-## 10. Known Limitations & Open Issues
+## 11. Known Limitations & Open Issues
 
 ### Non-migrated search strategies (CRITICAL)
 
@@ -689,24 +876,6 @@ absorbed.
 
 Additionally, `best_of_n.py` sorts by `completion_time` instead of score
 when `sort_completed=True` (pre-existing bug from AE).
-
-### Pruned beam KV cache persistence (unsolvable)
-
-A pruned beam's KV blocks remain in vLLM's global cache but its scores
-are discarded. No donor exists -- scores are permanently lost. Caught by
-RuntimeError safety net.
-
-```
-Iteration N:
-  beam A: [q + step1 + spec2]  -> scored -> scores = [s1, s2]
-  beam B: [q + step1]          -> scored -> scores = [s1']
-  (tie-broken by position: A pruned, B survives)
-
-Iteration N+1:
-  beam B generates step2 (== spec2 tokens)
-    -> KV cache hits from A -> step2 score = None
-    -> A pruned, scores gone -> no donor -> RuntimeError
-```
 
 ### SBE detokenizer text/token_ids desync
 

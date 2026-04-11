@@ -473,6 +473,11 @@ _SOL_3C = _SHARED_STEP1 + _SHARED_STEP2 + _ENDING_C
 # Test 9 — Question prefix sharing (within-batch)
 # -------------------------------------------------------------------
 
+def _fmt_scores(step_scores):
+    """Format a score list that may contain Nones."""
+    return [f'{s:.4f}' if s is not None else 'None' for s in step_scores]
+
+
 def test_question_prefix_sharing(llm):
     print("\n=== Test 9: Question prefix sharing (within-batch) ===")
 
@@ -482,15 +487,37 @@ def test_question_prefix_sharing(llm):
     assert len(scores) == 1
     assert len(scores[0]) == 3
 
+    # With prefix caching, the first solution (cold cache) gets full scores.
+    # Later solutions sharing the same prefix get None for cached steps.
+    # This is expected — propagation happens in the search layer, not here.
+    cold_scores = scores[0][0]
     for sol_idx, step_scores in enumerate(scores[0]):
         sol = [_SOL_3A, _SOL_3B, _SOL_3C][sol_idx]
         n_expected = sol.count("\n\n") + 1
+        n_nones = sum(1 for s in step_scores if s is None)
         print(f"  solution {sol_idx}: {len(step_scores)} scores "
-              f"(expected {n_expected}): {[f'{s:.4f}' for s in step_scores]}")
+              f"(expected {n_expected}), {n_nones} Nones: {_fmt_scores(step_scores)}")
         assert len(step_scores) == n_expected, (
             f"FAIL: solution {sol_idx} has {len(step_scores)} scores, expected {n_expected}"
         )
-        assert all(0.0 <= s <= 1.0 for s in step_scores)
+        # Non-None scores must be valid
+        assert all(0.0 <= s <= 1.0 for s in step_scores if s is not None)
+
+    # First solution should have no Nones (cold cache)
+    assert all(s is not None for s in cold_scores), (
+        f"FAIL: first solution (cold cache) has Nones: {_fmt_scores(cold_scores)}"
+    )
+
+    # Later solutions: Nones should only appear at shared prefix positions
+    for sol_idx in range(1, 3):
+        step_scores = scores[0][sol_idx]
+        for j, s in enumerate(step_scores):
+            if s is None:
+                assert j < len(cold_scores), (
+                    f"FAIL: None at position {j} beyond cold_scores range"
+                )
+                print(f"    solution {sol_idx} step {j}: None (cached, "
+                      f"cold value = {cold_scores[j]:.4f})")
 
     print("[9] PASS")
 
@@ -501,29 +528,40 @@ def test_question_prefix_sharing(llm):
 
 def test_cross_iteration_merge(llm):
     print("\n=== Test 10: Cross-iteration merge ===")
+    # Tests that scoring the same text twice produces consistent results,
+    # simulating cross-iteration scoring where step1 was scored in iter1
+    # and step1+step2+step3 scored in iter2.
+    # Propagation (merging prev_scores) now happens in the search layer,
+    # so here we just verify the raw PRM gives consistent scores for
+    # the same prefix across calls.
 
     question = "What is the greatest common factor of 48 and 18?"
 
     # Iteration 1: score 2-step solution
     scores_iter1 = llm.score_outputs([question], [[_SOL_2_STEPS]], "unused")
     s1 = scores_iter1[0][0]
-    print(f"  iter1 (2 steps): {[f'{s:.4f}' for s in s1]}")
+    print(f"  iter1 (2 steps): {_fmt_scores(s1)}")
     assert len(s1) > 0
 
-    # Iteration 2: score 3-step extension, prev_scores from iter1
-    scores_iter2 = llm.score_outputs(
-        [question], [[_SOL_3A]], "unused", prev_scores=[s1],
-    )
+    # Iteration 2: score 3-step extension (shares step1 prefix with iter1)
+    scores_iter2 = llm.score_outputs([question], [[_SOL_3A]], "unused")
     s2 = scores_iter2[0][0]
     n_expected = _SOL_3A.count("\n\n") + 1
-    print(f"  iter2 ({n_expected} steps): {[f'{s:.4f}' for s in s2]}")
+    print(f"  iter2 ({n_expected} steps): {_fmt_scores(s2)}")
     assert len(s2) == n_expected, (
         f"FAIL: iter2 has {len(s2)} scores, expected {n_expected}"
     )
-    assert abs(s2[0] - s1[0]) < 1e-4, (
-        f"FAIL: step1 differs: iter1={s1[0]:.6f} iter2={s2[0]:.6f}"
-    )
-    print(f"  step1 preserved: {s1[0]:.4f} == {s2[0]:.4f}")
+
+    # With prefix caching, step1 may be None in iter2 (cached from iter1).
+    # If not None, it should match iter1's value.
+    if s2[0] is not None:
+        assert abs(s2[0] - s1[0]) < 1e-4, (
+            f"FAIL: step1 differs: iter1={s1[0]:.6f} iter2={s2[0]:.6f}"
+        )
+        print(f"  step1 match: iter1={s1[0]:.4f} == iter2={s2[0]:.4f}")
+    else:
+        print(f"  step1: None in iter2 (cached), iter1={s1[0]:.4f} — "
+              f"search layer would fill from prev_scores")
 
     print("[10] PASS")
 
@@ -533,15 +571,16 @@ def test_cross_iteration_merge(llm):
 # -------------------------------------------------------------------
 
 def test_within_batch_propagation(llm):
-    print("\n=== Test 11: Within-batch solution prefix propagation ===")
+    print("\n=== Test 11: Within-batch solution prefix sharing ===")
+    # Two solutions with identical step1+step2, different step3.
+    # With prefix caching, solution B gets Nones at shared steps.
+    # The search layer (beam_search._propagate_by_step_hash) fills
+    # these from solution A at runtime. Here we verify the raw
+    # pattern: A has full scores, B has Nones at shared positions.
 
     question = "Compute gcd(48, 18) using the Euclidean algorithm."
 
-    # Two solutions with identical step1+step2, different step3
-    # Empty prev_scores — first time scoring
-    scores = llm.score_outputs(
-        [question], [[_SOL_3A, _SOL_3B]], "unused", prev_scores=[[], []],
-    )
+    scores = llm.score_outputs([question], [[_SOL_3A, _SOL_3B]], "unused")
 
     assert len(scores[0]) == 2
     s_a, s_b = scores[0][0], scores[0][1]
@@ -549,17 +588,28 @@ def test_within_batch_propagation(llm):
     for sol_idx, step_scores in enumerate(scores[0]):
         n_expected = [_SOL_3A, _SOL_3B][sol_idx].count("\n\n") + 1
         print(f"  solution {sol_idx}: {len(step_scores)} scores "
-              f"(expected {n_expected}): {[f'{s:.4f}' for s in step_scores]}")
+              f"(expected {n_expected}): {_fmt_scores(step_scores)}")
         assert len(step_scores) == n_expected
 
-    # Shared steps should have identical scores (same tokens)
+    # Solution A (cold cache) should have full scores
+    assert all(s is not None for s in s_a), (
+        f"FAIL: solution A (cold) has Nones: {_fmt_scores(s_a)}"
+    )
+
+    # Solution B: shared steps may be None (cached), step3 must be non-None (unique)
+    assert s_b[-1] is not None, (
+        f"FAIL: solution B's unique last step is None"
+    )
     for j in range(2):
-        assert abs(s_a[j] - s_b[j]) < 1e-4, (
-            f"FAIL: step{j+1} differs: A={s_a[j]:.6f} B={s_b[j]:.6f}"
-        )
-    print(f"  step1 match: {s_a[0]:.4f} == {s_b[0]:.4f}")
-    print(f"  step2 match: {s_a[1]:.4f} == {s_b[1]:.4f}")
-    print(f"  step3 differ: {s_a[2]:.4f} vs {s_b[2]:.4f}")
+        if s_b[j] is not None:
+            assert abs(s_a[j] - s_b[j]) < 1e-4, (
+                f"FAIL: step{j+1} differs: A={s_a[j]:.6f} B={s_b[j]:.6f}"
+            )
+            print(f"  step{j+1} match: A={s_a[j]:.4f} == B={s_b[j]:.4f}")
+        else:
+            print(f"  step{j+1}: B=None (cached), A={s_a[j]:.4f} — "
+                  f"search layer would fill via step_hash")
+    print(f"  step3 differ: A={s_a[2]:.4f} vs B={s_b[2]:.4f}")
 
     print("[11] PASS")
 
@@ -568,29 +618,35 @@ def test_within_batch_propagation(llm):
 # Test 12 — Edge case: RuntimeError when no donor
 # -------------------------------------------------------------------
 
-def test_edge_case_runtime_error(llm):
-    print("\n=== Test 12: Edge case — RuntimeError when no donor ===")
+def test_edge_case_no_donor(llm):
+    print("\n=== Test 12: Edge case — Nones with no batch donor ===")
+    # Score solution A to populate KV cache, then score solution B
+    # alone. B shares step1+step2 prefix with A, so prefix caching
+    # may produce Nones. With no batch neighbor and no prev_scores
+    # (propagation now in search layer), Nones remain in raw output.
+    # The search layer's _validate_scores would catch this at runtime.
 
     question = "Determine the highest common factor of 48 and 18."
 
     # First call: cache solution A's KV blocks
-    _ = llm.score_outputs([question], [[_SOL_3A]], "unused")
-    print("  cached solution A")
+    scores_a = llm.score_outputs([question], [[_SOL_3A]], "unused")
+    print(f"  cached solution A: {_fmt_scores(scores_a[0][0])}")
 
-    # Second call: solution B shares step1+step2 prefix with A,
-    # but empty prev_scores and no batch neighbor → RuntimeError
-    caught = False
-    try:
-        _ = llm.score_outputs(
-            [question], [[_SOL_3B]], "unused", prev_scores=[[]],
-        )
-    except RuntimeError as e:
-        caught = True
-        print(f"  RuntimeError caught: {str(e)[:100]}...")
+    # Second call: solution B alone — no batch neighbor to donate
+    scores_b = llm.score_outputs([question], [[_SOL_3B]], "unused")
+    s_b = scores_b[0][0]
+    n_nones = sum(1 for s in s_b if s is None)
+    print(f"  solution B alone: {_fmt_scores(s_b)}, {n_nones} Nones")
 
-    if not caught:
-        print("  RuntimeError not triggered (KV cache evicted or step "
-              "boundaries fell in recomputed last block — acceptable)")
+    if n_nones > 0:
+        print("  Nones present — search layer propagation would be needed")
+    else:
+        print("  No Nones — KV cache evicted or blocks recomputed")
+
+    # Last step (unique to B) should always have a score
+    assert s_b[-1] is not None, (
+        f"FAIL: solution B's unique last step is None"
+    )
 
     print("[12] PASS")
 
@@ -689,7 +745,7 @@ if __name__ == "__main__":
     test_question_prefix_sharing(llm)
     test_cross_iteration_merge(llm)
     test_within_batch_propagation(llm)
-    test_edge_case_runtime_error(llm)
+    test_edge_case_no_donor(llm)
     test_prefix_cache_performance(llm, tokenizer)
 
     # Cleanup

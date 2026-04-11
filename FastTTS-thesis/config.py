@@ -48,7 +48,6 @@ class SearchConfig:
     
     # Filtering options
     filter_duplicates: bool = False
-    sort_completed: bool = False
     
     # Batch processing
     batch_size: int = 1  # Number of problems to process at once (1 = sequential processing)

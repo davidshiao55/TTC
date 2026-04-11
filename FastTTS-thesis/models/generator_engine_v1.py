@@ -278,7 +278,7 @@ class GeneratorLLMEngineV1(V1LLMEngine):
         from vllm.v1.request import RequestStatus
 
         to_remove: list[str] = []
-        for req_id in tracker.speculative:
+        for req_id in list(tracker.speculative):
             request = self._scheduler.requests.get(req_id)
             if request is None:
                 # Already cleaned up externally.

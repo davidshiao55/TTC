@@ -16,6 +16,14 @@
 import os
 os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+# Prevent fragmentation OOM when two engines share one GPU (see migration doc).
+# Incompatible with CuMemAllocator (sleep mode) — remove when enabling offloading.
+_alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+if "expandable_segments:True" not in _alloc_conf:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+        f"{_alloc_conf},expandable_segments:True" if _alloc_conf
+        else "expandable_segments:True"
+    )
 import logging
 import multiprocessing as mp
 import pickle
