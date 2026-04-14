@@ -118,7 +118,7 @@ def main():
     parser.add_argument("--source", type=str, default="both",
                         choices=["ae", "thesis", "both"],
                         help="Which result set to evaluate")
-    parser.add_argument("--model_combo", type=str, default="7B-1.5B")
+    parser.add_argument("--model_combo", type=str, default="1.5B-1.5B")
     parser.add_argument("--dataset", type=str, default="aime")
     parser.add_argument("--methods", type=str, default="baseline,spec_prefix")
     parser.add_argument("--output", type=str, default=None)

@@ -13,7 +13,7 @@ prefix_aware_scheduling: true
 generator_model:
   model: "Qwen/Qwen2.5-7B-Instruct"
   max_model_len: 8192
-  gpu_memory_utilization: 0.68
+  gpu_memory_utilization: 0.74
   tensor_parallel_size: 1
   enable_prefix_caching: true
   seed: 42
@@ -21,7 +21,7 @@ generator_model:
 # Verifier (Skywork PRM, 1.5B, fixed)
 verifier_model:
   model: "Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B"
-  gpu_memory_utilization: 0.22
+  gpu_memory_utilization: 0.16
   tensor_parallel_size: 1
   enable_prefix_caching: true
   seed: 42

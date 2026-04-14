@@ -1,36 +1,65 @@
-from vllm import LLM
+"""Custom LLM wrapper that boots a V1 engine with FastTTS extensions.
+
+``TTSLLM`` bypasses ``vllm.LLM.__init__`` so it can swap in
+:class:`GeneratorLLMEngineV1` (for the generator, with Speculative Beam
+Extension) or a plain V1 ``LLMEngine`` (for the verifier). After engine
+creation, the attributes ``LLM.generate`` / ``LLM.encode`` rely on are
+bootstrapped manually. ``score_outputs`` runs the Skywork PRM scoring
+pipeline.
+"""
+
 from collections.abc import Sequence
-from typing import (Any, Callable, Optional, Union, cast)
-import torch
-from collections import deque
+from typing import Any, Callable, Optional, Union
 
 import cloudpickle
 from tqdm.auto import tqdm
 
-from vllm.config import (CompilationConfig, is_init_field)
+from vllm import LLM
+from vllm.config import CompilationConfig, is_init_field
 from vllm.config.model import ModelDType, TokenizerMode
-from vllm.engine.arg_utils import (EngineArgs, HfOverrides, PoolerConfig,
-                                   RunnerOption)
+from vllm.engine.arg_utils import EngineArgs, HfOverrides, PoolerConfig, RunnerOption
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.quantization import QuantizationMethods
-from vllm.outputs import (PoolingRequestOutput, RequestOutput)
+from vllm.outputs import PoolingRequestOutput
 from vllm.pooling_params import PoolingParams
-from vllm.sampling_params import SamplingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
-
-from .generator_engine_v1 import GeneratorLLMEngineV1
 from vllm.v1.engine.llm_engine import LLMEngine as VerifierLLMEngine
 
+from .generator_engine_v1 import GeneratorLLMEngineV1
 from .reward_utils import prepare_input, sigmoid
-
-import torch.cuda.nvtx as nvtx
 
 logger = init_logger(__name__)
 
-# Custom synchronous LLM wrapper
+SKYWORK_PRM_MODELS = (
+    "Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B",
+    "Skywork/Skywork-o1-Open-PRM-Qwen-2.5-7B",
+)
+
+
+def _build_compilation_config(
+    compilation_config: Optional[Union[int, dict[str, Any], CompilationConfig]],
+) -> CompilationConfig:
+    """Normalize the caller-supplied compilation_config to a CompilationConfig."""
+    if compilation_config is None:
+        return CompilationConfig()
+    if isinstance(compilation_config, int):
+        return CompilationConfig(level=compilation_config)
+    if isinstance(compilation_config, dict):
+        valid = {k: v for k, v in compilation_config.items() if is_init_field(CompilationConfig, k)}
+        return CompilationConfig(**valid)
+    return compilation_config
+
+
+def _resolve_worker_cls(kwargs: dict[str, Any]) -> None:
+    """Cloudpickle a class-typed worker_cls in-place so it survives mp.spawn."""
+    worker_cls = kwargs.get("worker_cls")
+    if isinstance(worker_cls, type):
+        kwargs["worker_cls"] = cloudpickle.dumps(worker_cls)
+
+
 class TTSLLM(LLM):
     def __init__(
         self,
@@ -57,46 +86,23 @@ class TTSLLM(LLM):
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         pooler_config: Optional[PoolerConfig] = None,
         compilation_config: Optional[Union[int, dict[str, Any]]] = None,
-        # New parameters
         spec_beam_extension: bool = False,
         prefix_aware_scheduling: bool = False,
         **kwargs,
     ) -> None:
         """LLM constructor."""
-
-        if "disable_log_stats" not in kwargs:
-            kwargs["disable_log_stats"] = True
-
-        if "worker_cls" in kwargs:
-            worker_cls = kwargs["worker_cls"]
-            # if the worker_cls is not qualified string name,
-            # we serialize it using cloudpickle to avoid pickling issues
-            if isinstance(worker_cls, type):
-                kwargs["worker_cls"] = cloudpickle.dumps(worker_cls)
+        kwargs.setdefault("disable_log_stats", True)
+        _resolve_worker_cls(kwargs)
 
         if hf_overrides is None:
             hf_overrides = {}
 
-        if compilation_config is not None:
-            if isinstance(compilation_config, int):
-                compilation_config_instance = CompilationConfig(
-                    level=compilation_config)
-            elif isinstance(compilation_config, dict):
-                predicate = lambda x: is_init_field(CompilationConfig, x[0])
-                compilation_config_instance = CompilationConfig(
-                    **dict(filter(predicate, compilation_config.items())))
-            else:
-                compilation_config_instance = compilation_config
-        else:
-            compilation_config_instance = CompilationConfig()
-
-        # SBE requires priority scheduling, which must be set at engine
-        # init time (the scheduler queue type is chosen once in __init__).
+        # SBE requires priority scheduling — must be set at engine init time
+        # (the scheduler queue type is chosen once in __init__).
         if spec_beam_extension:
             kwargs.setdefault("scheduling_policy", "priority")
 
-        # Only pass seed when explicitly provided — thesis vLLM requires
-        # int (rejects None).  Omitting lets EngineArgs default to 0.
+        # Only pass seed when explicitly provided — thesis vLLM requires int.
         seed_kwargs = {"seed": seed} if seed is not None else {}
 
         engine_args = EngineArgs(
@@ -121,40 +127,47 @@ class TTSLLM(LLM):
             hf_overrides=hf_overrides,
             mm_processor_kwargs=mm_processor_kwargs,
             pooler_config=pooler_config,
-            compilation_config=compilation_config_instance,
+            compilation_config=_build_compilation_config(compilation_config),
             **kwargs,
         )
 
-        # Select engine class
-        if runner in ('generate', 'auto'):
-            engine_cls = GeneratorLLMEngineV1
+        engine_cls = GeneratorLLMEngineV1 if runner in ("generate", "auto") else VerifierLLMEngine
+        if engine_cls is GeneratorLLMEngineV1:
             logger.info(f"Using V1 engine with speculative beam extension: {spec_beam_extension}")
-        else:
-            engine_cls = VerifierLLMEngine
         logger.info(f"Prefix-aware scheduling enabled: {prefix_aware_scheduling}")
+
         self.llm_engine = engine_cls.from_engine_args(
-            engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
+            engine_args=engine_args, usage_context=UsageContext.LLM_CLASS,
+        )
         if spec_beam_extension and isinstance(self.llm_engine, GeneratorLLMEngineV1):
             self.llm_engine.enable_spec_beam_extension()
 
         self.engine_class = type(self.llm_engine)
         self.request_counter = Counter()
         self.default_sampling_params: Union[dict[str, Any], None] = None
-        self.model_path = model  # Store the model path for score_outputs dispatch
+        self.model_path = model
 
-        # Set attributes required by parent LLM methods (generate, encode, etc.)
+        self._bootstrap_llm_attributes()
+
+    def _bootstrap_llm_attributes(self) -> None:
+        """Populate attributes that ``LLM.generate`` / ``LLM.encode`` expect."""
         self.model_config = self.llm_engine.model_config
-        self.renderer = getattr(self.llm_engine, 'renderer', None)
+        self.renderer = getattr(self.llm_engine, "renderer", None)
         self.runner_type = self.model_config.runner_type
         self.supported_tasks = self.llm_engine.get_supported_tasks()
         self.pooling_io_processors = {}
-        self.io_processor = getattr(self.llm_engine, 'io_processor', None)
-        self.input_processor = getattr(self.llm_engine, 'input_processor', None)
+        self.io_processor = getattr(self.llm_engine, "io_processor", None)
+        self.input_processor = getattr(self.llm_engine, "input_processor", None)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def generate_text(self, prompts, **kwargs):
-        assert isinstance(self.llm_engine, GeneratorLLMEngineV1), "GeneratorLLMEngineV1 is required for generate_text"
-        request_outputs = self.generate(prompts, **kwargs)
-        return request_outputs
+        assert isinstance(self.llm_engine, GeneratorLLMEngineV1), (
+            "GeneratorLLMEngineV1 is required for generate_text"
+        )
+        return self.generate(prompts, **kwargs)
 
     def encode(
         self,
@@ -178,95 +191,93 @@ class TTSLLM(LLM):
         )
 
     def score_outputs(self, questions, outputs, system_prompt, **kwargs):
-        """Dispatch to the correct scoring implementation based on model_path."""
-        if self.model_path == "peiyi9979/math-shepherd-mistral-7b-prm":
-            return self._score_outputs_math_shepherd(questions, outputs, system_prompt, **kwargs)
-        elif self.model_path in [
-            "Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B",
-            "Skywork/Skywork-o1-Open-PRM-Qwen-2.5-7B"
-        ]:
-            return self._score_outputs_skywork(questions, outputs, system_prompt, **kwargs)
-        else:
+        if self.model_path not in SKYWORK_PRM_MODELS:
             raise NotImplementedError(f"score_outputs not implemented for model_path: {self.model_path}")
+        return self._score_outputs_skywork(questions, outputs, system_prompt, **kwargs)
 
-    def _score_outputs_math_shepherd(self, questions, outputs, system_prompt, **kwargs):
-        inputs_for_prm = []
-        lengths = []
-        tokenizer = self.get_tokenizer()
-        for question, output in zip(questions, outputs):
-            prompt = system_prompt + "\n" + question + "\n"
-            special_outputs = [o.replace("\n\n", " ки\n\n") for o in output]
-            special_outputs = [
-                o + " ки" if o[-2:] != "\n\n" else o for o in special_outputs
-            ]
-            special_outputs = [f"{prompt} {o}" for o in special_outputs]
-            special_outputs = [TokensPrompt(prompt_token_ids=tokenizer.encode(o, truncation=True, max_length=4096)) for o in special_outputs]
-            inputs_for_prm.extend(special_outputs)
-            lengths.append(len(output))
-        nvtx.range_push("encode")
-        request_outputs = self.encode(inputs_for_prm, **kwargs)
-        nvtx.range_pop()
-        output_scores = [[output.outputs.data[:, 0].tolist()] for output in request_outputs] if len(outputs) > 0 else []
-        return output_scores
+    # ------------------------------------------------------------------
+    # Skywork PRM scoring (decomposed into 3 phases)
+    # ------------------------------------------------------------------
 
-    def _score_outputs_skywork(self, questions, outputs, _, **kwargs):
-        """Pure PRM scoring — returns raw per-step scores (may contain Nones
-        from prefix caching). Propagation is done in beam_search._score_and_assign.
+    def _score_outputs_skywork(self, questions, outputs, _, *,
+                               skip_reading_prefix_cache: bool = False, **kwargs):
+        """Pure PRM scoring — returns raw per-step scores.
+
+        When ``skip_reading_prefix_cache=False`` (default), within-batch shared
+        prefixes hit the KV cache and cached step boundaries come back as
+        ``None``; callers must fill them via the search-layer step-hash
+        propagation (see ``_score_and_assign``). Single-shot callers that
+        don't run propagation (e.g. ``best_of_n``) pass ``True`` to get a
+        None-free scoring at the cost of re-encoding the shared prefix.
         """
-        all_scores = []
+        prompts, flat_reward_flags, boundaries = self._build_skywork_scoring_prompts(
+            questions, outputs,
+        )
+        rewards = self.encode(
+            prompts,
+            pooling_params=PoolingParams(
+                skip_reading_prefix_cache=skip_reading_prefix_cache,
+            ),
+        )
+        flat_step_rewards = _extract_step_rewards(rewards, flat_reward_flags)
+        return _rebuild_nested_scores(flat_step_rewards, boundaries)
+
+    def _build_skywork_scoring_prompts(self, questions, outputs):
         tokenizer = self.get_tokenizer()
+        max_model_len = self.model_config.max_model_len
         flat_input_ids = []
         flat_reward_flags = []
         boundaries = []
-        max_model_len = self.model_config.max_model_len
         for question, output in zip(questions, outputs):
-            processed_data = [prepare_input(question, o, tokenizer=tokenizer, step_token="\n\n", max_model_len=max_model_len) for o in output]
-            input_ids, steps, reward_flags = zip(*processed_data)
-            flat_input_ids.extend(input_ids)
-            flat_reward_flags.extend(reward_flags)
+            processed = [
+                prepare_input(question, o, tokenizer=tokenizer, max_model_len=max_model_len)
+                for o in output
+            ]
+            for input_ids, _steps, reward_flags in processed:
+                flat_input_ids.append(input_ids)
+                flat_reward_flags.append(reward_flags)
             boundaries.append(len(output))
-        prompts = [TokensPrompt(prompt_token_ids=input_id) for input_id in flat_input_ids]
-        rewards = self.encode(
-            prompts,
-            pooling_params=PoolingParams(skip_reading_prefix_cache=False),
-        )
+        prompts = [TokensPrompt(prompt_token_ids=ids) for ids in flat_input_ids]
+        return prompts, flat_reward_flags, boundaries
 
-        # Extract raw step scores from reward embeddings.
-        # With prefix caching, cached prefix tokens produce no hidden states
-        # — those step boundaries get None placeholders.
-        flat_step_rewards = []
-        idx = 0
-        for num_outputs in boundaries:
-            for _ in range(num_outputs):
-                reward = rewards[idx]
-                reward_flag = flat_reward_flags[idx]
-                reward_embedding = reward.outputs.data.tolist()
-                offset = len(reward_flag) - len(reward_embedding)
-                if offset < 0:
-                    logger.error(
-                        f"reward_embedding ({len(reward_embedding)}) larger than "
-                        f"reward_flag ({len(reward_flag)}) — unexpected. "
-                        f"Prompt idx={idx}"
-                    )
-                step_reward = []
-                for i, flag in enumerate(reward_flag):
-                    if flag == 1:
-                        local_idx = i - offset
-                        if local_idx < 0:
-                            step_reward.append(None)  # cached — fill in beam_search
-                        elif local_idx >= len(reward_embedding):
-                            break
-                        else:
-                            step_reward.append(sigmoid(reward_embedding[local_idx][0]))
-                flat_step_rewards.append(step_reward)
-                idx += 1
 
-        # Rebuild nested structure
-        idx = 0
-        for num_outputs in boundaries:
-            step_rewards = []
-            for _ in range(num_outputs):
-                step_rewards.append(flat_step_rewards[idx])
-                idx += 1
-            all_scores.append(step_rewards)
-        return all_scores
+def _extract_step_rewards(rewards, flat_reward_flags):
+    """Pull per-step scores out of PRM reward embeddings.
+
+    With prefix caching, cached prefix tokens produce no hidden states — those
+    step boundaries get ``None`` placeholders that are filled later in the
+    search layer via step-hash propagation.
+    """
+    flat_step_rewards = []
+    for idx, reward in enumerate(rewards):
+        reward_flag = flat_reward_flags[idx]
+        reward_embedding = reward.outputs.data.tolist()
+        offset = len(reward_flag) - len(reward_embedding)
+        if offset < 0:
+            logger.error(
+                f"reward_embedding ({len(reward_embedding)}) larger than "
+                f"reward_flag ({len(reward_flag)}) — unexpected. Prompt idx={idx}"
+            )
+        step_reward = []
+        for i, flag in enumerate(reward_flag):
+            if flag != 1:
+                continue
+            local_idx = i - offset
+            if local_idx < 0:
+                step_reward.append(None)  # cached — fill in beam_search
+            elif local_idx >= len(reward_embedding):
+                break
+            else:
+                step_reward.append(sigmoid(reward_embedding[local_idx][0]))
+        flat_step_rewards.append(step_reward)
+    return flat_step_rewards
+
+
+def _rebuild_nested_scores(flat_step_rewards, boundaries):
+    """Restore the per-question / per-output nesting from a flat rewards list."""
+    all_scores = []
+    idx = 0
+    for num_outputs in boundaries:
+        all_scores.append(flat_step_rewards[idx:idx + num_outputs])
+        idx += num_outputs
+    return all_scores

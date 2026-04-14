@@ -15,7 +15,6 @@
 
 import copy
 import logging
-import random
 from typing import List, Dict, Any
 
 import numpy as np
@@ -102,9 +101,6 @@ def _dynamic_branching_duplicate_beams(state: SearchState, tokenizer):
                     duplicate.step_hashes = beam.step_hashes[:i]
                 final_beams.append(duplicate)
 
-    if not getattr(config, 'prefix_aware_scheduling', False):
-        random.shuffle(final_beams)
-
     state.active_beams = final_beams
 
     assert len(state.active_beams) == config.n, (
@@ -132,15 +128,12 @@ def _dynamic_branching_search(
     for i in tqdm(range(search_config.num_iterations), desc="Dynamic branching search iterations"):
         state.iteration = i
         state.is_last = (i == search_config.num_iterations - 1)
-        state.extended_tokens = []
 
         _filter_active(state)
         _dynamic_branching_duplicate_beams(state, tokenizer)
         _prepare_step_source(state, tokenizer)
         _generate(state, generator, tokenizer)
         scoring_batch = _process_results(state, tokenizer)
-
-        state.extended_tokens_list.append(state.extended_tokens)
 
         _score_and_assign(state, verifier, tokenizer, scoring_batch)
 
@@ -171,15 +164,13 @@ def dynamic_branching_search(
     nvtx.range_push("Total")
     (
         completed_beams, total_generator_latency_s, total_verifier_latency_s,
-        n_generator_latency_s, n_verifier_latency_s,
-        total_num_tokens, n_completion_tokens, extended_tokens_list,
+        total_num_tokens, n_completion_tokens,
     ) = _dynamic_branching_search(problems, search_config, generator, verifier)
     nvtx.range_pop()
 
     return package_results(
         problems, completed_beams,
         total_generator_latency_s, total_verifier_latency_s,
-        n_generator_latency_s, n_verifier_latency_s,
-        total_num_tokens, n_completion_tokens, extended_tokens_list,
+        total_num_tokens, n_completion_tokens,
         search_config,
     )

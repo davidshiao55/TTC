@@ -1,16 +1,17 @@
-"""
-Principled evaluation pipeline for FastTTS test-time compute scaling.
+"""Principled evaluation pipeline for FastTTS test-time compute scaling.
 
 Evaluates ALL completions in a single result file. For multi-N scaling
 curves, call this script once per N-value result file (each is a separate
 beam search run with a different N).
 
 Metrics:
-  - Pass@N   : at least one of N completions is correct (OpenAI unbiased formula)
-  - Majority Vote : most common extracted answer (no PRM)
-  - PRM-Max  : single best completion by aggregate PRM score
-  - PRM-Vote : group answers by equivalence, sum PRM scores per group, pick highest
-               (matches Liu et al. _agg_prm_last_vote)
+  - pass@n : at least one of N completions is correct (OpenAI unbiased formula)
+  - pass@1 : PRM-Vote = group answers by equivalence, sum PRM scores per
+             group, pick highest-sum group (matches Liu et al. _agg_prm_last_vote).
+             Named pass@1 because it represents the single deployed answer.
+
+For a richer dump with all 4 metrics (Pass@N, MajVote, PRM-Max, PRM-Vote)
+across all aggregation strategies, use `evaluate_full.py`.
 
 Usage:
   python evaluate.py --data_name math --file_path results.jsonl
@@ -19,15 +20,40 @@ Usage:
 
 import argparse
 import json
-import numpy as np
 from concurrent.futures import TimeoutError
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 from pebble import ProcessPool
 
-from grader import math_equal, math_equal_process
+from grader import math_equal_process
 from parser import extract_answer
+
+
+AGG_STRATEGIES: Tuple[str, ...] = ("last", "min", "prod", "mean")
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProblemMetrics:
+    pass_at_n: float
+    pass_at_1_correct: bool  # = PRM-Vote correctness
+    n: int
+    idx: Optional[str] = None
+
+
+@dataclass
+class AggregatedResult:
+    n: int
+    num_problems: int
+    agg_strategy: str
+    pass_at_n: float
+    pass_at_1: float  # = PRM-Vote accuracy
 
 
 # ---------------------------------------------------------------------------
@@ -35,16 +61,7 @@ from parser import extract_answer
 # ---------------------------------------------------------------------------
 
 def pass_at_k(n: int, c: int, k: int) -> float:
-    """Unbiased estimate of pass@k.
-
-    From Chen et al., "Evaluating Large Language Models Trained on Code", 2021.
-    https://arxiv.org/abs/2107.03374
-
-    Args:
-        n: total number of samples
-        c: number of correct samples
-        k: k in pass@k
-    """
+    """Unbiased estimate of pass@k (Chen et al. 2021)."""
     if n - c < k:
         return 1.0
     return 1.0 - np.prod(1.0 - k / np.arange(n - c + 1, n + 1))
@@ -55,63 +72,73 @@ def pass_at_k(n: int, c: int, k: int) -> float:
 # ---------------------------------------------------------------------------
 
 def aggregate_scores(scores: List[float], strategy: str = "last") -> float:
-    """Aggregate per-step PRM scores into a single value."""
     if not scores:
         return 0.0
     if strategy == "last":
         return scores[-1]
-    elif strategy == "min":
+    if strategy == "min":
         return min(scores)
-    elif strategy == "prod":
+    if strategy == "prod":
         return float(np.prod(scores))
-    elif strategy == "mean":
+    if strategy == "mean":
         return float(np.mean(scores))
-    else:
-        raise ValueError(f"Unknown aggregation strategy: {strategy}")
+    raise ValueError(f"Unknown aggregation strategy: {strategy}; expected one of {AGG_STRATEGIES}")
 
 
 # ---------------------------------------------------------------------------
-# Answer grouping with math_equal  (timeout-safe)
+# Answer grouping (exact string match — matches Liu et al. compute-optimal-tts)
 # ---------------------------------------------------------------------------
 
 def _group_answers(answers: List[str]) -> Dict[str, List[int]]:
-    """Group answer indices by mathematical equivalence.
-
-    Returns {canonical_answer: [indices]} where canonical_answer is the
-    first-seen representative of each equivalence group.
-    """
-    groups: Dict[str, List[int]] = {}  # representative -> indices
-    rep_list: List[str] = []  # ordered list of representatives
-
+    """Group answer indices by exact string match (after normalization)."""
+    groups: Dict[str, List[int]] = {}
     for idx, ans in enumerate(answers):
-        matched = False
-        for rep in rep_list:
-            try:
-                if _answers_equal(ans, rep):
-                    groups[rep].append(idx)
-                    matched = True
-                    break
-            except Exception:
-                continue
-
-        if not matched:
-            rep_list.append(ans)
-            groups[ans] = [idx]
-
+        groups.setdefault(ans.strip(), []).append(idx)
     return groups
-
-
-def _answers_equal(a: str, b: str) -> bool:
-    """Check if two answers are mathematically equal (with timeout)."""
-    if a.strip().lower() == b.strip().lower():
-        return True
-    # math_equal with timeout=True uses call_with_timeout (1s) for symbolic checks
-    return math_equal(a, b, timeout=True)
 
 
 # ---------------------------------------------------------------------------
 # Per-problem metric computation
 # ---------------------------------------------------------------------------
+
+def _extract_and_check(
+    completions: List[str],
+    reference: str,
+    data_name: str,
+) -> Tuple[List[str], List[bool]]:
+    """Extract each completion's final answer and grade it against ``reference``."""
+    extracted = [extract_answer(c, data_name) for c in completions]
+    params = [(i, ext, reference) for i, ext in enumerate(extracted)]
+    correct: List[bool] = []
+    with ProcessPool(max_workers=min(4, len(completions))) as pool:
+        future = pool.map(math_equal_process, params, timeout=5)
+        iterator = future.result()
+        while True:
+            try:
+                correct.append(bool(next(iterator)))
+            except StopIteration:
+                break
+            except (TimeoutError, Exception):
+                correct.append(False)
+    return extracted, correct
+
+
+def _select_prm_vote(
+    valid_correct: List[bool],
+    valid_agg: List[float],
+    groups: Dict[str, List[int]],
+) -> bool:
+    """PRM-Vote: group answers, sum PRM scores per group, pick highest."""
+    best_score = -float("inf")
+    best_key: Optional[str] = None
+    for key, indices in groups.items():
+        score = sum(valid_agg[i] for i in indices)
+        if score > best_score or (score == best_score and (best_key is None or key < best_key)):
+            best_score = score
+            best_key = key
+    idx = groups[best_key][0] if best_key is not None else 0
+    return valid_correct[idx]
+
 
 def _compute_problem_metrics(
     completions: List[str],
@@ -119,99 +146,31 @@ def _compute_problem_metrics(
     reference_answer: str,
     data_name: str,
     agg_strategy: str,
-) -> Dict[str, Any]:
-    """Compute all metrics for a single problem using ALL completions."""
+) -> ProblemMetrics:
+    """Compute pass@n and pass@1 (PRM-Vote) for a single problem."""
     n = len(completions)
-
     if n == 0:
-        return {
-            "pass_at_n": 0.0,
-            "majority_vote_correct": False,
-            "prm_max_correct": False,
-            "prm_vote_correct": False,
-            "n": 0,
-        }
+        return ProblemMetrics(pass_at_n=0.0, pass_at_1_correct=False, n=0)
 
-    # 1. Extract answers from completions
-    extracted = [extract_answer(c, data_name) for c in completions]
-
-    # 2. Check correctness of each answer
-    correct = []
-    params = [(i, ext, str(reference_answer)) for i, ext in enumerate(extracted)]
-    with ProcessPool(max_workers=min(4, n)) as pool:
-        future = pool.map(math_equal_process, params, timeout=5)
-        iterator = future.result()
-        while True:
-            try:
-                result = next(iterator)
-                correct.append(bool(result))
-            except StopIteration:
-                break
-            except (TimeoutError, Exception):
-                correct.append(False)
-
-    n_correct = sum(correct)
-
-    # 3. Aggregate PRM scores
+    extracted, correct = _extract_and_check(completions, str(reference_answer), data_name)
     agg = [aggregate_scores(s, agg_strategy) for s in step_scores]
+    pass_n = pass_at_k(n, sum(correct), n)
 
-    # --- Pass@N (computed on ALL completions, including unparseable) ---
-    pass_n = pass_at_k(n, n_correct, n)
-
-    # 4. Filter invalid answers before selection metrics
-    #    (matching Liu et al. compute-optimal-tts: judge_ans filters INVALID_ANS)
+    # Filter invalid answers before selection (matches Liu et al. judge_ans).
     valid_indices = [i for i, ans in enumerate(extracted) if ans]
     if not valid_indices:
-        return {
-            "pass_at_n": pass_n,
-            "majority_vote_correct": False,
-            "prm_max_correct": False,
-            "prm_vote_correct": False,
-            "n": n,
-        }
+        return ProblemMetrics(pass_at_n=pass_n, pass_at_1_correct=False, n=n)
 
     valid_extracted = [extracted[i] for i in valid_indices]
     valid_correct = [correct[i] for i in valid_indices]
     valid_agg = [agg[i] for i in valid_indices]
-
-    # 5. Group valid answers by equivalence
     groups = _group_answers(valid_extracted)
 
-    # --- Majority Vote (pure count, no PRM) ---
-    best_group_key = None
-    best_count = -1
-    for rep, indices in groups.items():
-        count = len(indices)
-        if count > best_count or (count == best_count and rep < (best_group_key or "")):
-            best_count = count
-            best_group_key = rep
-    maj_idx = groups[best_group_key][0] if best_group_key else 0
-    maj_correct = valid_correct[maj_idx]
-
-    # --- PRM-Max (best single completion by PRM score) ---
-    prm_max_idx = int(np.argmax(valid_agg))
-    prm_max_correct = valid_correct[prm_max_idx]
-
-    # --- PRM-Vote (group answers, sum PRM scores, pick highest-sum group) ---
-    best_vote_key = None
-    best_vote_score = -float("inf")
-    for rep, indices in groups.items():
-        group_score = sum(valid_agg[i] for i in indices)
-        if group_score > best_vote_score or (
-            group_score == best_vote_score and rep < (best_vote_key or "")
-        ):
-            best_vote_score = group_score
-            best_vote_key = rep
-    vote_idx = groups[best_vote_key][0] if best_vote_key else 0
-    prm_vote_correct = valid_correct[vote_idx]
-
-    return {
-        "pass_at_n": pass_n,
-        "majority_vote_correct": maj_correct,
-        "prm_max_correct": prm_max_correct,
-        "prm_vote_correct": prm_vote_correct,
-        "n": n,
-    }
+    return ProblemMetrics(
+        pass_at_n=pass_n,
+        pass_at_1_correct=_select_prm_vote(valid_correct, valid_agg, groups),
+        n=n,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -228,94 +187,65 @@ def load_jsonl(file_path: str):
                 continue
 
 
+def _dedupe_and_sort(samples: List[dict]) -> List[dict]:
+    if samples and "idx" in samples[0]:
+        samples = list({s["idx"]: s for s in samples}.values())
+        samples.sort(key=lambda x: x["idx"])
+    return samples
+
+
+def _aggregate(
+    problem_results: List[ProblemMetrics],
+    agg_strategy: str,
+) -> AggregatedResult:
+    return AggregatedResult(
+        n=min(r.n for r in problem_results),
+        num_problems=len(problem_results),
+        agg_strategy=agg_strategy,
+        pass_at_n=round(100.0 * np.mean([r.pass_at_n for r in problem_results]), 1),
+        pass_at_1=round(100.0 * np.mean([r.pass_at_1_correct for r in problem_results]), 1),
+    )
+
+
 def evaluate(
     data_name: str,
     file_path: str,
     agg_strategy: str = "last",
     max_num_samples: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Run multi-metric evaluation on a single result file.
-
-    Evaluates ALL completions in the file — no subsampling.
-    For multi-N scaling curves, call this once per N-value result file.
-
-    Args:
-        data_name: Dataset name (for answer extraction, e.g. "math")
-        file_path: Path to JSONL results file
-        agg_strategy: PRM score aggregation strategy ("last", "min", "prod", "mean")
-        max_num_samples: Limit number of problems to evaluate
-
-    Returns:
-        Dict with aggregated metrics and per-problem details.
-    """
-    samples = list(load_jsonl(file_path))
+    """Run evaluation on a single result file, reporting pass@n and pass@1."""
+    samples = _dedupe_and_sort(list(load_jsonl(file_path)))
     if not samples:
         raise ValueError(f"No samples found in {file_path}")
-
-    # Deduplicate by idx if present
-    if "idx" in samples[0]:
-        samples = list({s["idx"]: s for s in samples}.values())
-        samples.sort(key=lambda x: x["idx"])
-
     if max_num_samples:
         samples = samples[:max_num_samples]
 
-    # Determine N (completions per problem)
     n_per_problem = [len(s["solutions"]["completions"][0]) for s in samples]
-    n_min = min(n_per_problem)
-    n_max = max(n_per_problem)
-
-    print(f"Evaluating {len(samples)} problems, "
-          f"completions per problem: {n_min}" +
-          (f"-{n_max}" if n_min != n_max else ""))
+    n_min, n_max = min(n_per_problem), max(n_per_problem)
+    print(f"Evaluating {len(samples)} problems, completions per problem: {n_min}"
+          + (f"-{n_max}" if n_min != n_max else ""))
     print(f"Aggregation strategy: {agg_strategy}")
 
-    problem_results = []
+    problem_results: List[ProblemMetrics] = []
     for sample in samples:
-        completions = sample["solutions"]["completions"][0]
-        step_scores = sample["solutions"]["scores"][0]
-        reference = str(sample["reference_answer"])
-
         metrics = _compute_problem_metrics(
-            completions, step_scores, reference,
+            sample["solutions"]["completions"][0],
+            sample["solutions"]["scores"][0],
+            str(sample["reference_answer"]),
             data_name, agg_strategy,
         )
-        metrics["idx"] = sample.get("idx", sample.get("id", ""))
+        metrics.idx = sample.get("idx", sample.get("id", ""))
         problem_results.append(metrics)
 
-    # Aggregate across problems
-    num_problems = len(problem_results)
-    result = {
-        "n": n_min,
-        "num_problems": num_problems,
-        "agg_strategy": agg_strategy,
-        "pass_at_n": round(
-            100.0 * np.mean([r["pass_at_n"] for r in problem_results]), 1
-        ),
-        "majority_vote": round(
-            100.0 * np.mean([r["majority_vote_correct"] for r in problem_results]), 1
-        ),
-        "prm_max": round(
-            100.0 * np.mean([r["prm_max_correct"] for r in problem_results]), 1
-        ),
-        "prm_vote": round(
-            100.0 * np.mean([r["prm_vote_correct"] for r in problem_results]), 1
-        ),
-    }
-
-    print(
-        f"  N={result['n']:>4d}: Pass@N={result['pass_at_n']:5.1f}%  "
-        f"MajVote={result['majority_vote']:5.1f}%  "
-        f"PRM-Max={result['prm_max']:5.1f}%  "
-        f"PRM-Vote={result['prm_vote']:5.1f}%"
-    )
+    result = _aggregate(problem_results, agg_strategy)
+    print(f"  N={result.n:>4d}: pass@n={result.pass_at_n:5.1f}%  pass@1={result.pass_at_1:5.1f}%")
 
     return {
         "file_path": str(file_path),
         "data_name": data_name,
         "agg_strategy": agg_strategy,
-        "result": result,
-        "per_problem": problem_results,
+        "result": asdict(result),
+        "per_problem": [asdict(r) for r in problem_results],
     }
 
 
@@ -325,14 +255,14 @@ def evaluate(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate FastTTS results with multi-metric pipeline"
+        description="Evaluate FastTTS results (pass@n + pass@1 via PRM-Vote)",
     )
     parser.add_argument("--data_name", type=str, default="math",
                         help="Dataset name for answer extraction")
     parser.add_argument("--file_path", type=str, required=True,
                         help="Path to JSONL results file")
     parser.add_argument("--agg_strategy", type=str, default="last",
-                        choices=["last", "min", "prod", "mean"],
+                        choices=list(AGG_STRATEGIES),
                         help="PRM score aggregation strategy")
     parser.add_argument("--max_num_samples", type=int, default=None,
                         help="Limit number of problems")
@@ -343,7 +273,6 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-
     results = evaluate(
         data_name=args.data_name,
         file_path=args.file_path,
@@ -351,12 +280,10 @@ if __name__ == "__main__":
         max_num_samples=args.max_num_samples,
     )
 
-    # Print summary
     r = results["result"]
-    print(f"\n{'='*60}")
-    print(f"N={r['n']}: Pass@N={r['pass_at_n']}  MajVote={r['majority_vote']}  "
-          f"PRM-Max={r['prm_max']}  PRM-Vote={r['prm_vote']}")
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print(f"N={r['n']}: pass@n={r['pass_at_n']}  pass@1={r['pass_at_1']}")
+    print(f"{'=' * 60}")
 
     if args.output:
         output_path = Path(args.output)

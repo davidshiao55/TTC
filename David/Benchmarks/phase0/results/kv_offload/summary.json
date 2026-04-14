@@ -1,0 +1,110 @@
+{
+  "fasttts": {
+    "256": {
+      "mean_generator_latency": 97.82763566176097,
+      "mean_verifier_latency": 9.094507042566935,
+      "mean_total_latency": 106.9221427043279,
+      "mean_average_tokens_per_completion": 689.3111979166666,
+      "mean_total_tokens": 244962.36666666667,
+      "mean_n_completion_tokens": 0.0,
+      "mean_n_generator_latencies": 97.82763566176097,
+      "mean_n_verifier_latencies": 9.094507042566935,
+      "mean_average_completion_times": 96.01999713933716,
+      "mean_precise_goodput": 7.1788296027169105,
+      "mean_goodput": 6.446851704261304
+    },
+    "16": {
+      "mean_generator_latency": 29.462193330128986,
+      "mean_verifier_latency": 0.4464873790740967,
+      "mean_total_latency": 29.908680709203086,
+      "mean_average_tokens_per_completion": 749.2375,
+      "mean_total_tokens": 16442.833333333332,
+      "mean_n_completion_tokens": 0.0,
+      "mean_n_generator_latencies": 29.462193330128986,
+      "mean_n_verifier_latencies": 0.4464873790740967,
+      "mean_average_completion_times": 28.162555462121965,
+      "mean_precise_goodput": 26.6040310513621,
+      "mean_goodput": 25.05083749044989
+    },
+    "4": {
+      "mean_generator_latency": 16.22109119097392,
+      "mean_verifier_latency": 0.1851321299870809,
+      "mean_total_latency": 16.406223320960997,
+      "mean_average_tokens_per_completion": 700.1833333333333,
+      "mean_total_tokens": 3082.9,
+      "mean_n_completion_tokens": 0.0,
+      "mean_n_generator_latencies": 16.22109119097392,
+      "mean_n_verifier_latencies": 0.1851321299870809,
+      "mean_average_completion_times": 16.368940337498984,
+      "mean_precise_goodput": 42.77511670864301,
+      "mean_goodput": 42.67791067056619
+    },
+    "64": {
+      "mean_generator_latency": 45.155975715319315,
+      "mean_verifier_latency": 1.8012767871220907,
+      "mean_total_latency": 46.957252502441406,
+      "mean_average_tokens_per_completion": 678.0119791666667,
+      "mean_total_tokens": 61520.2,
+      "mean_n_completion_tokens": 0.0,
+      "mean_n_generator_latencies": 45.155975715319315,
+      "mean_n_verifier_latencies": 1.8012767871220907,
+      "mean_average_completion_times": 41.99796733769278,
+      "mean_precise_goodput": 16.143923674090708,
+      "mean_goodput": 14.438919294339366
+    }
+  },
+  "fasttts_kvoff": {
+    "256": {
+      "mean_generator_latency": 89.95573927561442,
+      "mean_verifier_latency": 5.866036081314087,
+      "mean_total_latency": 95.82177535692851,
+      "mean_average_tokens_per_completion": 672.1071614583333,
+      "mean_total_tokens": 225455.06666666668,
+      "mean_n_completion_tokens": 0.0,
+      "mean_n_generator_latencies": 89.95573927561442,
+      "mean_n_verifier_latencies": 5.866036081314087,
+      "mean_average_completion_times": 86.00704541454712,
+      "mean_precise_goodput": 7.814559356374007,
+      "mean_goodput": 7.01413805948374
+    },
+    "16": {
+      "mean_generator_latency": 28.30463486512502,
+      "mean_verifier_latency": 0.40841813882191974,
+      "mean_total_latency": 28.71305300394694,
+      "mean_average_tokens_per_completion": 737.4395833333333,
+      "mean_total_tokens": 16387.566666666666,
+      "mean_n_completion_tokens": 0.0,
+      "mean_n_generator_latencies": 28.30463486512502,
+      "mean_n_verifier_latencies": 0.40841813882191974,
+      "mean_average_completion_times": 27.5014599353075,
+      "mean_precise_goodput": 26.814561302128478,
+      "mean_goodput": 25.683078118929526
+    },
+    "4": {
+      "mean_generator_latency": 15.240811808904011,
+      "mean_verifier_latency": 0.1796538194020589,
+      "mean_total_latency": 15.42046562830607,
+      "mean_average_tokens_per_completion": 726.8166666666667,
+      "mean_total_tokens": 3063.233333333333,
+      "mean_n_completion_tokens": 0.0,
+      "mean_n_generator_latencies": 15.240811808904011,
+      "mean_n_verifier_latencies": 0.1796538194020589,
+      "mean_average_completion_times": 15.223531200488408,
+      "mean_precise_goodput": 47.7429748127917,
+      "mean_goodput": 47.133250330165744
+    },
+    "64": {
+      "mean_generator_latency": 42.30903619130452,
+      "mean_verifier_latency": 1.5206565697987875,
+      "mean_total_latency": 43.82969276110331,
+      "mean_average_tokens_per_completion": 686.1135416666667,
+      "mean_total_tokens": 61413.8,
+      "mean_n_completion_tokens": 0.0,
+      "mean_n_generator_latencies": 42.30903619130452,
+      "mean_n_verifier_latencies": 1.5206565697987875,
+      "mean_average_completion_times": 40.83465071618557,
+      "mean_precise_goodput": 16.80223853107951,
+      "mean_goodput": 15.65408056603031
+    }
+  }
+}

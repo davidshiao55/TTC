@@ -5,7 +5,6 @@
 
 import copy
 import logging
-import random
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -19,6 +18,7 @@ import torch.cuda.nvtx as nvtx
 from config import SearchConfig
 from models.vllm_wrapper import GeneratorVLLMModelWrapper, VerifierVLLMModelWrapper
 from search.beam import Beam, StepChunk, _next_beam_id, reset_beam_id_counter, step_hash
+from search.results import SearchResults
 from search.utils import build_conversation, aggregate_scores, truncate_sentence_by_tokens
 
 logger = logging.getLogger(__name__)
@@ -86,10 +86,25 @@ def parse_generation_into_chunks(
 # Scoring helper
 # ---------------------------------------------------------------------------
 
-def score_beam(verifier: VerifierVLLMModelWrapper, prompts: List[str], completions: List[List[str]]):
-    """Score a beam of completions. Returns raw scores (may contain Nones from prefix caching)."""
+def score_beam(
+    verifier: VerifierVLLMModelWrapper,
+    prompts: List[str],
+    completions: List[List[str]],
+    *,
+    skip_reading_prefix_cache: bool = False,
+):
+    """Score a beam of completions.
+
+    With the default ``skip_reading_prefix_cache=False``, shared prefixes
+    hit the PRM KV cache and those step boundaries come back as ``None``
+    — callers must run step-hash propagation. Pass ``True`` for single-shot
+    callers that don't propagate.
+    """
     verifier_time = time.time()
-    scores = verifier.score(prompts, completions)
+    scores = verifier.score(
+        prompts, completions,
+        skip_reading_prefix_cache=skip_reading_prefix_cache,
+    )
     verifier_time = time.time() - verifier_time
     return scores, verifier_time
 
@@ -201,14 +216,9 @@ class SearchState:
     total_gen_latency: float = 0.0
     total_ver_latency: float = 0.0
     total_tokens: int = 0
-    n_gen_latency: float = 0.0
-    n_ver_latency: float = 0.0
-    n_completion_tokens: int = 0
-    extended_tokens_list: List[List[int]] = field(default_factory=list)
 
     # Per-iteration transients (reset each iteration)
     gen_results: List[Beam] = field(default_factory=list)
-    extended_tokens: List[int] = field(default_factory=list)
     agg_scores: List[float] = field(default_factory=list)
 
     # Per-iteration counters (for logging)
@@ -290,21 +300,34 @@ def _filter_active(state: SearchState):
     else:
         state.active_beams = [b for b in state.active_beams if not b.pruned]
 
+    # Under SBE, sort active beams low→high by aggregate score so low-score
+    # beams are submitted to the engine first. They drain during Phase 1
+    # (no speculation) while the waiting queue is non-empty; high-score
+    # beams are admitted last and hit their stops after the queue empties,
+    # making them the ones that speculate in Phase 2.
+    # NOTE: this sort exists in FastTTS-AE as a commented-out line in each
+    # search strategy (e.g. search/dynamic_branching.py:249); re-enabled here
+    if state.search_config.spec_beam_extension:
+        state.active_beams.sort(
+            key=lambda b: aggregate_scores(b.scores, state.search_config.agg_strategy)
+        )
+
 
 def _check_n_completion(state: SearchState) -> bool:
-    """Record metrics when we first reach n completions. Returns True to stop."""
+    """Return True when the search has produced enough beams to stop.
+
+    All n_* metrics are set in `_finalize` once — the loop breaks
+    immediately on `True`, so the snapshot we used to take here is
+    always equal to the end-of-loop total.
+    """
     has_enough = (
         len(state.completed_beams) >= state.search_config.n
         or len(state.active_beams) == 0
     )
-    if has_enough and state.n_gen_latency == 0:
-        state.n_gen_latency = state.total_gen_latency
-        state.n_ver_latency = state.total_ver_latency
-        state.n_completion_tokens = state.total_tokens
+    if has_enough:
         logger.info(
             f"Reached target n: {len(state.completed_beams)} completed beams "
-            f"after {state.n_gen_latency + state.n_ver_latency:.2f}s, "
-            f"{state.n_completion_tokens} total tokens"
+            f"after {state.total_gen_latency + state.total_ver_latency:.2f}s"
         )
     return has_enough
 
@@ -334,8 +357,10 @@ def _duplicate_beams(state: SearchState, tokenizer):
                 duplicate.parent_id = beam.beam_id
                 duplicate.born_at_iteration = i
                 if beam.pending_steps:
+                    # R=0: algorithm equivalence with vanilla beam search.
                     first_text = truncate_sentence_by_tokens(
-                        beam.pending_steps[0].text, tokenizer
+                        beam.pending_steps[0].text, tokenizer,
+                        mean_ratio=0.0, std_ratio=0.0,
                     )
                     duplicate.pending_steps = [
                         StepChunk(text=first_text, is_complete_step=False, terminal=False)
@@ -346,14 +371,16 @@ def _duplicate_beams(state: SearchState, tokenizer):
             final_beams.extend([beam] + duplicates)
         state.active_beams = final_beams
     else:
-        # Standard: place duplicates at the end, then shuffle
+        # Standard: place duplicates at the end (matches AE beam_search).
         extended_active_beams = [copy.deepcopy(b) for b in (active * repeats)]
         for b in extended_active_beams:
             b.beam_id = _next_beam_id()
             b.born_at_iteration = i
             if b.pending_steps:
+                # R=0: algorithm equivalence with vanilla beam search.
                 first_text = truncate_sentence_by_tokens(
-                    b.pending_steps[0].text, tokenizer
+                    b.pending_steps[0].text, tokenizer,
+                    mean_ratio=0.0, std_ratio=0.0,
                 )
                 b.pending_steps = [
                     StepChunk(text=first_text, is_complete_step=False, terminal=False)
@@ -365,8 +392,6 @@ def _duplicate_beams(state: SearchState, tokenizer):
         for idx, dup in enumerate(extended_active_beams):
             original_idx = idx % len(active)
             dup.parent_id = active[original_idx].beam_id
-
-        random.shuffle(state.active_beams)
 
     assert len(state.active_beams) == config.n, (
         f"Expected {config.n} active beams, got {len(state.active_beams)}"
@@ -395,7 +420,6 @@ def _prepare_step_source(state: SearchState, tokenizer):
             beam.total_tokens_generated += num_tokens
             beam.current_text += head.text
             beam.pending_steps.pop(0)
-            state.extended_tokens.append(num_tokens)
             beam.skipped_this_step = False
 
 
@@ -418,8 +442,6 @@ def _generate(state: SearchState, generator: GeneratorVLLMModelWrapper, tokenize
     continue_final_message = (i > 0)
 
     if convs:
-        if hasattr(config, 'custom_chat_template') and config.custom_chat_template is not None:
-            tokenizer.chat_template = config.custom_chat_template
         templated_convs = tokenizer.apply_chat_template(
             convs,
             add_generation_prompt=add_generation_prompt,
@@ -454,7 +476,6 @@ def _process_results(state: SearchState, tokenizer) -> ScoringBatch:
             beam.total_tokens_generated += num_tokens
             beam.gen_history.append("")
             state.skipped_beam_count += 1
-            state.extended_tokens.append(num_tokens)
         else:
             gen_result = state.gen_results[counter]
             counter += 1
@@ -734,10 +755,6 @@ def _finalize(state: SearchState):
         )
 
     state.total_tokens += sum(b.total_tokens_generated for b in state.completed_beams)
-    if state.n_gen_latency == 0:
-        state.n_completion_tokens = state.total_tokens
-        state.n_gen_latency = state.total_gen_latency
-        state.n_ver_latency = state.total_ver_latency
 
     state.completed_beams = sorted(
         state.completed_beams,
@@ -745,15 +762,17 @@ def _finalize(state: SearchState):
         reverse=True,
     )[:config.n]
 
+    # n_completion_tokens references the same top-n beam set that
+    # `evaluate.py` scores for accuracy — can differ from total_tokens
+    # when burst completion pushed M > n before truncation.
+    n_completion_tokens = sum(b.total_tokens_generated for b in state.completed_beams)
+
     return (
         state.completed_beams,
         state.total_gen_latency,
         state.total_ver_latency,
-        state.n_gen_latency,
-        state.n_ver_latency,
         state.total_tokens,
-        state.n_completion_tokens,
-        state.extended_tokens_list,
+        n_completion_tokens,
     )
 
 
@@ -766,35 +785,21 @@ def package_results(
     completed_beams: List[Beam],
     total_generator_latency_s: float,
     total_verifier_latency_s: float,
-    n_generator_latency_s: float,
-    n_verifier_latency_s: float,
     total_num_tokens: int,
     n_completion_tokens: int,
-    extended_tokens_list: List[List[int]],
     search_config: SearchConfig,
-) -> Dict[str, Any]:
-    """Package completed beams into the standard result dict."""
+) -> SearchResults:
+    """Package completed beams into the canonical SearchResults container."""
     grouped_results = defaultdict(list)
     for beam in completed_beams:
         grouped_results[beam.prompt].append(beam)
 
-    results = {
-        "completions": [],
-        "pred": [],
-        "completion_tokens": [],
-        "scores": [],
-        "effective_num_tokens": [],
-        "total_num_tokens": total_num_tokens,
-        "n_completion_tokens": n_completion_tokens,
-        "total_generator_latency_s": total_generator_latency_s,
-        "total_verifier_latency_s": total_verifier_latency_s,
-        "n_generator_latency_s": n_generator_latency_s,
-        "n_verifier_latency_s": n_verifier_latency_s,
-        "completion_time": [],
-        "vllm_metrics": {},
-        "vllm_metrics_summary": {},
-        "extended_tokens_list": extended_tokens_list,
-    }
+    results = SearchResults(
+        total_num_tokens=total_num_tokens,
+        n_completion_tokens=n_completion_tokens,
+        total_generator_latency_s=total_generator_latency_s,
+        total_verifier_latency_s=total_verifier_latency_s,
+    )
 
     for p in problems:
         beams = grouped_results[p]
@@ -803,11 +808,10 @@ def package_results(
             aggregate_scores(b.scores, search_config.agg_strategy) for b in beams
         ]
         pred = completions[np.argmax(agg_scores)] if agg_scores else ""
-        results["pred"].append(pred)
-        results["completions"].append(completions)
-        results["scores"].append([b.scores for b in beams])
-        results["completion_tokens"].append([b.step_tokens for b in beams])
-        results["completion_time"].append([b.time_to_complete for b in beams])
-        results["effective_num_tokens"].append([b.total_tokens_generated for b in beams])
+        results.pred.append(pred)
+        results.completions.append(completions)
+        results.scores.append([b.scores for b in beams])
+        results.completion_time.append([b.time_to_complete for b in beams])
+        results.effective_num_tokens.append([b.total_tokens_generated for b in beams])
 
     return results

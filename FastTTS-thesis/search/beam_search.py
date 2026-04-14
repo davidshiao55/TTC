@@ -60,15 +60,12 @@ def _beam_search(
     for i in tqdm(range(search_config.num_iterations), desc="Beam search iterations"):
         state.iteration = i
         state.is_last = (i == search_config.num_iterations - 1)
-        state.extended_tokens = []
 
         _filter_active(state)
         _duplicate_beams(state, tokenizer)
         _prepare_step_source(state, tokenizer)
         _generate(state, generator, tokenizer)
         scoring_batch = _process_results(state, tokenizer)
-
-        state.extended_tokens_list.append(state.extended_tokens)
 
         _score_and_assign(state, verifier, tokenizer, scoring_batch)
 
@@ -99,15 +96,13 @@ def beam_search(
     nvtx.range_push("Total")
     (
         completed_beams, total_generator_latency_s, total_verifier_latency_s,
-        n_generator_latency_s, n_verifier_latency_s,
-        total_num_tokens, n_completion_tokens, extended_tokens_list,
+        total_num_tokens, n_completion_tokens,
     ) = _beam_search(problems, search_config, generator, verifier)
     nvtx.range_pop()
 
     return package_results(
         problems, completed_beams,
         total_generator_latency_s, total_verifier_latency_s,
-        n_generator_latency_s, n_verifier_latency_s,
-        total_num_tokens, n_completion_tokens, extended_tokens_list,
+        total_num_tokens, n_completion_tokens,
         search_config,
     )

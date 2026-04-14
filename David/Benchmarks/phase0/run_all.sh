@@ -87,7 +87,7 @@ run_benchmark "0.6" "CUDA Graph Impact" \
     "bash ${SCRIPT_DIR}/bench_cuda_graph.sh"
 
 run_benchmark "0.7" "KV Offload Impact" \
-    "bash ${SCRIPT_DIR}/bench_kv_offload.sh"
+    "python ${SCRIPT_DIR}/bench_kv_offload.py --exp --plot"
 
 # --- Application-level benchmark ---
 

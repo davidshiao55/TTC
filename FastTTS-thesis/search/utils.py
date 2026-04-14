@@ -82,51 +82,7 @@ def aggregate_scores(scores: List[float], strategy: str = "last") -> float:
         raise ValueError(f"Unknown aggregation strategy: {strategy}")
 
 
-def assign_prefix_priorities(tokenized_seqs: list[list[int]]) -> list[int]:
-    """
-    Assign priorities to each sequence based on the longest shared prefix grouping.
-    Returns a list of priorities (lower = higher priority), one per input sequence.
-    """
-    n = len(tokenized_seqs)
-    priorities = [None] * n
-    remaining = set(range(n))
-    current_priority = 0
-
-    # Helper: find the largest group with the longest shared prefix
-    def find_largest_prefix_group(indices):
-        if not indices:
-            return set(), []
-        # Sort indices by their tokenized sequence
-        sorted_indices = sorted(indices, key=lambda i: tokenized_seqs[i])
-        max_prefix_len = 0
-        best_group = set()
-        for i in range(len(sorted_indices)):
-            for j in range(i+1, len(sorted_indices)):
-                # Find common prefix length
-                a, b = tokenized_seqs[sorted_indices[i]], tokenized_seqs[sorted_indices[j]]
-                prefix_len = 0
-                while prefix_len < min(len(a), len(b)) and a[prefix_len] == b[prefix_len]:
-                    prefix_len += 1
-                if prefix_len > max_prefix_len and prefix_len > 0:
-                    # Find all with this prefix
-                    group = set(k for k in sorted_indices if tokenized_seqs[k][:prefix_len] == a[:prefix_len])
-                    if len(group) > 1:
-                        max_prefix_len = prefix_len
-                        best_group = group
-        if not best_group:
-            # No group found, pick one remaining
-            return {sorted_indices[0]}, []
-        return best_group, tokenized_seqs[next(iter(best_group))][:max_prefix_len]
-
-    while remaining:
-        group, prefix = find_largest_prefix_group(remaining)
-        for idx in group:
-            priorities[idx] = current_priority
-        remaining -= group
-        current_priority += 1
-    return priorities
-
-np.random.seed(42)
+_rng = np.random.default_rng(42)
 def truncate_sentence_by_tokens(
     sentence: str, 
     tokenizer,
@@ -163,7 +119,7 @@ def truncate_sentence_by_tokens(
         return ""
     
     # Calculate target number of tokens to keep using normal distribution
-    ratio = np.random.normal(mean_ratio, std_ratio)
+    ratio = _rng.normal(mean_ratio, std_ratio)
     ratio = np.clip(ratio, 0.0, 1.0)  # Ensure ratio is between 0 and 1
     
     target_tokens = int(ratio * total_tokens)

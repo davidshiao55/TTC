@@ -13,10 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
 import logging
 from typing import Dict, List, Any, Optional
-import time
 
 from config import FastTTSConfig, SearchConfig
 from models.vllm_wrapper import GeneratorVLLMModelWrapper, VerifierVLLMModelWrapper
@@ -25,8 +23,18 @@ from search.dvts import dvts_search
 from search.dynamic_branching import dynamic_branching_search
 from search.vg_search import vg_search
 from search.best_of_n import best_of_n_search
+from search.results import SearchResults
 
 logger = logging.getLogger(__name__)
+
+
+_SEARCH_STRATEGIES = {
+    "beam_search": beam_search,
+    "dvts": dvts_search,
+    "best_of_n": best_of_n_search,
+    "dynamic_branching": dynamic_branching_search,
+    "vg_search": vg_search,
+}
 
 
 class FastTTS:
@@ -62,120 +70,54 @@ class FastTTS:
         logger.info("FastTTS models initialized successfully")
         
     def _process_batch(
-        self, 
-        problems: List[str], 
+        self,
+        problems: List[str],
         search_config: SearchConfig,
-        **search_kwargs
-    ) -> Dict[str, Any]:
+    ) -> SearchResults:
         """Process a single batch of problems."""
-        # Override with any additional kwargs
-        if search_kwargs:
-            search_config = search_config.copy(**search_kwargs)
-            
-        # Prepare examples format
-        examples = {"problem": problems}
-        
-        if search_config.approach == "beam_search":
-            return beam_search(examples, search_config, self.generator, self.verifier)
-        elif search_config.approach == "dvts":
-            return dvts_search(examples, search_config, self.generator, self.verifier)
-        elif search_config.approach == "best_of_n":
-            return best_of_n_search(examples, search_config, self.generator, self.verifier)
-        elif search_config.approach == "dynamic_branching":
-            return dynamic_branching_search(examples, search_config, self.generator, self.verifier)
-        elif search_config.approach == "vg_search":
-            return vg_search(examples, search_config, self.generator, self.verifier)
-        else:
+        strategy = _SEARCH_STRATEGIES.get(search_config.approach)
+        if strategy is None:
             raise ValueError(f"Unknown approach: {search_config.approach}")
-        
+        return strategy({"problem": problems}, search_config, self.generator, self.verifier)
+
     def search(
-        self, 
-        problems: List[str], 
+        self,
+        problems: List[str],
         search_config: Optional[SearchConfig] = None,
-        **search_kwargs
-    ) -> Dict[str, Any]:
-        """Perform test time search asynchronously with batch processing."""
+        **search_kwargs,
+    ) -> SearchResults:
+        """Perform test-time search with batch processing."""
         if not self._initialized:
             self.initialize()
-            
-        # Get search configuration
-        search_config = self.config.get_search_config(search_config)
-        
-        # Override with any additional kwargs
+
+        if search_config is None:
+            search_config = self.config.search_config
         if search_kwargs:
             search_config = search_config.copy(**search_kwargs)
-            
+        search_config = search_config.copy(
+            spec_beam_extension=self.config.spec_beam_extension,
+        )
+
         batch_size = search_config.batch_size
-        
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
-            
-        # If batch_size is greater than the number of problems, process all at once
+
         if batch_size >= len(problems):
             logger.info(f"Processing {len(problems)} problems at once")
             return self._process_batch(problems, search_config)
-        
-        # Process problems in batches
+
         logger.info(f"Processing {len(problems)} problems in batches of {batch_size}")
-        
-        all_results = {
-            "completions": [],
-            "pred": [],
-            "completion_tokens": [],
-            "scores": [],
-            "total_num_tokens": [], 
-            "n_completion_tokens": [],
-            "total_generator_latency_s": [],
-            "total_verifier_latency_s": [],
-            "n_generator_latency_s": [],
-            "n_verifier_latency_s": [],
-            "completion_time": [],
-        }
-        
-        # Process batches sequentially
-        for i in range(0, len(problems), batch_size):
-            batch_problems = problems[i:i + batch_size]
-            batch_num = (i // batch_size) + 1
-            total_batches = (len(problems) + batch_size - 1) // batch_size
-            
+        total_batches = (len(problems) + batch_size - 1) // batch_size
+        merged = SearchResults()
+        for batch_num, start in enumerate(range(0, len(problems), batch_size), start=1):
+            batch_problems = problems[start:start + batch_size]
             logger.info(f"Processing batch {batch_num}/{total_batches} with {len(batch_problems)} problems")
-            
-            batch_results = self._process_batch(batch_problems, search_config)
-            
-            # Merge results
-            for key in all_results:
-                if key in batch_results:
-                    all_results[key].append(batch_results[key])
-                    
-            # Log progress
+            merged.append_batch(self._process_batch(batch_problems, search_config))
             logger.info(f"Completed batch {batch_num}/{total_batches}")
-        
+
         logger.info(f"Completed processing all {len(problems)} problems")
-        return all_results
-        
-    def search_single(
-        self, 
-        problem: str, 
-        search_config: Optional[SearchConfig] = None,
-        **search_kwargs
-    ) -> Dict[str, Any]:
-        """Search for a single problem asynchronously."""
-        results = self.search([problem], search_config, **search_kwargs)
-        
-        # Extract single result
-        single_result = {}
-        for key, value in results.items():
-            if isinstance(value, list) and len(value) > 0:
-                single_result[key] = value[0]
-            else:
-                single_result[key] = value
-                
-        return single_result
-        
-    def create_search_config(self, **kwargs) -> SearchConfig:
-        """Create a search configuration with optional overrides."""
-        return self.config.create_search_config(**kwargs)
-        
+        return merged
+
     def shutdown(self):
         """Shutdown the models gracefully."""
         if self.generator:
@@ -194,55 +136,46 @@ class FastTTS:
         self.shutdown()
 
 
+def _merge_vllm_config(defaults: Dict, overrides: Optional[Dict]) -> Dict:
+    """Shallow-merge a caller-supplied vLLM config dict over the defaults."""
+    merged = defaults.copy()
+    if overrides:
+        merged.update(overrides)
+    return merged
+
+
 def create_fasttts_config(
     generator_vllm_config: Optional[Dict] = None,
     verifier_vllm_config: Optional[Dict] = None,
-    **kwargs
+    **kwargs,
 ) -> FastTTSConfig:
-    # Separate FastTTSConfig parameters from SearchConfig parameters
+    """Build a FastTTSConfig. kwargs matching FastTTSConfig fields are consumed;
+    the rest are left in the caller's dict for downstream use (search params)."""
     from dataclasses import fields
-    fasttts_config_param_names = {field.name for field in fields(FastTTSConfig)}
-    
-    # Create default config to get default VLLM configs
-    default_config = FastTTSConfig()
-    
-    # Merge VLLM configs with defaults
-    merged_generator_config = default_config.generator_vllm_config.copy()
-    if generator_vllm_config:
-        merged_generator_config.update(generator_vllm_config)
-        
-    merged_verifier_config = default_config.verifier_vllm_config.copy()
-    if verifier_vllm_config:
-        merged_verifier_config.update(verifier_vllm_config)
-    
-    # Extract FastTTSConfig parameters from kwargs
-    fasttts_config_params = {
-        'generator_vllm_config': merged_generator_config,
-        'verifier_vllm_config': merged_verifier_config,
-    }
-    
-    # Dynamically extract parameters that exist in kwargs
-    for param_name in fasttts_config_param_names:
-        if param_name in kwargs:
-            fasttts_config_params[param_name] = kwargs.pop(param_name)
-    
-    config = FastTTSConfig(**fasttts_config_params)
-    return config
+    fasttts_field_names = {f.name for f in fields(FastTTSConfig)}
+    defaults = FastTTSConfig()
 
-# Convenience function for quick usage
+    fasttts_params = {
+        "generator_vllm_config": _merge_vllm_config(defaults.generator_vllm_config, generator_vllm_config),
+        "verifier_vllm_config": _merge_vllm_config(defaults.verifier_vllm_config, verifier_vllm_config),
+    }
+    for name in list(kwargs):
+        if name in fasttts_field_names:
+            fasttts_params[name] = kwargs.pop(name)
+
+    return FastTTSConfig(**fasttts_params)
+
+
 def create_fasttts(
     generator_vllm_config: Optional[Dict] = None,
     verifier_vllm_config: Optional[Dict] = None,
     approach: str = "beam_search",
-    **kwargs
+    **kwargs,
 ) -> FastTTS:
     """Create a FastTTS instance with default configuration."""
     config = create_fasttts_config(generator_vllm_config, verifier_vllm_config, **kwargs)
-    
-    # Set the default search approach and any remaining search config parameters
-    config.search_config.approach = approach
-    for key, value in kwargs.items():
-        if hasattr(config.search_config, key):
-            setattr(config.search_config, key, value)
-    
-    return FastTTS(config) 
+    # Remaining kwargs target SearchConfig fields; let SearchConfig.copy validate.
+    config.search_config = config.search_config.copy(approach=approach, **{
+        k: v for k, v in kwargs.items() if hasattr(config.search_config, k)
+    })
+    return FastTTS(config)

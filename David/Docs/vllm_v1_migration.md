@@ -1,4 +1,4 @@
-# FastTTS vLLM V1 Migration (0.9.2 -> 0.18.1)
+# FastTTS vLLM V1 Migration (0.9.2 -> 0.19.0)
 
 ## 1. Introduction & Motivation
 
@@ -9,7 +9,7 @@ offloading, KV-cache management -- targets `vllm/v1/`. Running FastTTS on V0
 would mean none of those optimisations are exercised at test-time, making any
 comparison against the baseline meaningless.
 
-The thesis vLLM fork is pinned to **v0.18.1** (tag `a26e8dc7f`) for
+The thesis vLLM fork is pinned to **v0.19.0** (tag `2a69949bd`) for
 reproducibility. The `thesis` branch is created from this tag for all
 thesis-specific modifications.
 
@@ -17,26 +17,31 @@ thesis-specific modifications.
 
 | Component | Status |
 |---|---|
-| `models/tts_llm.py` | Fully migrated to V1 APIs |
+| `models/tts_llm.py` | Fully migrated to V1 APIs; `__init__` decomposed, score dispatch via registry, `_score_outputs_skywork` split into 3 phases (§8) |
 | `models/generator_engine_v1.py` | New file -- V1 SBE implementation |
-| `models/vllm_wrapper.py` | Updated (`task`->`runner`, `PoolerConfig`) |
-| `models/reward_utils.py` | Rewritten (tokenizer boundary fix) |
+| `models/vllm_wrapper.py` | Updated (`task`->`runner`, `PoolerConfig`); worker now dispatches via `_WORKER_HANDLERS` registry, `ProcessTokenizerWrapper` collapsed via `_rpc` (§8) |
+| `models/reward_utils.py` | Rewritten (tokenizer boundary fix); `DEFAULT_STEP_TOKEN` constant |
+| `config.py` | Extracted `DEFAULT_SYSTEM_PROMPT`, `DEFAULT_GENERATOR_VLLM_CONFIG`, `DEFAULT_VERIFIER_VLLM_CONFIG` module constants; removed duplicate `FastTTSConfig` generation-param fields (§8) |
+| `fasttts.py` | `_SEARCH_STRATEGIES` registry replaces if/elif; `search()` decomposed; `SearchResults` in/out; dead `search_single` / `create_search_config` proxy removed (§8) |
 | `search/beam_search.py` | Fully rewritten (decomposed, StepChunk, step-hash propagation) |
 | `search/beam.py` | Restructured (renamed fields, StepChunk, beam identity) |
-| `search/common.py` | New -- shared infrastructure (SearchState, phase functions, generate/score/parse) |
+| `search/common.py` | New -- shared infrastructure (SearchState, phase functions, generate/score/parse); `package_results` returns `SearchResults` |
+| `search/results.py` | New -- `SearchResults` dataclass, canonical return type (§8) |
 | `search/dvts.py` | Fully migrated -- uses shared infrastructure + DVTS-specific subtree pruning |
-| `search/best_of_n.py` | Fully migrated -- standalone single-shot generation + scoring |
+| `search/best_of_n.py` | Fully migrated -- now routes through `common.package_results` (dedupe) |
 | `search/dynamic_branching.py` | Fully migrated -- uses shared infrastructure + score-proportional duplication |
 | `search/vg_search.py` | Fully migrated -- uses shared infrastructure + 3-stage sampling params |
 | PRM plugin (`prm_model.py`) | Migrated to V1 TokenPooler |
-| `accuracy_evaluation/evaluation/evaluate.py` | Rewritten (multi-metric, no test-set tuning) |
-| `run_all_experiments.py` | Updated (removed `top_n` sweep, scaling curve plots) |
+| `accuracy_evaluation/evaluation/evaluate.py` | Rewritten; headline metrics `pass@n` + `pass@1` (PRM-Vote), no test-set tuning |
+| `accuracy_evaluation/evaluation/evaluate_full.py` | **New** — full 4-metric × 4-aggregation-strategy utility for appendix/ablation tables |
+| `run_all_experiments.py` | Updated (removed `top_n` sweep, new N sweep `{1, 4, 16, 64, 256}`, scaling curve plots) |
+| `benchmarks/run_benchmarks.py` | Calls `results.to_dict()` before JSONL serialization |
+| `migration_verification/worker_e2e_thesis.py` | Uses `SearchResults` attribute access |
 
-The non-migrated search strategies construct `Beam` objects with field names
-that no longer exist (`index`, `next_texts`, `lookahead_texts`, `best_scores`,
-`all_scores`, `previous_text`, `history`, `completion_tokens`,
-`total_completion_tokens`, `completion_time`, `future_texts`). See
-[Section 11](#11-known-limitations--open-issues) for the full field mapping.
+All 5 search strategies (`beam_search`, `dvts`, `best_of_n`,
+`dynamic_branching`, `vg_search`) use the new `Beam` field names and return
+`SearchResults`. The old `example.py` / `run_aime_fasttts.py` entry points
+were deleted; single-run testing now goes through `benchmarks/run_benchmarks.py`.
 
 ---
 
@@ -46,7 +51,7 @@ that no longer exist (`index`, `next_texts`, `lookahead_texts`, `best_scores`,
 
 ### What broke
 
-| Old import | Status in v0.18.1 |
+| Old import | Status in v0.19.0 |
 |---|---|
 | `vllm.model_executor.pooling_metadata.PoolingMetadata` | Moved to `vllm.v1.pool.metadata.PoolingMetadata` |
 | `vllm.model_executor.pooling_metadata.PoolingTensors` | Removed |
@@ -127,7 +132,7 @@ accumulates across steps.
 
 ### Files removed (V0 code)
 
-These imported V0 APIs that no longer exist in v0.18.1. Originals preserved
+These imported V0 APIs that no longer exist in v0.19.0. Originals preserved
 in `FastTTS-AE/models/`.
 
 | File | Purpose (V0) | V1 Replacement |
@@ -200,7 +205,7 @@ return {
 
 ### GPU memory allocation
 
-v0.18.1 has higher memory overhead than v0.9.2 (CUDA graphs, torch.compile,
+v0.19.0 has higher memory overhead than v0.9.2 (CUDA graphs, torch.compile,
 per-process CUDA contexts). Each spawned process adds ~0.9–1.4 GiB overhead
 beyond what `gpu_memory_utilization` budgets for. With two processes
 (generator + verifier), the combined overhead is ~2.3 GiB.
@@ -208,45 +213,35 @@ beyond what `gpu_memory_utilization` budgets for. With two processes
 #### Root cause: PyTorch memory fragmentation
 
 The original AE splits (baseline 0.68/0.22=0.90, spec-prefix 0.75/0.15=0.90)
-OOM in v0.18.1 — but not from absolute memory exhaustion. The OOM occurs on
-**activation allocations** (MLP gate_up projection: `max_num_batched_tokens ×
-18944 × 2` bytes = 296 MiB at batch 8192) inside torch.compile/inductor
-compiled code. PyTorch's default caching allocator fragments into "slivers"
-of unusable memory (reported as "reserved but unallocated" in OOM messages,
-observed 187–869 MiB). Two engines on one GPU compounds this: each process
-independently fragments its allocator pool, and the combined waste exceeds
-the ~2.4 GiB headroom at 0.90 total utilization.
-
-This fragmentation is worse in v0.18.1 because CUDA graphs + torch.compile
-create more allocation/deallocation cycles with varying tensor sizes. The
-`memory_latency_analysis.py` profiling (1 problem / 1 iteration) didn't
-reproduce it because fewer cycles = less fragmentation. The full evaluation
-pipeline (30 problems / 10 iterations) fragments far more.
+OOM in v0.19.0 — but not from absolute exhaustion. The failure is on
+activation allocations inside torch.compile-emitted code (e.g. MLP
+`gate_up`, ~296 MiB at `max_num_batched_tokens=8192`). PyTorch's default
+caching allocator fragments into unusable slivers (reported as "reserved
+but unallocated", observed 187–869 MiB). Two engines share one GPU, so
+the combined waste exceeds the ~2.4 GiB headroom at 0.90 total utilization.
+Fragmentation scales with compile/graph cycles, so the full eval pipeline
+reproduces it while single-iteration profiling does not.
 
 #### Fix: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
 
-Set in `models/vllm_wrapper.py` at module level. This tells PyTorch's default
-caching allocator to use growable memory segments instead of fixed-size blocks,
-eliminating fragmentation-induced OOM. This is the documented PyTorch solution
-for workloads with varying allocation sizes (see PyTorch CUDA Memory
-Management docs).
+Set in `models/vllm_wrapper.py` at module level. Growable segments replace
+fixed-size blocks, which is PyTorch's documented fix for workloads with
+varying allocation sizes.
 
 **Compatibility:**
 - **Safe** with kv_offload, prefetch offloader, UVA offloader (they use
-  standard `torch.zeros()`/`torch.empty_strided()`, not custom allocators)
-- **Incompatible** with vLLM's `CuMemAllocator` (sleep mode). Sleep mode
-  replaces PyTorch's default allocator via `cuMemCreate`/`cuMemMap` for
-  tagged memory management. The two allocators cannot coexist. When
-  `offload_enabled=True` enables sleep mode, `expandable_segments` must be
-  removed — but at that point only one model's weights are GPU-resident
-  (the other is sleeping), so fragmentation headroom is not an issue.
+  standard `torch.zeros()` / `torch.empty_strided()`).
+- **Incompatible** with vLLM's `CuMemAllocator` (sleep mode), which
+  replaces the default allocator. When `offload_enabled=True` turns on
+  sleep mode, drop `expandable_segments` — only one model's weights are
+  GPU-resident at a time, so fragmentation headroom is not needed.
 
 #### Updated splits
 
 With `expandable_segments:True`, the original AE total=0.90 is restored:
 
 - Verifier minimum: 0.15 -> **0.16** (0.15 has insufficient KV cache capacity
-  for `max_model_len=4096` due to higher per-process overhead in v0.18.1;
+  for `max_model_len=4096` due to higher per-process overhead in v0.19.0;
   this is a capacity constraint, not fragmentation)
 - Baseline split: generator 0.68 / verifier **0.22** (total 0.90)
 - Spec-prefix split: generator **0.74** / verifier 0.16 (total 0.90;
@@ -345,9 +340,19 @@ supports explicit `False`.
 ```python
 rewards = self.encode(
     prompts,
-    pooling_params=PoolingParams(skip_reading_prefix_cache=False),
+    pooling_params=PoolingParams(
+        skip_reading_prefix_cache=skip_reading_prefix_cache,
+    ),
 )
 ```
+
+The flag is threaded from `score_beam` through `VerifierVLLMModelWrapper.score`
+→ `_handle_score` → `score_outputs` → `_score_outputs_skywork`. Default is
+`False` (caching on) so the iterative strategies keep the 18× speedup and
+rely on the step-hash propagation layer to fill cached-step `None`s.
+`best_of_n` opts in to `True`: it's single-shot, has no step-hash bank to
+propagate through, and its completions diverge from the first answer token
+so the cached prefix (question only) buys little.
 
 #### 2. Offset-based reward_flags indexing (`tts_llm.py`)
 
@@ -371,7 +376,7 @@ for i, flag in enumerate(reward_flag):
 All question prefix flags are 0, so within-batch prefix sharing produces
 zero Nones in the common case.
 
-#### 3. Score propagation via step-hash matching (`beam_search.py`)
+#### 3. Score propagation via step-hash matching (`search/common.py`)
 
 Score propagation runs in `_score_and_assign()` in the search layer, not
 in the PRM subprocess. This avoids tokenization mismatches from
@@ -458,18 +463,31 @@ Duplicates consumed parent's speculative steps unchanged -- no divergence.
 This contradicts the FastTTS paper's Algorithm 1 line 19
 (`DuplicateThenTruncate`).
 
-**Fix:** Truncate the FIRST speculative step (R=0.85), clear all subsequent
+**Fix:** Truncate the FIRST speculative step, clear all subsequent
 steps. Trim `scores[:i]` to remove speculative scores:
 
 ```python
 if beam.pending_steps:
-    first_text = truncate_sentence_by_tokens(beam.pending_steps[0].text, tokenizer)
+    # Thesis uses R=0 for algorithm equivalence with vanilla beam search.
+    first_text = truncate_sentence_by_tokens(
+        beam.pending_steps[0].text, tokenizer,
+        mean_ratio=0.0, std_ratio=0.0,
+    )
     duplicate.pending_steps = [
         StepChunk(text=first_text, is_complete_step=False, terminal=False)
     ]
     duplicate.scores = beam.scores[:i]
     duplicate.step_hashes = beam.step_hashes[:i]
 ```
+
+The FastTTS paper's default is R=0.85 (keep 85% of speculative tokens,
+trading a tiny bit of beam diversity for throughput). Our thesis sets
+**R=0** (`mean_ratio=0`, `std_ratio=0`) so duplicates regenerate step
+k+1 from scratch — guaranteeing vanilla beam search diversity and
+algorithmic accuracy equivalence. The FastTTS paper's §6.5.2 Fig. 17
+reports this as the equivalence configuration. The original beam still
+benefits from SBE's step-overlap throughput; only duplicates lose the
+extra speedup.
 
 Parent beam keeps full scores and pending_steps unchanged. Duplicate gets
 truncated first step + cleared rest for immediate divergence.
@@ -560,7 +578,7 @@ pre-existing in AE and carried through to the initial thesis migration.
 | # | Issue | Severity | Location |
 |---|---|---|---|
 | 1 | **Test-set tuning of `top_n`** | Critical | `run_all_experiments.py:186,257-272` |
-| 2 | **Completion count exceeds n** | Critical | `beam_search.py:_check_n_completion()` |
+| 2 | **Completion count exceeds n** | Critical | `search/common.py:_check_n_completion()` |
 | 3 | **Inconsistent latency/accuracy pairing** | Critical | latency at n, accuracy over >n |
 | 4 | **Hardcoded `np.prod` aggregation** | Moderate | `evaluate.py:34` |
 | 5 | **Non-deterministic tie-breaking** | Minor | `evaluate.py:41` |
@@ -591,35 +609,60 @@ returns the first element achieving the max count -- order-dependent.
 
 ### Fixes
 
-**Beam search early exit** (`beam_search.py`):
+**Beam search early exit** (`search/common.py`):
 - `_check_n_completion()` returns `bool` -- `True` when `completed >= n`
-  or no active beams remain
-- `_filter_completed_and_prune()` simplified: no longer returns stop signal
-  (redundant -- `_check_n_completion` covers both conditions)
-- Main loop breaks on `reached_n`
-- `_finalize()` always sorts by aggregate PRM score (descending) and
-  truncates to `[:config.n]`. Handles burst completions from the final
-  iteration fairly (multiple beams complete simultaneously -> keep top-n
-  by score since they share the same compute budget).
+  or no active beams remain; main loop breaks on that signal
+- `_finalize()` always sorts completed beams by aggregate PRM score
+  (descending) and truncates to `[:config.n]`. Handles burst completions
+  fairly when several beams finish in the same iteration.
+- `n_completion_tokens` is computed in `_finalize()` **after** the top-n
+  sort+truncate, so it references the same beam set that `evaluate.py`
+  scores for accuracy. Previously it was set in `_check_n_completion()`
+  before truncation, which over-counted by the `M - n` burst-completion
+  excess -- the latency/goodput plot was paying for beams the accuracy
+  plot never saw.
+- `n_generator_latency_s` / `n_verifier_latency_s` were removed from
+  the JSONL schema and `SearchResults`. After early-exit the loop
+  breaks the moment `n` is reached, so they always equalled
+  `total_generator_latency_s` / `total_verifier_latency_s`. Consumers
+  (`run_all_experiments.py`, `compare_e2e.py`) now read `total_*`.
+  The AE-vs-thesis comparison worker still emits `n_*_latency_s` JSON
+  keys sourced from `total_*` for schema parity with the untouched AE
+  worker.
 
 **Evaluation pipeline rewrite** (`evaluate.py`):
-- Replaced single-metric pipeline with multi-metric evaluation
-- Four metrics computed at each N:
-  - **Pass@N**: unbiased estimate via OpenAI Codex formula
-  - **Majority Vote**: most common extracted answer (no PRM)
-  - **PRM-Max**: best single completion by aggregate PRM score
-  - **PRM-Vote**: group answers by `math_equal`, sum PRM scores per group,
-    pick highest-sum group (matches Liu et al. `_agg_prm_last_vote`)
-- Ordered subsampling: `completions[:n_eval]` for multi-N curves from a
-  single max-N run (following search-and-learn methodology)
+- Headline metrics (two curves per plot):
+  - **pass@n**: at least one of N completions correct (OpenAI Codex
+    unbiased formula). Measures search coverage.
+  - **pass@1**: PRM-Vote — group answers by exact string equality, sum
+    aggregate PRM scores per group, pick highest-sum group (matches
+    Liu et al. `_agg_prm_last_vote`). Represents the deployed
+    single-answer accuracy.
+- Answer grouping uses **exact string match** (matches Liu et al.
+  `_agg_orm_vote`) after `extract_answer` + `strip_string` normalization.
+  `math_equal`-based grouping was abandoned due to O(n²) symbolic-math
+  cost; it produced identical numbers on our data (>18× slower with no
+  measurable gain).
 - Configurable `agg_strategy` (default: `"last"`, matching both reference
-  frameworks)
-- Deterministic tie-breaking (lexicographic on canonical answer form)
+  frameworks).
+- Deterministic tie-breaking (lexicographic on canonical answer form).
+- Invalid/empty extracted answers filtered before selection (matches
+  Liu et al. `judge_ans`).
+
+**Full-metric utility** (`evaluate_full.py`):
+- Separate script reporting all four metrics (Pass@N, MajVote, PRM-Max,
+  PRM-Vote) across all four aggregation strategies (last, min, prod,
+  mean) — 16 numbers per result file. Used for appendix/ablation tables;
+  not driven by `run_all_experiments.py`.
+- Shares extract-and-grade work across strategies via a per-problem
+  cache; only the aggregation step is recomputed per strategy.
 
 **Orchestration** (`run_all_experiments.py`):
-- Removed `TOP_N_VALUES` sweep entirely
-- `evaluate_accuracy()` calls `evaluate.py` once per result file
-- `plot_accuracy()` generates scaling curves (accuracy vs N, log2 x-axis)
+- Removed `TOP_N_VALUES` sweep entirely.
+- `evaluate_accuracy()` calls `evaluate.py` once per result file.
+- `plot_accuracy()` generates pass@n + pass@1 scaling curves per
+  (dataset, generator), overlaying fasttts and baseline as separate
+  line styles.
 
 ### Reference framework alignment
 
@@ -627,10 +670,12 @@ returns the first element achieving the max count -- order-dependent.
 |---|---|---|---|
 | Stops at exactly N | Yes | Yes (pad if fewer) | Yes (early exit + truncate) |
 | Score aggregation | Configurable (min/last/avg) | Hardcoded `"last"` | Configurable, default `"last"` |
-| Answer selection | 7 methods, fixed per run | 3 methods, all reported | 4 methods, all reported |
-| Multi-N evaluation | Separate runs per N | Subsample from max-N | Subsample from max-N |
-| Pass@N metric | Not implemented | OpenAI formula | OpenAI formula |
+| Answer selection (headline) | 7 methods, fixed per run | 3 methods, all reported | pass@1 (= PRM-Vote) |
+| Answer grouping | Exact string | Exact string | Exact string (switched from `math_equal`) |
+| Multi-N evaluation | Separate runs per N | Subsample from max-N | Separate runs per N |
+| Pass@N metric | Not implemented | Helper only | Headline metric (pass@n) |
 | Test-set tuning prevention | Config locked before eval | Ordered subsampling | No sweeping |
+| N sweep | {4, 16, 64, 256} | Powers of 2 up to max-N | **{1, 4, 16, 64, 256}** (matches Liu et al. + N=1 reference) |
 
 ### Empirical findings: TTC accuracy scaling
 
@@ -677,24 +722,44 @@ scaling but **flat selection metrics**. Confirmed pre-existing in AE
   remains the weakest selection method (consistent with Liu et al.'s
   finding for off-policy PRMs).
 
-**Recommended thesis setup**: `Qwen2.5-7B-Instruct` generator +
-Skywork-PRM-1.5B verifier, `max_model_len=8192`, MATH-500 (primary) +
-AIME 2024 (hard subset). Report all four selection methods (MajVote,
-PRM-Vote, PRM-Max, Pass@N) -- no cherry-picking.
+**Recommended thesis setup** (adopted):
+- Generators: `Qwen2.5-7B-Instruct` (primary) + `Qwen2.5-1.5B-Instruct`
+  (secondary). Both non-Math variants — 32K context avoids the Math-7B
+  4096 exhaustion.
+- Verifier: `Skywork-o1-Open-PRM-Qwen-2.5-1.5B` (fixed).
+- `max_model_len=8192` for all configs (matches compute-optimal-tts).
+- Datasets: MATH-500 (primary, 500 problems) + AIME 2024 (hard subset).
+- N sweep: `{1, 4, 16, 64, 256}` — matches Liu et al.'s `{4, 16, 64, 256}`
+  plus N=1 as the "no TTC" reference point (`beam_width=1`, no search).
+- Methods: `fasttts` (FastTTS with all optimizations enabled) and
+  `baseline` (vanilla beam search). Both swept across every N.
+- SBE truncation ratio **R = 0** (`mean_ratio=0.0, std_ratio=0.0` in
+  `_duplicate_beams`). Duplicates regenerate step k+1 from scratch,
+  preserving vanilla beam search diversity. This is the FastTTS paper's
+  algorithm-equivalence setting (Fig. 17 ablation). Trades a small amount
+  of SBE throughput for a clean accuracy claim — the main thesis
+  contribution (offloading) is not conflated with SBE's accuracy/throughput
+  trade-off.
+- Headline metrics: **pass@n** (search coverage) and **pass@1** (deployed
+  accuracy via PRM-Vote). Full 4-metric × 4-aggregation-strategy table
+  in the appendix via `evaluate_full.py`.
 
 ---
 
 ## 8. Code Restructuring
 
-### Decomposed beam search into named phases (`beam_search.py`)
+### Decomposed beam search into named phases (`search/common.py`)
 
-The monolithic 336-line `_beam_search()` loop was split into 11 functions:
+The monolithic 336-line `_beam_search()` loop was split into 11 phase
+functions. They live in `search/common.py` so every strategy
+(`beam_search`, `dvts`, `dynamic_branching`, `vg_search`, `best_of_n`) can
+compose them; `search/beam_search.py` is now a ~110-line orchestrator.
 
 | Function | Responsibility |
 |---|---|
 | `_init_state()` | Create beams, sampling params, compute prompt token length |
-| `_filter_active()` | Remove pruned beams |
-| `_check_n_completion()` | Record metrics when n completions first reached |
+| `_filter_active()` | Remove pruned beams (SBE: sort low→high by score) |
+| `_check_n_completion()` | Record metrics, signal early exit when `n` reached |
 | `_duplicate_beams()` | Expand active beams to `config.n` via duplication |
 | `_prepare_step_source()` | Decide skip vs generate per beam |
 | `_generate()` | Build conversations, call generator |
@@ -704,8 +769,8 @@ The monolithic 336-line `_beam_search()` loop was split into 11 functions:
 | `_log_iteration()` | Structured logging (INFO summary + DEBUG per-beam) |
 | `_finalize()` | Post-loop metrics, sort completed beams |
 
-New dataclasses: `BeamSearchState` (shared mutable state), `ScoringBatch`
-(typed container for verifier inputs).
+New dataclasses: `SearchState` (shared mutable state across phases) and
+`ScoringBatch` (typed container for verifier inputs).
 
 ### Beam identity tracking (`beam.py`)
 
@@ -732,18 +797,90 @@ Removed dead fields: `index`, `best_scores`, `previous_text`.
 Added: `step_hashes` (cumulative text hash per step, aligned 1:1 with
 `scores`), `finish_reasons`, `prompt_token_lens`, `stop_label` property.
 
-### Structured logging
-
-- **INFO** (always): one-line summary -- beam counts, latencies
-- **DEBUG** (opt-in): per-beam table with ID lineage, token counts, scores,
-  pending_steps count, stop reasons
-
 ### Dead code removal
 
-- Removed multi-step lookahead generation loop (`config.lookahead` always 0)
-- Deleted `core.py` (imported non-existent async wrappers)
-- Fixed `__init__.py` (removed async exports)
-- Removed `_score_call_counter`, `score_debug_dump.txt` writer
+- Multi-step lookahead generation loop (`config.lookahead` always 0)
+- `core.py` (imported non-existent async wrappers) and its `__init__.py`
+  re-exports
+- `_score_call_counter` / `score_debug_dump.txt` writer
+- Math-Shepherd PRM path (`_score_outputs_math_shepherd`,
+  `MATH_SHEPHERD_POOLER_CONFIG`, `_SCORE_DISPATCH` registry). Thesis
+  benchmarks run Skywork-PRM exclusively, so the dispatch collapsed to
+  a direct call. Default verifier in `benchmark_config.py` and
+  `memory_latency_analysis.py` updated to Skywork-PRM-1.5B.
+
+### Post-migration restructuring (cross-layer)
+
+After the search-layer decomposition landed, the same pattern (typed
+dataclasses, registry dispatch, shared helpers, module-level constants)
+was applied to the rest of the codebase. All changes are behaviour-preserving
+-- the migration verification suite still passes.
+
+**`SearchResults` dataclass (`search/results.py`).** Replaces the 15-key
+dict returned by every strategy and `FastTTS.search()`. `append_batch()`
+sums scalars + extends per-problem lists for multi-batch merging;
+`to_dict()` preserves the JSONL schema so benchmark artifacts are
+byte-compatible. Callers now use attribute access (`results.completions`)
+instead of string keys -- typos caught at import time, and fixed a
+pre-existing drift between `"completion_tokens"` and `"effective_num_tokens"`.
+
+**Registries replace if/elif chains.**
+| Location | Registry | Branches removed |
+|---|---|---|
+| `fasttts.py` | `_SEARCH_STRATEGIES` | 5 (approach -> strategy fn) |
+| `models/tts_llm.py` | `_SCORE_DISPATCH` | 3 (PRM model -> scorer) |
+| `models/vllm_wrapper.py` | `_WORKER_HANDLERS` | 7 (action -> handler) |
+
+**`models/tts_llm.py` decomposition.** `__init__` split via
+`_build_compilation_config`, `_resolve_worker_cls`, `_bootstrap_llm_attributes`.
+`_score_outputs_skywork` (61 lines) split into `_build_skywork_scoring_prompts`,
+`_extract_step_rewards`, `_rebuild_nested_scores`. Dead `lengths` list
+removed from `_score_outputs_math_shepherd`.
+
+**`models/vllm_wrapper.py` decomposition.** `_model_process_worker`'s
+9-branch if/elif replaced with `_WORKER_HANDLERS` dict + `WorkerContext`
+dataclass. `@_with_sleep_wake` decorator dedupes 4× repeated sleep/wake
+wrapping around `generate`/`score`. `ProcessTokenizerWrapper`'s 4 methods
+collapsed to one-liners via `_rpc(action, response_key, **payload)`.
+`MATH_SHEPHERD_POOLER_CONFIG` lifted to module-level constant (was inlined
+with magic numbers `step_tag_id=12902`, `returned_token_ids=[648, 387]`).
+`_ensure_v1_env()` helper dedupes the env-var setup (module load + worker).
+
+**`config.py` constants.** `DEFAULT_SYSTEM_PROMPT`,
+`DEFAULT_GENERATOR_VLLM_CONFIG`, `DEFAULT_VERIFIER_VLLM_CONFIG` lifted out
+of `field(default_factory=...)` inline dicts. Removed duplicate
+`FastTTSConfig` fields (`system_prompt`, `temperature`, `top_p`,
+`max_tokens`, `custom_chat_template`) and the `__post_init__` sync --
+these fields live only on `SearchConfig` now. `custom_chat_template` was
+subsequently dropped from `SearchConfig` too (no YAML or caller ever set
+it, and the process-based tokenizer path never forwarded it across the
+RPC boundary anyway). `num_samples` was removed for the same reason:
+`best_of_n` reads `n`, and `num_samples` was never consulted.
+
+*Latent bug fixed:* `VerifierVLLMModelWrapper.score` previously read
+`self.config.system_prompt`, which existed at the `FastTTSConfig` level
+only by the now-removed `__post_init__` sync. Now reads
+`self.config.search_config.system_prompt` directly.
+
+**`run_all_experiments.py`** (843 -> 763 lines). Extracted plot-styling
+constants (`PLOT_STYLE_{GOODPUT,LATENCY,ACCURACY}`, `METHOD_DISPLAY_MAP`).
+Shared plot helpers: `_build_records_df`, `_combos_per_dataset`,
+`_draw_dataset_separators`, `_save_figure`, `_lighten`. `parse_jsonl_folder`
+(81 lines) split into `_extract_n_from_filename` / `_load_jsonl_records`
+/ `_compute_folder_metrics`. `plot_accuracy` extracted
+`_collect_accuracy_panels` + `_draw_accuracy_panel`.
+
+**`accuracy_evaluation/evaluation/evaluate.py`.** Headline pipeline
+keeps only `_extract_and_check` + `_select_prm_vote`. `ProblemMetrics` /
+`AggregatedResult` dataclasses carry `pass_at_n` + `pass_at_1_correct`.
+The richer 4-metric × 4-aggregation-strategy ablation variant lives in
+`evaluate_full.py` and caches extract-and-grade across strategies.
+
+**Dead file removal.**
+- `example.py`, `run_aime_fasttts.py` -- standalone single-run entry
+  points. Redundant with `benchmarks/run_benchmarks.py` and the YAML
+  config grid. `experiment_utils.py` (their shared helpers) removed
+  along with them.
 
 ---
 
@@ -752,7 +889,7 @@ Added: `step_hashes` (cumulative text hash per step, aligned 1:1 with
 These discrepancies exist in the **original AE codebase** -- they are NOT
 migration errors. The V1 migration faithfully preserves AE's actual behavior.
 
-### Score-based speculative priority tiering (SS4.1.1) -- NOT in AE
+### Score-based speculative priority tiering (SS4.1.1) -- approximated in V1
 
 **Paper claim:** "System policy partitions scores into B discrete bins.
 For beam b_i with score s_i, if s_i in C_j, then M_i = B - j + 1."
@@ -763,6 +900,21 @@ SPEC_BEAM_CANDIDATE_PRIORITY = 1e9  # uniform -- no score binning
 ```
 
 No discrete-bin partitioning, no M_i calculation exists anywhere.
+
+AE had a commented-out `sorted(active_beams, key=aggregate_scores)` (e.g.
+`FastTTS-AE/search/dynamic_branching.py:249`) that, if enabled, selects
+highest-score beams to speculate: with the waiting queue ordered low→high
+by score, low-score beams drain first and hit their stops while waiting is
+still non-empty (no speculation -- Phase 1); high-score beams are admitted
+last and hit stops after waiting empties (speculation -- Phase 2).
+
+**V1 status:** re-enabled in the thesis branch and consolidated into
+`search/common.py:_filter_active()` so all 5 strategies pick it up. Gated on
+`SearchConfig.spec_beam_extension` (mirrored from `FastTTSConfig` in
+`FastTTS.search()`), so it is active only when SBE itself is on. This is not
+the paper's discrete-bin scheme, but produces the same qualitative effect:
+speculation skewed toward high-score beams, without per-request priority
+tiering.
 
 ### Dynamic prefix-aware scheduling (SS4.2) -- commented out in AE
 
@@ -849,34 +1001,6 @@ per-step scores are exactly identical (Test 4).
 
 ## 11. Known Limitations & Open Issues
 
-### Non-migrated search strategies (CRITICAL)
-
-`dvts.py`, `best_of_n.py`, `dynamic_branching.py`, `vg_search.py` use old
-Beam field names. They will crash with `TypeError` on any call. Full
-field mapping:
-
-| Old field | New field / status |
-|---|---|
-| `index` | Removed |
-| `next_texts` | Renamed to `gen_text` |
-| `lookahead_texts` | Removed |
-| `best_scores` | Removed |
-| `all_scores` | Renamed to `scores` |
-| `previous_text` | Removed |
-| `history` | Renamed to `gen_history` |
-| `completion_tokens` | Renamed to `step_tokens` |
-| `total_completion_tokens` | Renamed to `total_tokens_generated` |
-| `completion_time` | Renamed to `time_to_complete` |
-| `future_texts` | Renamed to `pending_steps` (type: `List[StepChunk]`) |
-
-These strategies also pass dead `prev_scores`/`skipped_beam_context` kwargs
-through the verifier pipe -- score propagation was moved to the search
-layer (`beam_search.py:_score_and_assign()`), so these kwargs are silently
-absorbed.
-
-Additionally, `best_of_n.py` sorts by `completion_time` instead of score
-when `sort_completed=True` (pre-existing bug from AE).
-
 ### SBE detokenizer text/token_ids desync
 
 **Status:** Root cause identified, fix not yet implemented.
@@ -898,7 +1022,10 @@ The inflated `output_text` gets split into ~27 pending_steps (instead of
 
 Qwen2.5-Math-7B-Instruct has `max_position_embeddings=4096` -- the model's
 hard limit. With 7B generators, beams hit this as early as iteration 5/10
-without producing `\boxed{}` answers. The reference paper uses 8192 total
-with Qwen2.5-7B-Instruct (128K context), not the Math variant. Raising the
-limit would require `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` and risks NaN from
-RoPE extrapolation.
+without producing `\boxed{}` answers. Raising the limit would require
+`VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` and risks NaN from RoPE extrapolation.
+
+**Resolved:** current benchmarks use `Qwen2.5-{1.5B,7B}-Instruct` (non-Math
+variants, 32K native context) at `max_model_len=8192`. Every YAML config
+under `benchmarks/configs/*/` pins this value. The Math variants are no
+longer referenced in the benchmark grid.

@@ -15,17 +15,16 @@
 
 import logging
 import time
-from collections import defaultdict
 from typing import List, Dict, Any
 
-import numpy as np
 from vllm import SamplingParams
 import torch.cuda.nvtx as nvtx
 
 from config import SearchConfig
 from models.vllm_wrapper import GeneratorVLLMModelWrapper, VerifierVLLMModelWrapper
 from search.beam import Beam
-from search.common import score_beam
+from search.common import package_results, score_beam
+from search.results import SearchResults
 from search.utils import build_conversation, aggregate_scores
 
 logger = logging.getLogger(__name__)
@@ -58,8 +57,6 @@ def _best_of_n_search(
     for prompt in batch_of_prompts:
         conv = build_conversation(prompt, "", search_config.system_prompt)
 
-        if hasattr(search_config, 'custom_chat_template') and search_config.custom_chat_template is not None:
-            tokenizer.chat_template = search_config.custom_chat_template
         templated_conv = tokenizer.apply_chat_template(
             conv,
             add_generation_prompt=True,
@@ -101,7 +98,15 @@ def _best_of_n_search(
         prompts = [beam.prompt for beam in completed_beams]
         completions = [[beam.current_text] for beam in completed_beams]
 
-        scores, verifier_time = score_beam(verifier, prompts, completions)
+        # best_of_n is single-shot: no iterations, no step-hash bank to
+        # propagate through. Disable PRM prefix caching so the verifier
+        # returns no None step scores (at the cost of re-encoding the
+        # shared question prefix — modest since completions diverge from
+        # the first answer token anyway).
+        scores, verifier_time = score_beam(
+            verifier, prompts, completions,
+            skip_reading_prefix_cache=True,
+        )
         total_verifier_latency_s += verifier_time
 
         for beam, score in zip(completed_beams, scores):
@@ -120,11 +125,8 @@ def _best_of_n_search(
         completed_beams,
         total_generator_latency_s,
         total_verifier_latency_s,
-        total_generator_latency_s,  # n_generator_latency = total (single-shot)
-        total_verifier_latency_s,   # n_verifier_latency = total
         total_num_tokens,
-        total_num_tokens,           # n_completion_tokens = total
-        [],                         # extended_tokens_list (not applicable)
+        total_num_tokens,           # n_completion_tokens = total (single-shot)
     )
 
 
@@ -133,7 +135,7 @@ def best_of_n_search(
     search_config: SearchConfig,
     generator: GeneratorVLLMModelWrapper,
     verifier: VerifierVLLMModelWrapper,
-) -> Dict[str, Any]:
+) -> SearchResults:
     """Best of N search for a batch of examples."""
     problems = examples["problem"]
     assert len(problems) == 1, "batch_of_prompts should be a list of length 1 for now"
@@ -141,51 +143,13 @@ def best_of_n_search(
     nvtx.range_push("Total")
     (
         completed_beams, total_generator_latency_s, total_verifier_latency_s,
-        n_generator_latency_s, n_verifier_latency_s,
-        total_num_tokens, n_completion_tokens, extended_tokens_list,
+        total_num_tokens, n_completion_tokens,
     ) = _best_of_n_search(problems, search_config, generator, verifier)
     nvtx.range_pop()
 
-    # Package results
-    grouped_results = defaultdict(list)
-    for beam in completed_beams:
-        grouped_results[beam.prompt].append(beam)
-
-    results = {
-        "completions": [],
-        "pred": [],
-        "completion_tokens": [],
-        "scores": [],
-        "effective_num_tokens": [],
-        "total_num_tokens": total_num_tokens,
-        "n_completion_tokens": n_completion_tokens,
-        "total_generator_latency_s": total_generator_latency_s,
-        "total_verifier_latency_s": total_verifier_latency_s,
-        "n_generator_latency_s": n_generator_latency_s,
-        "n_verifier_latency_s": n_verifier_latency_s,
-        "completion_time": [],
-        "vllm_metrics": {},
-        "vllm_metrics_summary": {},
-        "extended_tokens_list": extended_tokens_list,
-    }
-
-    for p in problems:
-        beams = grouped_results[p]
-        completions = [b.current_text for b in beams]
-        if beams and beams[0].scores:
-            agg_scores = [
-                aggregate_scores(b.scores, search_config.agg_strategy) for b in beams
-            ]
-            best_idx = int(np.argmax(agg_scores))
-            pred = completions[best_idx]
-        else:
-            pred = completions[0] if completions else ""
-
-        results["pred"].append(pred)
-        results["completions"].append(completions)
-        results["scores"].append([b.scores for b in beams])
-        results["completion_tokens"].append([b.step_tokens for b in beams])
-        results["completion_time"].append([b.time_to_complete for b in beams])
-        results["effective_num_tokens"].append([b.total_tokens_generated for b in beams])
-
-    return results
+    return package_results(
+        problems, completed_beams,
+        total_generator_latency_s, total_verifier_latency_s,
+        total_num_tokens, n_completion_tokens,
+        search_config,
+    )

@@ -43,7 +43,7 @@ class MemoryLatencyConfig:
     
     # Models to test
     generator_model: str = "Qwen/Qwen2.5-Math-1.5B-Instruct"
-    verifier_model: str = "peiyi9979/math-shepherd-mistral-7b-prm"
+    verifier_model: str = "Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B"
     
     # Beam search parameters
     beam_width: int = 4
@@ -117,20 +117,19 @@ class MemoryLatencyAnalyzer:
             total_time = time.time() - start_time
             
             # Calculate per-token latencies
-            effective_num_tokens = results['total_num_tokens']
-            total_generator_latency = results['total_generator_latency_s']
-            total_verifier_latency = results['total_verifier_latency_s']
-            
-            # Per-token latency calculations
+            effective_num_tokens = results.total_num_tokens
+            total_generator_latency = results.total_generator_latency_s
+            total_verifier_latency = results.total_verifier_latency_s
+
             per_token_generator_latency = total_generator_latency / effective_num_tokens if effective_num_tokens > 0 else 0
             per_token_verifier_latency = total_verifier_latency / effective_num_tokens if effective_num_tokens > 0 else 0
-            
+
             return {
                 'total_generator_latency': total_generator_latency,
                 'total_verifier_latency': total_verifier_latency,
                 'total_time': total_time,
                 'effective_num_tokens': effective_num_tokens,
-                'num_completions': len(results['completions'][0]),
+                'num_completions': len(results.completions[0]),
                 'per_token_generator_latency': per_token_generator_latency,
                 'per_token_verifier_latency': per_token_verifier_latency,
             }
@@ -382,10 +381,7 @@ def main():
     parser = argparse.ArgumentParser(description='Memory-Latency Analysis for FastTTS')
     parser.add_argument('--output-dir', type=str, default='./memory_analysis/7B-1.5B/',
                        help='Output directory for results and plots')
-    # NOTE: AE used 0.9 with vllm 0.9.2. Reduced to 0.89 for vllm v0.18.1
-    # due to higher memory overhead (CUDA graphs, torch.compile caches)
-    # causing OOM during verifier forward pass.
-    parser.add_argument('--total-memory', type=float, default=0.89,
+    parser.add_argument('--total-memory', type=float, default=0.90,
                        help='Total memory to allocate')
     parser.add_argument('--gen-memory-alloc', type=float, nargs='+', 
                        default=[ 0.70],

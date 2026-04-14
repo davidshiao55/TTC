@@ -64,12 +64,14 @@ def run(test_cases):
         results[str(i)] = {
             "prompt": prob["prompt"],
             "reference_answer": prob["reference_answer"],
-            "completions": search_results["completions"],
-            "scores": search_results["scores"],
-            "pred": search_results["pred"],
-            "n_generator_latency_s": search_results["n_generator_latency_s"],
-            "n_verifier_latency_s": search_results["n_verifier_latency_s"],
-            "n_completion_tokens": search_results["n_completion_tokens"],
+            "completions": search_results.completions,
+            "scores": search_results.scores,
+            "pred": search_results.pred,
+            # After the early-exit fix, n_*_latency_s == total_*_latency_s.
+            # Keep the AE-side field names so compare_e2e.py stays unchanged.
+            "n_generator_latency_s": search_results.total_generator_latency_s,
+            "n_verifier_latency_s": search_results.total_verifier_latency_s,
+            "n_completion_tokens": search_results.n_completion_tokens,
             "wall_time_s": wall_time,
         }
 

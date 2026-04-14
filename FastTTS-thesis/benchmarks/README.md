@@ -31,7 +31,7 @@ generator_model:
 
 # Verifier model configuration
 verifier_model:
-  model: "peiyi9979/math-shepherd-mistral-7b-prm"
+  model: "Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B"
   max_model_len: 2048
   gpu_memory_utilization: 0.7
   tensor_parallel_size: 1
@@ -75,7 +75,7 @@ You can specify a list of configs in one YAML file:
     enable_prefix_caching: true
     seed: 42
   verifier_model:
-    model: "peiyi9979/math-shepherd-mistral-7b-prm"
+    model: "Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B"
     max_model_len: 2048
     gpu_memory_utilization: 0.7
     tensor_parallel_size: 1
@@ -106,7 +106,7 @@ You can specify a list of configs in one YAML file:
     enable_prefix_caching: true
     seed: 42
   verifier_model:
-    model: "peiyi9979/math-shepherd-mistral-7b-prm"
+    model: "Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B"
     max_model_len: 2048
     gpu_memory_utilization: 0.4
     tensor_parallel_size: 1

@@ -97,7 +97,7 @@ def run_benchmark_from_config(config_path: str):
                     search_config=config.search_config
                 )
                 # Save with question id
-                result = {"id": qid, "prompt": problem["prompt"], "reference_answer": problem.get("reference_answer"), "solutions": all_solutions}
+                result = {"id": qid, "prompt": problem["prompt"], "reference_answer": problem.get("reference_answer"), "solutions": all_solutions.to_dict()}
                 new_results.append(result)
                 existing_ids.add(qid)
                 

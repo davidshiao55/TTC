@@ -63,15 +63,15 @@ python run_all_experiments.py --exp --plot --dir /path/to/custom/results
 ### Flags
 
 - `--exp`: Run all benchmark experiments for:
-  - 3 model combinations: `1.5B-1.5B`, `1.5B-7B`, `7B-1.5B`
-  - 2 datasets: AIME and AMC
-  - 2 methods: `baseline` and `spec_prefix` (FastTTS)
-  - 7 n values: 8, 16, 32, 64, 128, 256, 512
+  - 2 generators: `7B-instruct`, `1.5B-instruct` (both `Qwen2.5-*-Instruct`, `max_model_len=8192`) paired with the fixed Skywork-PRM-1.5B verifier
+  - 2 datasets: MATH-500 (primary, 500 problems), AIME 2024 (hard subset, 30 problems)
+  - 2 methods: `fasttts` (all optimisations enabled) and `baseline`
+  - 5 N values: `1, 4, 16, 64, 256` — N=1 is the "no TTC" reference point (`beam_width=1`); the other four match Liu et al.'s compute-optimal-tts sweep
 
 - `--plot`: Generate figures from existing or newly collected data:
   - Goodput figure (`main_results_combined.pdf`)
   - Latency figure (`latency_combined.pdf`)
-  - Accuracy figure (`acc.pdf`)
+  - Accuracy scaling figure (`acc.pdf`) — four metrics per panel: Pass@N, MajVote, PRM-Max, PRM-Vote
 
 - `--dir <path>`: Specify a custom directory for saving/loading results (default: `benchmarks/benchmark_results/`)
 
@@ -79,12 +79,12 @@ python run_all_experiments.py --exp --plot --dir /path/to/custom/results
 
 When running with `--exp`, experiment results are saved as `.jsonl` files under:
 ```
-<data_dir>/<model_combo>/<dataset>/<method>/
+<data_dir>/<generator>/<dataset>/<method>/
 ```
 
 For example:
 ```
-benchmarks/benchmark_results/1.5B-1.5B/aime/baseline/aime2024_bw4_n8_iter10_results.jsonl
+benchmarks/benchmark_results/7B-instruct/math500/fasttts/math500_bw4_n16_iter10_specdiff_results.jsonl
 ```
 
 When running with `--plot`, the script:
