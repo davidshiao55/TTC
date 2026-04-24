@@ -41,6 +41,10 @@ def _best_of_n_search(
     tokenizer = generator.get_tokenizer()
     max_model_len = generator.config.generator_vllm_config.get("max_model_len", 4096)
 
+    # No `stop` strings + no iteration loop, so both SBE and prefix-aware
+    # scheduling (only invoked from common._duplicate_beams) are no-ops for
+    # this strategy. A `fasttts` BoN config differs from `baseline` only in
+    # GPU memory split (generator-heavy allocation).
     sampling_params = SamplingParams(
         temperature=search_config.temperature,
         max_tokens=max_model_len,

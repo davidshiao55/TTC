@@ -1,0 +1,9 @@
+batch_size	mode	avg_latency_ms	p50_ms	p99_ms
+1	cuda_graph	2063.93	N/A	N/A
+1	eager	2074.43	N/A	N/A
+4	cuda_graph	2244.47	N/A	N/A
+4	eager	2285.12	N/A	N/A
+16	cuda_graph	2857.70	N/A	N/A
+16	eager	2913.72	N/A	N/A
+64	cuda_graph	5484.59	N/A	N/A
+64	eager	5552.26	N/A	N/A

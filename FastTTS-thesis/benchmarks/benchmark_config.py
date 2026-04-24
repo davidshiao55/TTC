@@ -50,13 +50,24 @@ def build_benchmark_config_from_yaml(yaml_dict: Dict[str, Any]) -> BenchmarkConf
     verifier_gpu_memory_utilization = verifier_config.get("gpu_memory_utilization", 0.45)
     
     # Build FastTTS config with model settings
-    # Build vllm configs — pass through max_model_len if specified
+    # Build vllm configs — pass through max_model_len if specified.
+    #
+    # `disable_hybrid_kv_cache_manager=True` is set unconditionally: every
+    # thesis model (Qwen2.5-*-Instruct, Skywork-PRM-1.5B) is pure
+    # full-attention, so HMA would land in `UnitaryKVCacheCoordinator`
+    # either way (see `vllm/v1/core/kv_cache_utils.py:get_kv_cache_groups`
+    # — `unify_hybrid_kv_cache_specs` early-returns on uniform specs).
+    # Forcing it off makes the OffloadingConnector A/B a clean comparison
+    # and removes the `kv_offloading_size`-gated coupling that made the
+    # kvoff variant also implicitly "HMA-off". A hybrid-attention verifier
+    # would need to revisit this.
     gen_vllm_config = {
         "model": generator_config.get("model", "Qwen/Qwen2.5-Math-1.5B-Instruct"),
         "gpu_memory_utilization": generator_gpu_memory_utilization,
         "tensor_parallel_size": generator_config.get("tensor_parallel_size", 1),
         "enable_prefix_caching": generator_config.get("enable_prefix_caching", True),
         "seed": generator_config.get("seed", 42),
+        "disable_hybrid_kv_cache_manager": True,
     }
     if "max_model_len" in generator_config:
         gen_vllm_config["max_model_len"] = generator_config["max_model_len"]
@@ -65,12 +76,6 @@ def build_benchmark_config_from_yaml(yaml_dict: Dict[str, Any]) -> BenchmarkConf
         gen_vllm_config["kv_offloading_backend"] = generator_config.get(
             "kv_offloading_backend", "native"
         )
-        # vLLM v1 has an ordering bug in VllmConfig.__post_init__: the HMA
-        # auto-disable check runs before `_post_init_kv_transfer_config()`
-        # materialises `kv_transfer_config` from `kv_offloading_size`, so
-        # HMA stays on and OffloadingConnector's factory rejects it. Set
-        # this explicitly to bypass the auto-detect path.
-        gen_vllm_config["disable_hybrid_kv_cache_manager"] = True
 
     ver_vllm_config = {
         "model": verifier_config.get("model", "Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B"),
@@ -78,6 +83,7 @@ def build_benchmark_config_from_yaml(yaml_dict: Dict[str, Any]) -> BenchmarkConf
         "tensor_parallel_size": verifier_config.get("tensor_parallel_size", 1),
         "enable_prefix_caching": verifier_config.get("enable_prefix_caching", True),
         "seed": verifier_config.get("seed", 42),
+        "disable_hybrid_kv_cache_manager": True,
     }
     if "max_model_len" in verifier_config:
         ver_vllm_config["max_model_len"] = verifier_config["max_model_len"]
@@ -86,7 +92,6 @@ def build_benchmark_config_from_yaml(yaml_dict: Dict[str, Any]) -> BenchmarkConf
         ver_vllm_config["kv_offloading_backend"] = verifier_config.get(
             "kv_offloading_backend", "native"
         )
-        ver_vllm_config["disable_hybrid_kv_cache_manager"] = True
 
     fasttts_config = create_fasttts_config(
         generator_vllm_config=gen_vllm_config,

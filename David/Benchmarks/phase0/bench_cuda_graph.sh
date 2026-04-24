@@ -12,14 +12,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_DIR="${SCRIPT_DIR}/results"
 mkdir -p "$RESULTS_DIR"
 
-MODEL="Qwen/Qwen2.5-Math-7B-Instruct"
+MODEL="Qwen/Qwen2.5-7B-Instruct"
 DTYPE="bfloat16"
 INPUT_LEN=512
 OUTPUT_LEN=128
-NUM_ITERS=20
-NUM_WARMUP=5
+NUM_ITERS=10
+NUM_WARMUP=3
 
-BATCH_SIZES=(1 4 8 16 32 64 128)
+# Focus on the decode-critical range (matches Phase 3 sub-layer pipeline).
+# Skipping B=256+ — capture cost scales with batch count, and we've
+# already validated BW at B=64 represents the memory-bound regime.
+BATCH_SIZES=(1 4 16 64)
 
 OUTFILE="${RESULTS_DIR}/cuda_graph_impact.csv"
 echo -e "batch_size\tmode\tavg_latency_ms\tp50_ms\tp99_ms" > "$OUTFILE"

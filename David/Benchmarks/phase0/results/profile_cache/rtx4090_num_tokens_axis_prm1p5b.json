@@ -1,0 +1,339 @@
+{
+  "model": "prm1p5b",
+  "model_cfg": {
+    "display_name": "Skywork-o1-Open-PRM-Qwen-2.5-1.5B",
+    "hidden": 1536,
+    "num_heads": 12,
+    "num_kv_heads": 2,
+    "head_dim": 128,
+    "intermediate": 8960
+  },
+  "num_tokens_values": [
+    16,
+    64,
+    256
+  ],
+  "spread_threshold": 0.05,
+  "gpu": {
+    "16": {
+      "per_submodule": {
+        "WQKV": {
+          "compositions": {
+            "flat": 0.0133,
+            "1x_N": 0.0133,
+            "Nx_1": 0.0133,
+            "halfx_2": 0.0133,
+            "quarterx_4": 0.0133
+          },
+          "comp_spread": 0.0,
+          "total_spread": 0.0,
+          "passed": true
+        },
+        "WO": {
+          "compositions": {
+            "flat": 0.013,
+            "1x_N": 0.013,
+            "Nx_1": 0.013,
+            "halfx_2": 0.0126,
+            "quarterx_4": 0.0131
+          },
+          "comp_spread": 0.0382,
+          "total_spread": 0.0382,
+          "passed": true
+        },
+        "MLP1": {
+          "compositions": {
+            "flat": 0.0279,
+            "1x_N": 0.0286,
+            "Nx_1": 0.0278,
+            "halfx_2": 0.0283,
+            "quarterx_4": 0.0276
+          },
+          "comp_spread": 0.035,
+          "total_spread": 0.035,
+          "passed": true
+        },
+        "MLP2": {
+          "compositions": {
+            "flat": 0.0214,
+            "1x_N": 0.0215,
+            "Nx_1": 0.0213,
+            "halfx_2": 0.0215,
+            "quarterx_4": 0.0214
+          },
+          "comp_spread": 0.0093,
+          "total_spread": 0.0093,
+          "passed": true
+        }
+      },
+      "all_passed": true
+    },
+    "64": {
+      "per_submodule": {
+        "WQKV": {
+          "compositions": {
+            "flat": 0.0123,
+            "1x_N": 0.0123,
+            "Nx_1": 0.0123,
+            "halfx_2": 0.0123,
+            "quarterx_4": 0.013
+          },
+          "comp_spread": 0.0538,
+          "total_spread": 0.0538,
+          "passed": false
+        },
+        "WO": {
+          "compositions": {
+            "flat": 0.012,
+            "1x_N": 0.012,
+            "Nx_1": 0.012,
+            "halfx_2": 0.0121,
+            "quarterx_4": 0.012
+          },
+          "comp_spread": 0.0083,
+          "total_spread": 0.0083,
+          "passed": true
+        },
+        "MLP1": {
+          "compositions": {
+            "flat": 0.043,
+            "1x_N": 0.0451,
+            "Nx_1": 0.0432,
+            "halfx_2": 0.0452,
+            "quarterx_4": 0.043
+          },
+          "comp_spread": 0.0487,
+          "total_spread": 0.0487,
+          "passed": true
+        },
+        "MLP2": {
+          "compositions": {
+            "flat": 0.0223,
+            "1x_N": 0.0215,
+            "Nx_1": 0.0223,
+            "halfx_2": 0.0221,
+            "quarterx_4": 0.0236
+          },
+          "comp_spread": 0.089,
+          "total_spread": 0.089,
+          "passed": false
+        }
+      },
+      "all_passed": false
+    },
+    "256": {
+      "per_submodule": {
+        "WQKV": {
+          "compositions": {
+            "flat": 0.0184,
+            "1x_N": 0.0191,
+            "Nx_1": 0.0185,
+            "halfx_2": 0.0193,
+            "quarterx_4": 0.0186
+          },
+          "comp_spread": 0.0415,
+          "total_spread": 0.0466,
+          "passed": true
+        },
+        "WO": {
+          "compositions": {
+            "flat": 0.0174,
+            "1x_N": 0.0174,
+            "Nx_1": 0.0174,
+            "halfx_2": 0.0174,
+            "quarterx_4": 0.0174
+          },
+          "comp_spread": 0.0,
+          "total_spread": 0.0,
+          "passed": true
+        },
+        "MLP1": {
+          "compositions": {
+            "flat": 0.1044,
+            "1x_N": 0.1044,
+            "Nx_1": 0.1044,
+            "halfx_2": 0.1044,
+            "quarterx_4": 0.1044
+          },
+          "comp_spread": 0.0,
+          "total_spread": 0.0,
+          "passed": true
+        },
+        "MLP2": {
+          "compositions": {
+            "flat": 0.0565,
+            "1x_N": 0.0572,
+            "Nx_1": 0.0563,
+            "halfx_2": 0.0571,
+            "quarterx_4": 0.0563
+          },
+          "comp_spread": 0.0157,
+          "total_spread": 0.0157,
+          "passed": true
+        }
+      },
+      "all_passed": true
+    }
+  },
+  "cpu": {
+    "16": {
+      "per_submodule": {
+        "WQKV": {
+          "compositions": {
+            "flat": 0.3706,
+            "1x_N": 0.3704,
+            "Nx_1": 0.3707,
+            "halfx_2": 0.3794,
+            "quarterx_4": 0.3794
+          },
+          "comp_spread": 0.0237,
+          "total_spread": 0.0237,
+          "passed": true
+        },
+        "WO": {
+          "compositions": {
+            "flat": 0.277,
+            "1x_N": 0.2835,
+            "Nx_1": 0.284,
+            "halfx_2": 0.2835,
+            "quarterx_4": 0.2841
+          },
+          "comp_spread": 0.0021,
+          "total_spread": 0.025,
+          "passed": true
+        },
+        "MLP1": {
+          "compositions": {
+            "flat": 3.2566,
+            "1x_N": 3.3371,
+            "Nx_1": 3.2993,
+            "halfx_2": 3.3918,
+            "quarterx_4": 3.3958
+          },
+          "comp_spread": 0.0284,
+          "total_spread": 0.041,
+          "passed": true
+        },
+        "MLP2": {
+          "compositions": {
+            "flat": 1.5034,
+            "1x_N": 1.5648,
+            "Nx_1": 1.5744,
+            "halfx_2": 1.546,
+            "quarterx_4": 1.6012
+          },
+          "comp_spread": 0.0345,
+          "total_spread": 0.0611,
+          "passed": true
+        }
+      },
+      "all_passed": true
+    },
+    "64": {
+      "per_submodule": {
+        "WQKV": {
+          "compositions": {
+            "flat": 1.9861,
+            "1x_N": 1.5056,
+            "Nx_1": 1.5067,
+            "halfx_2": 1.5225,
+            "quarterx_4": 1.5443
+          },
+          "comp_spread": 0.0251,
+          "total_spread": 0.2419,
+          "passed": true
+        },
+        "WO": {
+          "compositions": {
+            "flat": 1.1218,
+            "1x_N": 1.1521,
+            "Nx_1": 1.1505,
+            "halfx_2": 1.1526,
+            "quarterx_4": 1.1537
+          },
+          "comp_spread": 0.0028,
+          "total_spread": 0.0277,
+          "passed": true
+        },
+        "MLP1": {
+          "compositions": {
+            "flat": 13.0995,
+            "1x_N": 13.4354,
+            "Nx_1": 13.3346,
+            "halfx_2": 13.4602,
+            "quarterx_4": 13.3791
+          },
+          "comp_spread": 0.0093,
+          "total_spread": 0.0268,
+          "passed": true
+        },
+        "MLP2": {
+          "compositions": {
+            "flat": 6.2673,
+            "1x_N": 6.2214,
+            "Nx_1": 6.2288,
+            "halfx_2": 6.3381,
+            "quarterx_4": 6.0089
+          },
+          "comp_spread": 0.0519,
+          "total_spread": 0.0519,
+          "passed": false
+        }
+      },
+      "all_passed": false
+    },
+    "256": {
+      "per_submodule": {
+        "WQKV": {
+          "compositions": {
+            "flat": 6.1226,
+            "1x_N": 6.199,
+            "Nx_1": 6.1946,
+            "halfx_2": 6.0175,
+            "quarterx_4": 6.1943
+          },
+          "comp_spread": 0.0293,
+          "total_spread": 0.0293,
+          "passed": true
+        },
+        "WO": {
+          "compositions": {
+            "flat": 4.6242,
+            "1x_N": 5.7935,
+            "Nx_1": 4.484,
+            "halfx_2": 4.6197,
+            "quarterx_4": 4.6238
+          },
+          "comp_spread": 0.226,
+          "total_spread": 0.226,
+          "passed": false
+        },
+        "MLP1": {
+          "compositions": {
+            "flat": 52.7605,
+            "1x_N": 52.9327,
+            "Nx_1": 53.0853,
+            "halfx_2": 52.7964,
+            "quarterx_4": 52.8666
+          },
+          "comp_spread": 0.0054,
+          "total_spread": 0.0061,
+          "passed": true
+        },
+        "MLP2": {
+          "compositions": {
+            "flat": 24.6841,
+            "1x_N": 25.1053,
+            "Nx_1": 25.216,
+            "halfx_2": 24.9127,
+            "quarterx_4": 25.1908
+          },
+          "comp_spread": 0.012,
+          "total_spread": 0.0211,
+          "passed": true
+        }
+      },
+      "all_passed": false
+    }
+  }
+}

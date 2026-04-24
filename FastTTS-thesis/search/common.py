@@ -357,14 +357,18 @@ def _duplicate_beams(state: SearchState, tokenizer):
                 duplicate.parent_id = beam.beam_id
                 duplicate.born_at_iteration = i
                 if beam.pending_steps:
-                    # R=0: algorithm equivalence with vanilla beam search.
-                    first_text = truncate_sentence_by_tokens(
-                        beam.pending_steps[0].text, tokenizer,
-                        mean_ratio=0.0, std_ratio=0.0,
-                    )
-                    duplicate.pending_steps = [
-                        StepChunk(text=first_text, is_complete_step=False, terminal=False)
-                    ]
+                    if config.spec_truncation_ratio <= 0.0:
+                        # True vanilla equivalence: duplicate regenerates from
+                        # current_text, no speculative seed.
+                        duplicate.pending_steps = []
+                    else:
+                        first_text = truncate_sentence_by_tokens(
+                            beam.pending_steps[0].text, tokenizer,
+                            mean_ratio=config.spec_truncation_ratio,
+                        )
+                        duplicate.pending_steps = [
+                            StepChunk(text=first_text, is_complete_step=False, terminal=False)
+                        ]
                     duplicate.scores = beam.scores[:i]
                     duplicate.step_hashes = beam.step_hashes[:i]
                 duplicates.append(duplicate)
@@ -377,14 +381,16 @@ def _duplicate_beams(state: SearchState, tokenizer):
             b.beam_id = _next_beam_id()
             b.born_at_iteration = i
             if b.pending_steps:
-                # R=0: algorithm equivalence with vanilla beam search.
-                first_text = truncate_sentence_by_tokens(
-                    b.pending_steps[0].text, tokenizer,
-                    mean_ratio=0.0, std_ratio=0.0,
-                )
-                b.pending_steps = [
-                    StepChunk(text=first_text, is_complete_step=False, terminal=False)
-                ]
+                if config.spec_truncation_ratio <= 0.0:
+                    b.pending_steps = []
+                else:
+                    first_text = truncate_sentence_by_tokens(
+                        b.pending_steps[0].text, tokenizer,
+                        mean_ratio=config.spec_truncation_ratio,
+                    )
+                    b.pending_steps = [
+                        StepChunk(text=first_text, is_complete_step=False, terminal=False)
+                    ]
                 b.scores = b.scores[:i]
                 b.step_hashes = b.step_hashes[:i]
         state.active_beams = (active + extended_active_beams)[:config.n]

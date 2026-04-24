@@ -1,5 +1,7 @@
 # PCIe Bandwidth Allocation Design
 
+> **Note on terminology.** This doc uses `f_gpu_kv`, `f_prefetch_kv`, `f_cpu_kv` to frame a three-way KV split for the *analysis* of why we rejected KV prefetch. The thesis's actual KV mechanism is a simpler **two-pool model** (`KV_gpu_bytes` + `KV_cpu_bytes`, with prefix-on-GPU / suffix-on-CPU as a fixed topology — see `attention_offload_design.md`). The three-way framing here is kept as-is because it's the cleanest way to present the contention analysis and explain why the two-pool simplification is correct.
+
 ## The Contention
 
 Both weight offloading and attention offloading use a three-way split (f_gpu, f_prefetch, f_cpu). The f_gpu and f_cpu components are **orthogonal** — they use GPU memory and CPU compute respectively, with no PCIe contention. Only f_prefetch competes:
@@ -153,55 +155,44 @@ Coarser partition forces longer minimum prefetch distance — you can't start co
 |---|---|---|
 | vLLM PrefetchOffloader | Group | Multi-layer-ahead (G−1 layers) |
 | FlexGen | Layer | Layer-ahead |
-| **Ours** | Tensor | Tensor-ahead **or** layer-ahead **or** multi-layer-ahead |
+| **Ours** | Tensor | **Layer-ahead** (committed) |
 
-### Tensor Partition: Prefetch Distance Options
+### Our Committed Design: Tensor Partition + Layer-Ahead
 
-#### Option A: Tensor-Ahead
-
-Prefetch next tensor's f_prefetch during current tensor's compute.
+Prefetch all of next layer's f_prefetch portions during the entire current layer's compute. One prefetch queue per layer boundary, one sync per layer.
 
 ```
-Layer N:
-GPU :  WQKV compute → (QK^T)V attn  → WO compute   → MLP1 compute  → MLP2 compute
-PCIe:  (idle)       → WO prefetch   → MLP1 prefetch → MLP2 prefetch → WQKV prefetch (N+1)
-CPU :  WQKV compute → (QK^T)V attn  → WO compute   → MLP1 compute  → MLP2 compute
-```
-
-- **Per-tensor budget**: f_prefetch_i × W_i ≤ preceding_phase_time × PCIe_BW
-- **Buffer**: max(f_prefetch_i × W_i) — reused between phases
-- **Bottleneck**: WO phase is tiny (0.018 ms) → MLP1 gets almost no prefetch budget (~0.4 MB). Forces self-bootstrapping: MLP1 mostly f_cpu → long phase → MLP2 gets large budget.
-
-#### Option B: Layer-Ahead
-
-Prefetch ALL of next layer's f_prefetch portions during entire current layer's compute.
-
-```
-Layer N:   GPU+CPU compute all 5 phases │ PCIe: prefetch layer N+1's f_prefetch (all tensors)
+Layer N:   GPU+CPU compute full layer   │ PCIe: prefetch layer N+1's f_prefetch (all sub-modules)
 Layer N+1: GPU+CPU compute (uses prefetched) │ PCIe: prefetch layer N+2's f_prefetch
 ```
 
-- **Global budget**: sum(f_prefetch_i × W_i) ≤ layer_time × PCIe_BW
-- **Buffer**: sum(f_prefetch_i × W_i) — all must be resident when layer starts
-- **No per-tensor bottleneck**: MLP1 can get meaningful f_prefetch because the budget is shared across the full layer time, not gated by WO's tiny phase.
+- **Global budget per layer**: `Σ_m (f_prefetch × W_m) ≤ layer_time × PCIe_BW` over the offloaded sub-modules {WQKV, MLP1, MLP2}.
+- **Buffer**: `Σ_m (f_prefetch × W_m)` — all prefetched weights resident when the layer begins. At 7B f=50%, ~233 MB (~1% of 24 GB budget — negligible).
+- **Scheduling**: single prefetch queue populated at the layer boundary; one `cudaStreamWaitEvent` to gate compute on prefetch completion. Clean Phase 4 CUDA-graph integration (one sync per layer instead of per sub-phase).
 
-#### Option C: Multi-Layer-Ahead (K layers)
+### Alternatives Considered and Rejected
 
-Same as layer-ahead but start K layers in advance.
+#### Tensor-ahead (per-sub-phase prefetch)
 
-- **Budget**: sum(f_prefetch_i × W_i) ≤ K × layer_time × PCIe_BW
-- **Buffer**: sum(f_prefetch_i × W_i) × num_buffer_slots (vLLM's `prefetch_step` concept)
-- **Use case**: when even 1 layer's compute time isn't enough to prefetch the desired f_prefetch.
+Prefetch next sub-module's weights during the current sub-module's compute. Smaller buffer (`max(f_prefetch_i × W_i)` ≈ 73 MB at 7B f=50%) but introduces a **topological constraint**:
 
-### Prefetch Distance Comparison (Tensor Partition, Qwen2.5-7B)
+```
+f_prefetch_{m+1} × W_{m+1} ≤ compute_time_m × PCIe_BW
+```
 
-| | Tensor-ahead | Layer-ahead | 2-layer-ahead |
-|---|---|---|---|
-| PCIe budget | Per-phase (0.018–3.34 ms × 22 GB/s) | Full layer (0.72–5 ms × 22 GB/s) | 2× layer time × 22 GB/s |
-| MLP1 f_prefetch | ~0% (WO too short) | Meaningful (global budget) | Large |
-| Buffer size | max(f_prefetch_i × W_i) | sum(f_prefetch_i × W_i) | sum × 2 |
-| Per-tensor bottleneck | Yes (WO→MLP1) | No | No |
-| Scheduling | Per-phase events | Per-layer overlap | Per-layer + prefetch_step |
+At decode with WO's short compute phase (~0.018 ms), the MLP1 prefetch budget starves to ~0.4 MB. The only way out is per-sub-module f tuning — force MLP1 to high `f_cpu` so its compute phase lengthens, bootstrapping MLP2's prefetch budget. A cascade the Planner would have to solve via a recurrence.
+
+**Why rejected:**
+1. `phase0_findings.md §0.2` shows CPU μs/MB is uniform across sub-modules at decode B ≥ 16. Per-sub-module f tuning (tensor-ahead's main purpose) buys effectively nothing.
+2. `phase0_findings.md §0.9` shows PCIe contention is already resolved under fg-first stream ordering — activation H2D at ~27 μs per sub-module does not measurably disturb weight prefetch throughput (~23.6 GB/s with concurrent activation). Tensor-ahead's fine-grained contention control has nothing to control.
+3. Buffer savings (~160 MB) are negligible on a 24 GB GPU.
+4. Per-sub-phase scheduling (~5 sync points per layer) adds Phase 4 CUDA-graph complexity for no measurable benefit.
+
+#### Multi-layer-ahead (K > 1)
+
+Same as layer-ahead but starts K layers in advance. Budget grows to `K × layer_time × PCIe_BW`, buffer to `K × Σ_m (f_prefetch × W_m)`.
+
+**Why not adopted**: 1-layer-ahead already provides enough budget (`layer_time × 22 GB/s` ≈ 10–30 MB at decode, scales with batch). Going deeper just inflates buffer without adding a benefit we need.
 
 ---
 
@@ -212,4 +203,4 @@ Same as layer-ahead but start K layers in advance.
 3. **KV prefetch has no regime where it's preferred**: at best equivalent (small models), at worst inferior (large models)
 4. **Batch size controls f_cpu_kv cost** — CPU attention bottleneck is a dial, not a wall
 5. **Design simplification**: all PCIe → weight prefetch. Suffix attention → CPU only. Merge via online softmax.
-6. **Prefetch distance is independent of partition granularity**: tensor partition can use tensor-ahead (small buffer, per-tensor bottleneck), layer-ahead (larger buffer, no bottleneck), or multi-layer-ahead (largest buffer, most hiding time). Coarser partition forces longer minimum distance.
+6. **Prefetch distance committed to layer-ahead**: one prefetch queue per layer boundary, one sync per layer. Tensor-ahead rejected because its topological constraint would force per-sub-module f tuning — needless given uniform CPU μs/MB (`phase0_findings.md §0.2`) and resolved PCIe contention (`phase0_findings.md §0.9`). Buffer cost (~160 MB extra at 7B f=50%) is ~1% of GPU budget — negligible.

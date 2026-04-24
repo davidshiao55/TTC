@@ -1,0 +1,102 @@
+{
+  "schema_version": 2,
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "size_sweep": [
+    {
+      "size_mb": 0.25,
+      "bytes": 262144,
+      "h2d_copy_gbps": 11.3,
+      "h2d_copy_lat_us": 23.2,
+      "d2h_copy_gbps": 15.29,
+      "d2h_copy_lat_us": 17.1,
+      "uva_read_gbps": 13.98,
+      "uva_read_lat_us": 18.7
+    },
+    {
+      "size_mb": 1,
+      "bytes": 1048576,
+      "h2d_copy_gbps": 20.18,
+      "h2d_copy_lat_us": 52.0,
+      "d2h_copy_gbps": 22.2,
+      "d2h_copy_lat_us": 47.2,
+      "uva_read_gbps": 20.01,
+      "uva_read_lat_us": 52.4
+    },
+    {
+      "size_mb": 4,
+      "bytes": 4194304,
+      "h2d_copy_gbps": 22.8,
+      "h2d_copy_lat_us": 183.9,
+      "d2h_copy_gbps": 25.16,
+      "d2h_copy_lat_us": 166.7,
+      "uva_read_gbps": 23.05,
+      "uva_read_lat_us": 182.0
+    },
+    {
+      "size_mb": 10,
+      "bytes": 10485760,
+      "h2d_copy_gbps": 23.51,
+      "h2d_copy_lat_us": 445.9,
+      "d2h_copy_gbps": 25.89,
+      "d2h_copy_lat_us": 404.9,
+      "uva_read_gbps": 23.65,
+      "uva_read_lat_us": 443.5
+    },
+    {
+      "size_mb": 50,
+      "bytes": 52428800,
+      "h2d_copy_gbps": 23.79,
+      "h2d_copy_lat_us": 2203.4,
+      "d2h_copy_gbps": 26.29,
+      "d2h_copy_lat_us": 1994.5,
+      "uva_read_gbps": 23.97,
+      "uva_read_lat_us": 2186.9
+    },
+    {
+      "size_mb": 100,
+      "bytes": 104857600,
+      "h2d_copy_gbps": 23.8,
+      "h2d_copy_lat_us": 4405.2,
+      "d2h_copy_gbps": 26.31,
+      "d2h_copy_lat_us": 3984.9,
+      "uva_read_gbps": 23.96,
+      "uva_read_lat_us": 4376.3
+    },
+    {
+      "size_mb": 500,
+      "bytes": 524288000,
+      "h2d_copy_gbps": 23.92,
+      "h2d_copy_lat_us": 21920.6,
+      "d2h_copy_gbps": 26.38,
+      "d2h_copy_lat_us": 19877.7,
+      "uva_read_gbps": 24.01,
+      "uva_read_lat_us": 21839.3
+    }
+  ],
+  "key_sizes": [
+    {
+      "desc": "CPU K+V output (B=16, bf16)",
+      "size_mb": 0.032768,
+      "h2d_copy_gbps": 3.57,
+      "uva_read_gbps": 4.1
+    },
+    {
+      "desc": "Activation result (B=16, hidden=3584, bf16)",
+      "size_mb": 0.114688,
+      "h2d_copy_gbps": 9.4,
+      "uva_read_gbps": 8.04
+    },
+    {
+      "desc": "9% MLP1 weight slice",
+      "size_mb": 4.0,
+      "h2d_copy_gbps": 22.85,
+      "uva_read_gbps": 23.09
+    },
+    {
+      "desc": "Full layer weight (7B)",
+      "size_mb": 466.0,
+      "h2d_copy_gbps": 23.91,
+      "uva_read_gbps": 24.0
+    }
+  ]
+}

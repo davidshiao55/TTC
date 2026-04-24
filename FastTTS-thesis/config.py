@@ -27,19 +27,7 @@ from typing import Dict, List, Literal, Optional
 
 
 DEFAULT_SYSTEM_PROMPT = (
-    "Solve the following math problem efficiently and clearly:\n\n"
-    "- For simple problems (2 steps or fewer):\n"
-    "Provide a concise solution with minimal explanation.\n\n"
-    "- For complex problems (3 steps or more):\n"
-    "Use this step-by-step format:\n\n"
-    "## Step 1: [Concise description]\n"
-    "[Brief explanation and calculations]\n\n"
-    "## Step 2: [Concise description]\n"
-    "[Brief explanation and calculations]\n\n"
-    "...\n\n"
-    "Regardless of the approach, always conclude with:\n\n"
-    "Therefore, the final answer is: $\\boxed{answer}$. I hope it is correct.\n\n"
-    "Where [answer] is just the final number or expression that solves the problem."
+    "Please reason step by step, and put your final answer within \\boxed{}."
 )
 
 DEFAULT_GENERATOR_VLLM_CONFIG: Dict = {
@@ -96,6 +84,14 @@ class SearchConfig:
     # (e.g. score-ordered active_beams) can gate on SBE without needing
     # access to the engine-level config. Set by FastTTS.search() at dispatch.
     spec_beam_extension: bool = False
+
+    # Speculative-step truncation ratio (paper §4.1.1). Controls how much
+    # of a parent beam's speculative first step a duplicated child inherits.
+    #   0.0  → true vanilla beam search equivalence: duplicates start with
+    #           empty pending_steps and regenerate from current_text.
+    #   0.85 → paper-recommended SBE value; duplicates inherit ~85% of the
+    #           parent's speculative first step as a starting seed.
+    spec_truncation_ratio: float = 0.0
 
     def __post_init__(self):
         if self.approach == "beam_search":

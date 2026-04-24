@@ -120,6 +120,22 @@ def run_benchmark_from_config(config_path: str):
             logger.error(f"Error running benchmark: {e}")
             raise e
         finally:
+            # Snapshot per-engine run totals before shutdown resets them.
+            try:
+                sidecar = {
+                    "generator": fast_tts.generator.get_run_stats() if fast_tts.generator else None,
+                    "verifier": fast_tts.verifier.get_run_stats() if fast_tts.verifier else None,
+                    "num_problems": len(problems),
+                }
+                sidecar_path = output_file.with_suffix(".runstats.json")
+                if sidecar_path.exists():
+                    logger.info(f"Run stats sidecar already exists, keeping: {sidecar_path}")
+                else:
+                    with open(sidecar_path, "w") as f:
+                        json.dump(sidecar, f, indent=2)
+                    logger.info(f"Run stats saved to: {sidecar_path}")
+            except Exception as stats_exc:
+                logger.warning(f"Failed to capture run stats: {stats_exc}")
             fast_tts.shutdown()
 
 if __name__ == "__main__":

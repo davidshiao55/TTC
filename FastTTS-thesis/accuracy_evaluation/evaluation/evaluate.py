@@ -45,6 +45,14 @@ class ProblemMetrics:
     pass_at_1_correct: bool  # = PRM-Vote correctness
     n: int
     idx: Optional[str] = None
+    # Debug/inspection fields: when pass_at_1_correct is False, these let
+    # the reader see what the model picked vs the ground truth without
+    # needing to parse the source JSONL. The completion text is NOT stored
+    # here (too large for batched configs); use `selected_idx` to look up
+    # `solutions.completions[0][selected_idx]` in the original results file.
+    reference_answer: Optional[str] = None
+    selected_answer: Optional[str] = None
+    selected_idx: Optional[int] = None
 
 
 @dataclass
@@ -127,8 +135,14 @@ def _select_prm_vote(
     valid_correct: List[bool],
     valid_agg: List[float],
     groups: Dict[str, List[int]],
-) -> bool:
-    """PRM-Vote: group answers, sum PRM scores per group, pick highest."""
+) -> Tuple[bool, int, str]:
+    """PRM-Vote: group answers, sum PRM scores per group, pick highest.
+
+    Returns (correct, valid_idx, selected_answer_key). `valid_idx` is the
+    index *within the valid-filtered lists* of the winning completion —
+    callers that need the original completion index must map it back
+    through their own `valid_indices` array.
+    """
     best_score = -float("inf")
     best_key: Optional[str] = None
     for key, indices in groups.items():
@@ -136,8 +150,10 @@ def _select_prm_vote(
         if score > best_score or (score == best_score and (best_key is None or key < best_key)):
             best_score = score
             best_key = key
-    idx = groups[best_key][0] if best_key is not None else 0
-    return valid_correct[idx]
+    if best_key is None:
+        return valid_correct[0], 0, ""
+    idx = groups[best_key][0]
+    return valid_correct[idx], idx, best_key
 
 
 def _compute_problem_metrics(
@@ -149,27 +165,42 @@ def _compute_problem_metrics(
 ) -> ProblemMetrics:
     """Compute pass@n and pass@1 (PRM-Vote) for a single problem."""
     n = len(completions)
+    ref = str(reference_answer)
     if n == 0:
-        return ProblemMetrics(pass_at_n=0.0, pass_at_1_correct=False, n=0)
+        return ProblemMetrics(
+            pass_at_n=0.0, pass_at_1_correct=False, n=0,
+            reference_answer=ref,
+        )
 
-    extracted, correct = _extract_and_check(completions, str(reference_answer), data_name)
+    extracted, correct = _extract_and_check(completions, ref, data_name)
     agg = [aggregate_scores(s, agg_strategy) for s in step_scores]
     pass_n = pass_at_k(n, sum(correct), n)
 
     # Filter invalid answers before selection (matches Liu et al. judge_ans).
     valid_indices = [i for i, ans in enumerate(extracted) if ans]
     if not valid_indices:
-        return ProblemMetrics(pass_at_n=pass_n, pass_at_1_correct=False, n=n)
+        return ProblemMetrics(
+            pass_at_n=pass_n, pass_at_1_correct=False, n=n,
+            reference_answer=ref,
+            selected_answer="",
+            selected_idx=None,
+        )
 
     valid_extracted = [extracted[i] for i in valid_indices]
     valid_correct = [correct[i] for i in valid_indices]
     valid_agg = [agg[i] for i in valid_indices]
     groups = _group_answers(valid_extracted)
 
+    correct_flag, valid_idx, selected_key = _select_prm_vote(valid_correct, valid_agg, groups)
+    original_idx = valid_indices[valid_idx]
+
     return ProblemMetrics(
         pass_at_n=pass_n,
-        pass_at_1_correct=_select_prm_vote(valid_correct, valid_agg, groups),
+        pass_at_1_correct=correct_flag,
         n=n,
+        reference_answer=ref,
+        selected_answer=selected_key,
+        selected_idx=original_idx,
     )
 
 

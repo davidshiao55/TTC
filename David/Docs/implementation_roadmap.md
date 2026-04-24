@@ -1,13 +1,42 @@
 # Implementation Roadmap
 
 This document is the authoritative implementation plan for the thesis offloading
-work. It supersedes the roadmap in `thesis_proposal.md` (Section 8.3) and the
-implementation phases in `CLAUDE.md`.
+work. It supersedes the roadmap in `thesis_proposal.md` and the implementation
+phases in `CLAUDE.md`.
 
 **Prerequisites completed:**
 - FastTTS migrated to vLLM V1 (see `vllm_v1_migration.md`)
 - Both conda environments (`baseline`, `thesis`) working
 - vLLM fork full CUDA build done
+
+---
+
+## Architecture Overview
+
+The thesis system has three components (see `thesis_proposal.md` §3):
+
+- **Profiler** (offline) — measures HW/model behavior; produces cached tables. See `profiler_design.md`.
+- **Planner** (load-time) — solves for placement + per-bucket dispatch; primary contribution. See `planner_design.md`.
+- **Scheduler** (runtime) — executes the plan; tier-aware admission + KV migration. See `scheduler_design.md`.
+
+And three offloading mechanisms the components orchestrate (`thesis_proposal.md` §3.2):
+
+- Two-tier weight storage + three-way compute dispatch
+- Two-tier KV pool
+- PCIe allocation (100% to weight prefetch — design invariant)
+
+### Phase-to-Component Map
+
+| Phase | Profiler | Planner | Scheduler | Mechanism scope |
+|---|---|---|---|---|
+| **0** — Benchmarks | First profile run (schema validation) | — | — | — |
+| **1** — Resident Hybrid Weight Split | + CPU GEMM curves (all sub-modules) | First Planner output: `f_cpu_store` only, single-entry dispatch | — | Weight storage; CPU-compute dispatch path (all sub-modules incl. WQKV) |
+| **2** — Attention Offloading | + CPU attention curve | Planner gains `KV_gpu_bytes` / `KV_cpu_bytes` variables | Tier-aware KV admission | KV two-pool storage; CPU suffix attention |
+| **3** — Tensor Prefetch | + PCIe BW curve refinement | Dispatch table gains `f_prefetch_compute` axis per bucket | — | Prefetch dispatch path added |
+| **4** — E2E | — | — | — | All mechanisms active |
+| **5** — CUDA Graph | — | — | `cudaLaunchHostFunc` retrofit | Graph-compatible dispatch |
+
+Phases deliver the system incrementally: each extends Profiler coverage, Planner variable set, or Scheduler capabilities while preserving the three-component architecture.
 
 ---
 
@@ -28,7 +57,7 @@ GPU layer time (~0.5 ms for 7B). If CPU BLAS achieves only 40 GB/s instead of
 slice at batch sizes B=1,4,8,16,32. Test both BF16 and FP32 — CPU BF16 BLAS may
 be slower than FP32 depending on hardware (AMX vs no-AMX).
 
-Representative shapes (7B, f_cpu=9%):
+Representative shapes (7B, f_cpu=9% uniform column choice):
 | Sub-module | GPU shape | CPU shape |
 |---|---|---|
 | WQKV | [B, 3584] × [3584, 4194] | [B, 3584] × [3584, 414] |
@@ -36,7 +65,7 @@ Representative shapes (7B, f_cpu=9%):
 | MLP1 | [B, 3584] × [3584, 34478] | [B, 3584] × [3584, 3410] |
 | MLP2 | [B, 18944] × [18944, 3262] | [B, 18944] × [18944, 322] |
 
-And for the WQKV Q|K|V split (Phase 1b+2):
+And for the WQKV K/V-biased slice at `f_cpu_store_WQKV = 22%` (strict Q | K | V boundary; see `weight_offload_design.md`):
 | Split | GPU (Q) | CPU (K+V) |
 |---|---|---|
 | WQKV | [B, 3584] × [3584, 3584] | [B, 3584] × [3584, 1024] |
@@ -52,7 +81,7 @@ that CPU compute must fit within. Also validates the memory-BW-bound assumption.
 **How:** `torch.cuda.Event` based timing around each sub-module, or vLLM's
 layerwise profiler. Run at B=1,4,8,16,32,64.
 
-### 0.3 PCIe Effective Bandwidth (validates Phase 3 estimates)
+### 0.3 PCIe Effective Bandwidth (validates Phase 1b prefetch estimates)
 
 **What:** Extend `David/Benchmarks/pcie_bandwidth_test.py` to sweep over
 transfer sizes: 256 KB, 1 MB, 4 MB, 10 MB, 50 MB, 100 MB, 500 MB.
@@ -73,7 +102,7 @@ concat, compare to unsplit result.
 **How:** Load a real layer, split WQKV/MLP columns, compute both paths, assert
 `torch.allclose(atol=0)`.
 
-### 0.5 CPU Attention Latency (gates Phase 1b+2)
+### 0.5 CPU Attention Latency (gates Phase 2)
 
 **What:** Measure `cpu_attention_with_kv_cache` latency at various (B, S)
 combinations: B=4,8,16,32 × S=100,500,1000,2000.
@@ -83,14 +112,14 @@ combinations: B=4,8,16,32 × S=100,500,1000,2000.
 **How:** Use `vllm/benchmarks/kernels/cpu/benchmark_cpu_attn.py` with target
 configurations.
 
-### 0.6 CUDA Graph Impact (informs Phase 5 priority)
+### 0.6 CUDA Graph Impact (informs Phase 4 priority)
 
 **What:** Measure decode throughput and per-step latency with CUDA Graphs
 enabled vs. disabled (`enforce_eager=True`) on 7B at various batch sizes.
 
 **Why:** Quantifies the actual performance cost of disabling CUDA Graphs. If
-the gap is small (e.g., <10%), Phase 5 is low priority and we can prototype
-comfortably with `enforce_eager=True`. If the gap is large (>20%), Phase 5
+the gap is small (e.g., <10%), Phase 4 is low priority and we can prototype
+comfortably with `enforce_eager=True`. If the gap is large (>20%), Phase 4
 becomes more urgent and we should consider building CUDA Graph compatibility
 earlier.
 
@@ -100,7 +129,7 @@ earlier.
 - Measure: per-step decode latency (ms), throughput (tok/s)
 - Also measure graph capture time to understand startup cost
 
-### 0.7 KV Cache CPU Offload Impact (informs Phase 1b+2)
+### 0.7 KV Cache CPU Offload Impact (informs Phase 2)
 
 **What:** Measure the performance impact of vLLM's existing KV cache offloading
 to CPU. This tests how well the system handles KV data on CPU and gives a
@@ -111,7 +140,7 @@ it reveals: (1) how much batch capacity increases when KV spills to CPU,
 (2) the actual CPU↔GPU transfer overhead for KV data, and (3) whether the
 existing infrastructure is usable as a building block for our suffix-on-CPU
 design. If existing KV offload already gives significant batch capacity gains,
-our attention offloading (Phase 1b+2) builds on proven infrastructure. If it
+our attention offloading (Phase 2) builds on proven infrastructure. If it
 causes severe slowdowns, we know the bottleneck to target.
 
 **How:** Run 7B decode with KV offloading enabled at various configurations:
@@ -130,22 +159,59 @@ Record throughput, latency, accuracy.
 
 ---
 
-## Phase 1a — Resident Hybrid (WO, MLP1, MLP2)
+## Phase 1 — Collaborative Weight Offload
 
-Column-parallel split on all sub-modules **except** WQKV. This validates the
-core mechanics without attention coupling.
+Mixed col/row tensor-granularity split across three sub-modules (WQKV, MLP1, MLP2), with uniform per-bucket dispatch and layer-ahead prefetch. WO is not offloaded in Phase 1 (fully GPU-resident — see `weight_offload_design.md §WO Split Axis Decision`). The phase is split into two sub-milestones: 1a ships the static compute path (no prefetch, `f_cpu` only) as an early checkpoint; 1b adds layer-ahead prefetch to complete the Planner's per-bucket dispatch story.
 
-### Scope
+**Why a single phase with sub-milestones?** Sub-milestones 1a and 1b share the same mechanism: the `CpuComputeDispatcher`, the col/row split machinery, and the per-bucket dispatch table. 1b extends 1a's dispatch table with a second scalar (`f_prefetch`). Treating them as sub-milestones of one phase (instead of separate phases) reflects that engineering cohesion — no context-switch between "weight offload" and "something else" in the middle of building the mechanism.
 
-- Modify `MergedColumnParallelLinear` (gate_up / MLP1) and
-  `RowParallelLinear` (down / MLP2) in `vllm/model_executor/layers/linear.py`
-- Modify `QKVParallelLinear` for WO projection
-- At model load: split weight columns into W_gpu (91%) and W_cpu (9%)
-- At forward: CPU computes `x @ W_cpu` in parallel with GPU `x @ W_gpu`, concat
+### Phase 1a — Static Weight Offload (no prefetch)
+
+CPU-resident weights are CPU-computed each forward; `f_prefetch = 0`. Ships as a standalone checkpoint that validates the split mechanism and CPU-compute path.
+
+**Scope:**
+
+- Extend `MergedColumnParallelLinear` (MLP1 / gate_up) for a col-parallel CPU slice on the output dim.
+- Extend `RowParallelLinear` (MLP2 / down) for a row-parallel CPU slice on the input dim; assembly is `add_` (partial-sum reduce), not `concat`.
+- Extend `QKVParallelLinear` (WQKV) for a col-parallel CPU slice with the K/V-biased column picker. Implement the K/V-pin guard inside `CpuComputeDispatcher` (see `weight_offload_design.md §Implementation Note`).
+- WO is untouched — stays fully GPU-resident, no CPU path, no prefetch path.
+- At model load: split each sub-module's weights into `W_gpu` and `W_cpu` along its assigned axis per the Planner's single `f_cpu_store` output (applied to WQKV/MLP1/MLP2 uniformly).
+- At forward: CPU and GPU compute their slices in parallel; assembly is `concat` for col-parallel and `add_` for row-parallel. For the MLP block, SwiGLU runs locally on each device's intermediate slice between MLP1 and MLP2 — no intermediate transfer (matched-index invariant is automatic under uniform dispatch).
+
+**Planner output at this sub-milestone:** `f_cpu_store` (load-time scalar) and `f_cpu` per bucket (with `f_prefetch = 0`). Dispatch table collapses to a 1-D bucket → `f_cpu` lookup.
+
+### Phase 1b — Layer-Ahead Weight Prefetch
+
+Add `f_prefetch` to the per-bucket dispatch: CPU-stored bytes not covered by `f_cpu` are streamed to GPU via the prefetch path during the previous layer's compute.
+
+**Scope:**
+
+- Add layer-ahead prefetch queue: one prefetch operation per layer boundary covering `Σ_m (f_prefetch × W_m)` across WQKV/MLP1/MLP2. One `cudaStreamWaitEvent` per layer.
+- Extend `CpuComputeDispatcher` to accept the `f_prefetch` share — prefetched weights land in the circular buffer and are consumed by the layer's GEMMs from GPU memory. `f_cpu_compute + f_prefetch_compute = f_cpu_store` exactly.
+- K/V-pin guard on WQKV (from 1a) ensures prefetch on WQKV only applies to Q columns above the K/V-bias boundary.
+- Planner's per-bucket output becomes a single `(f_cpu, f_prefetch)` pair — see `planner_design.md §4.2` and §7.3.
+
+**Expected result (7B at sub-milestone 1b):** layer-ahead prefetch enables meaningful `f_cpu_store` values without CPU-compute latency dominating at large batch. Free up GPU memory for larger KV pool without per-step latency regression at decode buckets where `f_prefetch` absorbs most of the offload.
+
+### WQKV Column Choice (K/V-Biased)
+
+CPU columns for WQKV are assigned in priority order: KV-head groups (K+V together per head) first, then Q heads. For Qwen2.5-7B GQA, K+V together is 22% of WQKV output; at `f_cpu_store = 22%`, the strict Q | K | V split emerges naturally. See `weight_offload_design.md` for the full rationale (volume savings + H2D contention avoidance) and the K/V-pin guard as an implementation detail.
+
+**Relevance to Phase 2**: above the 22% K/V-biased boundary, the K/V-pin guard keeps all K/V columns CPU-computed — K/V output lands directly in the suffix cache, no D2H. Below 22%, K/V output for the GPU-resident portion still requires D2H to CPU cache each step; K/V-group bias only *reduces* this transfer vs. uniform, not eliminates it.
+
+### Size Budget (Qwen2.5-7B, GQA: 28 Q heads, 4 KV heads, head_dim=128)
+
+| Component | Output dim | Size (BF16) | % of WQKV |
+|---|---|---|---|
+| W_Q | 3584 | 25.6 MB | 78% |
+| W_K | 512 | 3.7 MB | 11% |
+| W_V | 512 | 3.7 MB | 11% |
+
+K + V = 22% of WQKV; WQKV is 8.8% of the layer → at most ~2% of total layer weight from a pure K/V-on-CPU WQKV slice.
 
 ### CpuComputeDispatcher Abstraction
 
-Design this from day 1 to make CUDA Graph retrofit (Phase 5) a localized change:
+Design this from day 1 to make CUDA Graph retrofit (Phase 4) a localized change:
 
 ```python
 class CpuComputeDispatcher:
@@ -154,79 +220,28 @@ class CpuComputeDispatcher:
     def wait(self) -> Tensor: ...
 ```
 
-Prototype uses `ThreadPoolExecutor` + `enforce_eager=True`.
-Production swaps internals for KTransformers-style C++ `CPUInfer` +
-`cudaLaunchHostFunc`. Forward pass code doesn't change.
-
-### Expected Result (7B)
-
-~1.2 GB freed across 28 layers with near-zero latency cost. Validate by
-measuring KV cache capacity before/after.
+Prototype uses `ThreadPoolExecutor` + `enforce_eager=True`. Production swaps internals for KTransformers-style C++ `CPUInfer` + `cudaLaunchHostFunc`. Forward pass code doesn't change.
 
 ### What to Measure
 
-- Per-layer decode time (should be ≤ baseline)
-- GPU memory freed (target: ~1.2 GB)
-- KV cache capacity increase
-- Throughput change on FastTTS workload
+**At 1a:** per-layer decode time (should be ≤ baseline); GPU memory freed; KV cache capacity increase; per-sub-module CPU-slice latency vs. GPU-slice budget (validates Planner's dispatch-table entries).
+
+**At 1b:** layer-ahead prefetch critical-path behavior; buffer size vs. layer-time budget; per-bucket `(f_cpu, f_prefetch)` entries emitted by the Planner; throughput change on FastTTS workload.
 
 ---
 
-## Phase 1b+2 — WQKV Split + Attention Offloading (Coupled)
+## Phase 2 — Attention Offloading
 
-WQKV is split along the **Q|K|V dimension**, not arbitrary columns:
-- **Q → GPU**: needed for GPU prefix attention
-- **K, V → CPU**: new K/V go directly into CPU suffix KV cache
-
-This couples weight splitting and attention offloading by design. New K/V values
-are produced where they're consumed — no GPU→CPU transfer for KV cache
-population during decode.
-
-### Data Flow (Decode)
-
-```
-GPU                                    CPU
- │                                      │
- x ── x @ W_Q ──→ q                    │
- │                                      │
- x ── copy (async) ──────────→ x @ W_K ──→ k ──→ suffix KV cache
- │                              x @ W_V ──→ v ──→ suffix KV cache
- │                                      │
- q @ K_prefix ──→ out_gpu, lse_gpu      │
- │                    q (small) ──→ q @ K_suffix ──→ out_cpu, lse_cpu
- │                                      │
- merge(out_gpu, lse_gpu, out_cpu, lse_cpu)
-```
-
-### Size Budget (Qwen2.5-7B)
-
-| Component | Output dim | Size (BF16) | % of WQKV | Device |
-|---|---|---|---|---|
-| W_Q | 3584 → 3584 | 25.6 MB | 78% | GPU |
-| W_K | 3584 → 512 | 3.7 MB | 11% | CPU |
-| W_V | 3584 → 512 | 3.7 MB | 11% | CPU |
-
-K+V = 22% of WQKV, but WQKV is 8.8% of the layer → **~2% of total layer
-weight on CPU** from the QKV split. Well within f_cpu budget; leaves ~7% for
-WO/MLP (from Phase 1a).
+Move suffix KV to CPU and compute suffix attention on CPU in parallel with GPU prefix attention. Independent of Phase 1's WQKV choice: if Phase 1's WQKV slice produces K/V on CPU, Phase 2 consumes them directly; otherwise a small CPU↔GPU transfer bridges the two phases.
 
 ### Prefill Handling
 
-During prefill, K/V must go to the **GPU prefix** KV cache. Approach: always
-compute K/V on CPU, transfer to GPU during prefill only. Prefill is
-compute-bound and processes many tokens — the extra CPU→GPU transfer is
-negligible. During decode (the latency-critical path), K/V stays on CPU.
+During prefill, K/V must go to the **GPU prefix** KV cache. Simplest approach: always compute K/V on whichever device holds those WQKV columns, transferring to GPU during prefill only. Prefill is compute-bound and processes many tokens — the extra transfer is negligible. During decode (latency-critical path), K/V stays on CPU.
 
 ### Engineering Gaps
 
-1. **CPU attention must return LSE** (CRITICAL): Modify the C++ kernel
-   `cpu_attention_with_kv_cache` to output per-head LSE alongside attention
-   output. The softmax denominator is already computed internally. Requires C++
-   kernel + Python binding changes.
-
-2. **Separate block tables for GPU prefix / CPU suffix**: Two-pass attention
-   with separate block tables (extends existing cascade pattern). GPU pass over
-   prefix blocks, CPU pass over suffix blocks, merge via `merge_attn_states`.
+1. **CPU attention must return LSE** (CRITICAL): Modify the C++ kernel `cpu_attention_with_kv_cache` to output per-head LSE alongside the attention output. The softmax denominator is already computed internally. Requires C++ kernel + Python binding changes.
+2. **Separate block tables for GPU prefix / CPU suffix**: Two-pass attention with separate block tables (extends existing cascade pattern). GPU pass over prefix blocks, CPU pass over suffix blocks, merge via `merge_attn_states`.
 
 ### What to Measure
 
@@ -237,47 +252,7 @@ negligible. During decode (the latency-critical path), K/V stays on CPU.
 
 ---
 
-## Phase 3 — Tensor-Granularity Weight Prefetch
-
-Per-sub-module three-way split: `W = [W_gpu_permanent | W_gpu_prefetched | W_cpu]`.
-All PCIe H2D bandwidth dedicated to weight prefetch (no KV prefetch).
-
-### When This Matters
-
-- **7B (fits on GPU):** Elective offloading — prefetch replaces f_gpu to free
-  more memory for KV cache, at the cost of per-step latency.
-- **14B+ (doesn't fit):** Mandatory offloading — prefetch replaces f_cpu to
-  reduce latency on offloaded layers.
-
-### Sub-Layer Pipeline
-
-Each sub-module has independently tuned f_gpu/f_prefetch/f_cpu. The prefetch
-for sub-module N+1 runs during sub-module N's compute:
-
-```
-GPU:   WQKV compute → Attn → WO compute → MLP1 compute → MLP2 compute
-PCIe:  (KV/idle)    → WO   → MLP1       → MLP2         → WQKV(next)
-CPU:   WQKV(K+V)    → Attn → WO         → MLP1         → MLP2
-```
-
-### Prefetch Distance Options
-
-| Distance | Buffer size | MLP1 bottleneck? |
-|---|---|---|
-| Tensor-ahead | max(f_prefetch_i × W_i) — smallest | Yes (WO phase too short) |
-| Layer-ahead | sum(f_prefetch_i × W_i) | No (global budget) |
-
-Decision deferred to implementation — benchmark both.
-
-### Implementation
-
-Extend vLLM's `PrefetchOffloader` pattern (`StaticBufferPool`, async copy stream
-+ `cudaStreamWaitEvent`) to operate at tensor granularity instead of layer
-granularity.
-
----
-
-## Phase 4 — End-to-End Benchmarking
+## Phase 3 — End-to-End Benchmarking
 
 Full FastTTS runs on RTX 4090 with all offloading features.
 
@@ -286,10 +261,10 @@ Full FastTTS runs on RTX 4090 with all offloading features.
 | Config | Model | Offloading | Purpose |
 |---|---|---|---|
 | Baseline | 7B | None | Reference throughput |
-| Hybrid-only | 7B | Phase 1a (WO/MLP split) | Validate "free" 1.2 GB claim |
-| Full offload | 7B | Phase 1a + 1b+2 (+ attention) | Max batch capacity |
-| Prefetch | 7B | Phase 1a + 1b+2 + 3 (elective) | Latency-throughput tradeoff |
-| 14B minimal | 14B | Phase 1a + 1b+2 + 3 (mandatory) | Demonstrate 14B feasibility |
+| Static offload | 7B | Phase 1a (CPU-compute only, no prefetch) | Validate split mechanism + CPU-compute path |
+| Full weight offload | 7B | Phase 1 (1a + 1b prefetch) | Exercise full weight-offload mechanism |
+| Full offload | 7B | Phase 1 + 2 (attention) | Max batch capacity with attention offload |
+| 14B minimal | 14B | Phase 1 + 2 | Demonstrate 14B feasibility |
 
 ### Metrics
 
@@ -301,7 +276,7 @@ Full FastTTS runs on RTX 4090 with all offloading features.
 
 ---
 
-## Phase 5 — CUDA Graph Integration (If Time Permits)
+## Phase 4 — CUDA Graph Integration (If Time Permits)
 
 Replace the Python `CpuComputeDispatcher` prototype with C++ `CPUInfer` +
 `cudaLaunchHostFunc`, enabling CUDA Graph compatibility.
@@ -354,20 +329,20 @@ GPU and CPU run in parallel — giving `max(GPU, CPU)` timing naturally.
 
 ```
 Phase 0 (benchmarks)
-  ├─→ Phase 1a (WO/MLP split)  ← Python-only, fastest win
-  │     └─→ Phase 3 (prefetch)  ← builds on column splits
-  └─→ Phase 1b+2 (WQKV + attention)  ← requires C++ kernel (LSE)
-        └─→ Phase 3 (prefetch)
-
-Phase 1a + 1b+2 + 3 → Phase 4 (benchmarking)
-Phase 4 → Phase 5 (CUDA Graphs, if time)
+  └─→ Phase 1 — Collaborative Weight Offload
+        ├── 1a: Static col/row split (no prefetch)   ← Python-only, earliest checkpoint
+        └── 1b: Layer-ahead prefetch                 ← adds f_prefetch on top of 1a
+              │
+              └─→ Phase 2: Attention Offload         ← requires C++ kernel (LSE)
+                    │
+                    └─→ Phase 3: End-to-End Benchmarking
+                          │
+                          └─→ Phase 4: CUDA Graphs (if time)
 ```
 
-**Critical path:** Phase 0 → Phase 1a → Phase 1b+2 → Phase 4
+**Critical path:** Phase 0 → Phase 1a → Phase 1b → Phase 2 → Phase 3.
 
-Phase 1a and Phase 1b+2 can be developed in parallel after Phase 0, since
-Phase 1a touches WO/MLP and Phase 1b+2 touches WQKV/attention — different
-sub-modules.
+Phase 1a and 1b are sequential sub-milestones of the same mechanism (1b extends 1a's dispatch with `f_prefetch`). Phase 2 work lives in the attention backend + CPU attention kernel and is orthogonal to Phase 1's linear-layer code; if the CPU-attention LSE kernel is ready, Phase 2 can be developed in parallel with Phase 1b.
 
 ---
 
@@ -377,14 +352,36 @@ sub-modules.
    threading + `enforce_eager=True`. Swap internals for C++ CPUInfer later.
    Forward pass code never changes.
 
-2. **WQKV split along Q|K|V dimension.** Q on GPU (prefix attention), K/V on
-   CPU (suffix KV cache). Eliminates GPU→CPU KV transfer during decode.
+2. **Mixed col/row split per TP convention (Phase 1).** WQKV and MLP1 are
+   column-parallel (shard output dim); MLP2 is row-parallel (shard input dim,
+   pairs with MLP1 to eliminate intermediate activation round-trip). WO is
+   not offloaded. CPU plays the role of an additional TP rank along each
+   sub-module's native shard axis.
 
-3. **All PCIe to weight prefetch.** No KV prefetch. Suffix attention → CPU
+3. **Uniform per-bucket dispatch across WQKV/MLP1/MLP2.** The Planner emits a
+   single `(f_cpu, f_prefetch)` pair per bucket applied uniformly to the
+   three offloaded sub-modules. Justified empirically by uniform CPU μs/MB
+   at decode (`phase0_findings.md §0.2`). The MLP1↔MLP2 matched-index
+   invariant is automatic under uniform dispatch.
+
+4. **Layer-ahead prefetch (Phase 1b).** One prefetch queue per layer
+   boundary, one sync per layer. Rejected tensor-ahead because its
+   topological constraint would force per-sub-module f tuning to avoid
+   prefetch starvation — needless given uniform CPU throughput and
+   resolved PCIe contention (`phase0_findings.md §0.9`).
+
+5. **K/V-biased WQKV column choice + K/V-pin guard.** Picker assigns CPU
+   columns in priority order (K+V head pairs first, then Q tail). Runtime
+   K/V-pin guard in `CpuComputeDispatcher` keeps K/V CPU-computed regardless
+   of the uniform `f_cpu`, avoiding K/V round-trip. See
+   `weight_offload_design.md §Implementation Note`.
+
+6. **All PCIe to weight prefetch.** No KV prefetch. Suffix attention → CPU
    only. Batch size is the control variable for CPU attention bottleneck.
 
-4. **Prototype with `enforce_eager=True`.** Defer CUDA Graph compatibility to
-   Phase 5. Correctness and performance validation come first.
+7. **Prototype with `enforce_eager=True`.** Defer CUDA Graph compatibility to
+   Phase 4. Correctness and performance validation come first.
 
-5. **Prefill: always compute K/V on CPU, transfer to GPU.** One code path.
-   Prefill overhead is negligible (compute-bound, amortized over many tokens).
+8. **Prefill: transfer K/V to GPU prefix cache once.** Prefill overhead is
+   negligible (compute-bound, amortized over many tokens); decode keeps K/V
+   on CPU for the suffix cache.

@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "model_key": "prm1p5b",
+  "model": {
+    "display_name": "Skywork-o1-Open-PRM-Qwen-2.5-1.5B",
+    "num_query_heads": 12,
+    "num_kv_heads": 2,
+    "head_dim": 128
+  },
+  "dtype": "bfloat16",
+  "cpu_threads": 24,
+  "note": "PyTorch F.scaled_dot_product_attention reference (not vLLM's C++ kernel \u2014 upper-bound estimate only)",
+  "config": {
+    "batch_sizes": [
+      4,
+      8,
+      16,
+      32
+    ],
+    "suffix_lens": [
+      100,
+      500,
+      1000,
+      2000,
+      4000
+    ],
+    "warmup": 5,
+    "iters": 20
+  },
+  "cpu_attn_curve": {
+    "4": {
+      "100": {
+        "mean_ms": 0.0631,
+        "median_ms": 0.0476,
+        "p95_ms": 0.1518
+      },
+      "500": {
+        "mean_ms": 0.3076,
+        "median_ms": 0.3066,
+        "p95_ms": 0.3223
+      },
+      "1000": {
+        "mean_ms": 0.587,
+        "median_ms": 0.5817,
+        "p95_ms": 0.6311
+      },
+      "2000": {
+        "mean_ms": 1.123,
+        "median_ms": 1.1155,
+        "p95_ms": 1.1774
+      },
+      "4000": {
+        "mean_ms": 2.3817,
+        "median_ms": 2.3817,
+        "p95_ms": 2.523
+      }
+    },
+    "8": {
+      "100": {
+        "mean_ms": 0.0598,
+        "median_ms": 0.0594,
+        "p95_ms": 0.0655
+      },
+      "500": {
+        "mean_ms": 0.5874,
+        "median_ms": 0.585,
+        "p95_ms": 0.6071
+      },
+      "1000": {
+        "mean_ms": 1.1303,
+        "median_ms": 1.1349,
+        "p95_ms": 1.1618
+      },
+      "2000": {
+        "mean_ms": 2.2798,
+        "median_ms": 2.2882,
+        "p95_ms": 2.3288
+      },
+      "4000": {
+        "mean_ms": 4.7986,
+        "median_ms": 4.8029,
+        "p95_ms": 4.8278
+      }
+    },
+    "16": {
+      "100": {
+        "mean_ms": 0.12,
+        "median_ms": 0.1147,
+        "p95_ms": 0.146
+      },
+      "500": {
+        "mean_ms": 1.1829,
+        "median_ms": 1.1881,
+        "p95_ms": 1.2047
+      },
+      "1000": {
+        "mean_ms": 2.3373,
+        "median_ms": 2.3414,
+        "p95_ms": 2.4012
+      },
+      "2000": {
+        "mean_ms": 4.8914,
+        "median_ms": 4.9124,
+        "p95_ms": 4.9468
+      },
+      "4000": {
+        "mean_ms": 9.5297,
+        "median_ms": 9.6237,
+        "p95_ms": 9.9288
+      }
+    },
+    "32": {
+      "100": {
+        "mean_ms": 0.2216,
+        "median_ms": 0.2234,
+        "p95_ms": 0.2244
+      },
+      "500": {
+        "mean_ms": 2.3093,
+        "median_ms": 2.3243,
+        "p95_ms": 2.3993
+      },
+      "1000": {
+        "mean_ms": 4.5551,
+        "median_ms": 4.5499,
+        "p95_ms": 4.6739
+      },
+      "2000": {
+        "mean_ms": 8.6328,
+        "median_ms": 8.6712,
+        "p95_ms": 8.8896
+      },
+      "4000": {
+        "mean_ms": 18.206,
+        "median_ms": 18.0223,
+        "p95_ms": 21.1324
+      }
+    }
+  }
+}

@@ -1,11 +1,13 @@
 # Thesis Proposal
 
+**Working title**: *Scaling Test-Time Compute on Consumer GPUs via Collaborative CPU-GPU Weight and KV Offloading*
+
 ## 1. Problem Statement
 
 **Workload**: Test-time compute (TTC) inference — beam search, tree search, best-of-N sampling.
 **Computing Platform**: Consumer GPU (NVIDIA RTX 4090, 24 GB GDDR6X)
 
-**Existing Methods**: Locality-Aware Beam Scheduling, FastTTS — these optimize KV-cache handling (movement, scheduling, reuse), but assume model weights and active KV cache stay GPU-resident throughout inference.
+**Existing Methods**: Locality-Aware Beam Scheduling, FastTTS — these optimize KV-cache handling (movement, scheduling, reuse), but assume model weights and KV cache of current computing batch stay GPU-resident throughout inference.
 
 **Limitations**:
 - **Model size**: Max model size ≤ VRAM.
@@ -42,7 +44,7 @@ Existing work has attempted to improve test-time scaling at the edge through:
 - Dynamic Prefix-Aware Scheduling
 - Asymmetric Multi-Model Memory Allocation
 
-But these methods assume model weights and active KV cache stay GPU-resident throughout inference.
+But these methods assume model weights and KV cache of current computing batch stay GPU-resident throughout inference.
 
 #### Model Size Limitation
 
@@ -70,7 +72,8 @@ Existing offloading methods are typically optimized for one of two regimes:
 Neither regime applies to TTC because:
 1. TTC requires efficient handling of multi-path generation while maintaining low latency — neither regime's strategy addresses both.
 2. Existing methods do not consider that even when a model fully fits on GPU, weight offloading can be beneficial to enlarge batch size and therefore throughput. <!-- TODO: still considering whether to include this point — need to verify with experiments -->
-3. Existing methods are designed for a single model, but TTC pipelines have two models with different characteristics (generator vs. verifier).
+3. Existing methods assume prefill and decode occur as separate forward calls with static shapes. TTC's wide reasoning-path exploration (beam search, best-of-N, DVTS) typically spawns more concurrent requests than a single forward call can serve on a 24 GB GPU, forcing vLLM v1's continuous batching as the steady state — a single forward call then mixes chunked prefill from newly admitted paths with decode tokens from ongoing paths. Prior offloading systems (FlexGen, DeepSpeed-Inference, PowerInfer, TwinPilots, Doppeladler) do not handle this mixed-shape forward-call regime.
+4. TTC pipelines run two models with fundamentally different computation patterns (generator: autoregressive decode, small `num_tokens` per call; verifier: step scoring, medium `num_tokens` per call). Prior systems either serve a single model or — in TwinPilots' case — partition layers across devices within one model family. None applies distinct per-model offloading strategies matched to each model's forward-pass characteristics.
 
 #### Attention Offloading
 
@@ -82,73 +85,154 @@ These methods don't apply to TTC because:
 
 ---
 
-## 3. Proposed Solution: Resource Partitioning
+## 3. System Overview
 
-We partition computation and data across GPU, CPU, and PCIe to maximize utilization of all resources. The three methods below determine *where* each piece of work executes; Section 4 determines the optimal partition fractions.
+### 3.1 Architecture
 
-### 3.1 Attention Offloading
+Three components, each on a different timescale:
 
-TTC tree search naturally exhibits prefix-sharing. We partition KV cache by topology:
-- **Shared prefix** → GPU (KV cache + attention)
-- **Per-beam suffix** → CPU (KV cache + attention)
-
-```
-                [Shared Prefix - GPU]
-                /        |         \
-        [Suffix A]  [Suffix B]  [Suffix C]   ← CPU
-```
-
-Merge via online softmax (mathematically exact). Already implemented in vLLM's `cascade_attention()` and `merge_attn_states()`.
-
-### 3.2 Hybrid CPU-GPU Weight Computation
-
-The CPU has compute resources idle during GPU-only inference. Each weight matrix is split into two compute partitions via column-parallel partitioning:
+- **Profiler** (offline) — measures hardware and model behavior; produces cached tables. See `profiler_design.md`.
+- **Planner** (load-time) — at engine launch, consumes the profile + budgets + workload target (`n`, search strategy, `max_context`) and emits a placement plan (per-model scalars) and a per-bucket dispatch table. **Primary thesis contribution.** See `planner_design.md`.
+- **Scheduler** (runtime) — executes the plan per step: tier-aware KV admission, KV migration, dispatch lookup. Thin extension over vLLM's existing scheduler. See `scheduler_design.md`.
 
 ```
-W = [W_gpu | W_cpu]
-Y = concat(X @ W_gpu, X @ W_cpu)
-(column-parallel, mathematically exact)
+           ┌──────────────┐                           ┌───────────────┐
+ HW, model │   Profiler   │  profile tables           │    Planner    │
+ ─────────▶│   (offline)  │──────────────────────────▶│  (load-time)  │
+           └──────────────┘                           └───────┬───────┘
+                                                              │ placement +
+                                   SearchConfig ──────────────┤ dispatch table
+                                   VRAM / RAM budgets ────────┤
+                                                              ▼
+                                                   ┌────────────────────┐
+                                    request flow ─▶│     Scheduler      │
+                                                   │ (runtime, per step)│
+                                                   └──────────┬─────────┘
+                                                              ▼
+                                                     vLLM forward pass
+                                                     (gen or ver model)
 ```
 
-- **f_gpu**: stored and computed on GPU
-- **f_cpu**: stored on CPU, computed on CPU in parallel with GPU
+Each component writes data the next one reads; runtime never changes the plan.
 
-At small f_cpu (~9%), CPU compute fits within GPU idle time (GPU is memory-bandwidth-bound), so the split is effectively free — GPU memory is freed with no latency cost. The split is applied at **tensor granularity** — each sub-module (WQKV, WO, MLP1, MLP2) has independently tuned fractions.
+### 3.2 Offloading Strategy
 
-### 3.3 PCIe Weight Prefetch
+Transformer inference is fundamentally sequential — each layer feeds the next, and within a layer each sub-module (WQKV → attention → WO → MLP1 → MLP2) feeds the next. There are no independent branches that could be naively scheduled onto separate devices. For GPU + CPU + PCIe to run concurrently, each sequential operation must be split internally.
 
-Sections 3.1 and 3.2 partition *computation* between GPU and CPU. This section addresses how to use the PCIe bandwidth that remains available.
+Three fundamental partitions follow:
 
-Rather than splitting PCIe between weight prefetch and KV prefetch, we dedicate **all PCIe H2D bandwidth to weight prefetch**. A portion of f_gpu weights need not be permanently GPU-resident — they can be stored on CPU and streamed to GPU via PCIe during preceding computation. This introduces a three-way weight split:
+**Weight computation: 3-way split.** Every matmul sub-module (WQKV, WO, MLP1, MLP2) has three concurrent computation paths so that GPU compute, CPU compute, and PCIe can all contribute to the same operation:
 
-```
-W = [W_gpu_permanent | W_gpu_prefetched | W_cpu]
-```
+- GPU path — weights resident on GPU, computed on GPU
+- Prefetch path — weights streamed CPU→GPU on demand, computed on GPU
+- CPU path — weights resident on CPU, computed on CPU, result returned over PCIe
 
-- **f_gpu_permanent**: pinned on GPU
-- **f_prefetch**: stored on CPU, streamed to GPU via PCIe during preceding computation, computed on GPU after arrival
-- **f_cpu**: stored and computed on CPU (unchanged from 3.2)
+A 2-way split (no prefetch) leaves PCIe idle. A pure-prefetch split wastes CPU compute. 3-way is the minimum that engages all three resources concurrently.
 
-The role of prefetch depends on model size:
-- **Small models** (weights fit on GPU): prefetch **replaces f_gpu** — frees GPU memory for KV cache (more beams) with minimal latency impact.
-- **Large models** (weights don't fit): prefetch **replaces f_cpu** — shifts work from the slow CPU path to GPU, reducing per-layer latency.
+The split axis is **per-sub-module**, chosen to match vLLM's tensor-parallel conventions so the same mechanism applies across the device boundary as it does across GPU ranks: **WQKV and MLP1 are column-parallel** (shard the output dim); **MLP2 is row-parallel** (shard the input dim). The col→row pairing between MLP1 and MLP2 keeps the intermediate activation device-local automatically — under the Planner's uniform per-bucket `(f_cpu, f_prefetch)` applied to both, MLP1's CPU output-column set matches MLP2's CPU input-column set by construction, so each device holds its own intermediate slice and SwiGLU runs locally. **WO is not offloaded in Phase 1/2** — fully GPU-resident (see `weight_offload_design.md §WO Split Axis Decision`). For **WQKV**, columns are assigned K/V-biased (KV-head groups placed on the CPU slice before Q heads), aligning weight offload with attention offload: the new K/V produced by the CPU slice lands directly on the CPU side where the suffix cache lives, and PCIe H2D (reserved for weight prefetch) is not competed for. For the other sub-modules, any slice within the chosen axis is mathematically equivalent. See `weight_offload_design.md`.
 
-KV prefetch is not used because: (1) batch size is our control variable for CPU attention cost, (2) weight prefetch is universal (benefits every decode step) while KV prefetch is situational, and (3) eliminating KV prefetch simplifies scheduling. See `pcie_bandwidth_allocation_design.md` for the full analysis.
+**Attention (KV cache): 2-way split.** KV partitions naturally by sharing pattern, enabling prefix and suffix attention to run concurrently on different devices:
+
+- Prefix KV (shared across beams) → GPU — GPU runs prefix attention
+- Suffix KV (per-beam, large aggregate) → CPU — CPU runs suffix attention in parallel
+
+Results merge exactly via online softmax (`merge_attn_states`).
+
+**PCIe H2D: 100% weight prefetch.** PCIe H2D is the only contended direction (D2H is otherwise idle). Weight prefetch strictly dominates KV prefetch at every scale — see `pcie_bandwidth_allocation_design.md` for the full analysis. Writing new suffix KV to CPU uses PCIe D2H, so it does not compete.
+
+These three partitions define *what* can be split and *where* the boundaries lie. *How much* goes on each side — the actual partition fractions, per model and per batch shape — is what the Planner decides (§5).
 
 ---
 
-## 4. Proposed Solution: Performance Modeling
+## 4. Profiler
 
-The partition methods in Section 3 introduce tunable fractions (f_gpu, f_prefetch, f_cpu) for each sub-module. A performance model determines the optimal values, taking into account:
-- Hardware characteristics (GPU/CPU compute bandwidth, PCIe bandwidth, memory capacities)
-- Model architecture differences between generator and verifier
-- Target batch size and search configuration
+The Profiler characterizes hardware and model behavior once per `(hardware, model, dtype)` tuple. Its output — GPU per-layer timing, CPU GEMM curves, PCIe bandwidth, CPU attention latency — is cached and consumed by the Planner at every engine launch.
 
-All methods compose to maximize utilization of all available resources.
+See `profiler_design.md` for schema, methodology, and caching.
 
 ---
 
-## 5. Reference Architecture
+## 5. Planner
+
+The Planner is the primary technical contribution. At engine launch, it consumes the Profiler's tables, the VRAM/RAM budgets, and the workload target (`n`, search strategy, `max_context`) and emits two kinds of output: load-time placement scalars and a per-bucket compute dispatch table.
+
+### 5.1 Why a per-bucket dispatch table
+
+TTC serving produces forward calls spanning a wide range of shapes. Three sources of variation contribute:
+
+- **Continuous batching** — vLLM v1 admits requests based on KV memory pressure, so batch composition fluctuates across forward calls.
+- **Prefill/decode mixing** — chunked prefill and decode tokens share the same batch.
+- **Generator/verifier asymmetry** — the generator runs autoregressive decode (one new token per beam → small forward calls); the verifier runs step scoring (many tokens per step → medium forward calls).
+
+Each produces calls with different arithmetic intensity: small calls have GPU idle time that CPU compute can hide in, while large calls are GPU compute-bound and must lean on prefetch. A single static offloading strategy wastes resources on one end of the spectrum.
+
+All three axes collapse into a single scalar — the forward call's `num_tokens`. Arithmetic intensity, GPU idle time, and therefore the optimal compute split all depend on `num_tokens` alone. vLLM already captures one CUDA graph per `BatchDescriptor` (keyed on `num_tokens`), and the Planner emits one dispatch entry per captured bucket. Variation from batching, prefill/decode, and gen/ver becomes variation along the same `num_tokens` axis — handled uniformly by indexing the dispatch table.
+
+### 5.2 Load-time vs Runtime Decisions
+
+The Planner's output structure follows directly from *when* each decision is best made.
+
+**Storage (load-time).** The fraction of each model's weights on CPU (`f_cpu_store_m`) and the per-tier KV pool sizes (`KV_gpu_bytes_m`, `KV_cpu_bytes_m`) set VRAM/RAM allocations for the entire serving session. Changing them at runtime would trigger reallocation stalls and cache thrashing, so they are decided once at engine launch. `f_cpu_store_m` is a single scalar applied uniformly to WQKV, MLP1, and MLP2 (WO is fully GPU-resident in Phase 1/2).
+
+**Compute dispatch (pre-computed at plan time, looked up at runtime).** The compute split `(f_cpu_compute, f_prefetch_compute)` depends on the bucket's `num_tokens`, and the bucket distribution is not under our control (vLLM decides batch composition). Rather than re-solve at runtime, the Planner pre-computes the full table `(f_cpu_compute, f_prefetch_compute)[BatchDescriptor]` at plan time — a single pair per bucket, applied uniformly across WQKV/MLP1/MLP2. Runtime dispatch is a table lookup, not an optimization.
+
+The two levels are tied by the invariant `f_cpu_compute + f_prefetch_compute = f_cpu_store_m`: storage decides which weights are CPU-resident; dispatch decides how those bytes are used each forward — CPU-computed or streamed to GPU via the prefetch path. The matched-index invariant between MLP1 (col-parallel) and MLP2 (row-parallel) is satisfied automatically under uniform dispatch, so the intermediate activation stays device-local through the MLP block.
+
+### 5.3 Decision variables
+
+Per model `m ∈ {generator, verifier}`:
+
+- `f_cpu_store_m ∈ [0, 1]` — single scalar applied uniformly to {WQKV, MLP1, MLP2}; WO is fixed at 0 (not offloaded in Phase 1/2)
+- `KV_gpu_bytes_m`, `KV_cpu_bytes_m` — per-tier KV pool sizes
+
+Plus a derived dispatch table: one `(f_cpu_compute, f_prefetch_compute)` pair per `BatchDescriptor` per model, applied uniformly across WQKV/MLP1/MLP2.
+
+### 5.4 Constraints
+
+```
+Σ_m (W_gpu_m + KV_gpu_m + |B_prefetch_m|) ≤ VRAM_budget
+Σ_m (W_cpu_m + KV_cpu_m)                  ≤ Host_RAM_budget
+f_cpu_compute + f_prefetch_compute = f_cpu_store_m     (per bucket)
+KV_gpu_m + KV_cpu_m ≥ n × max_context × kv_bytes_per_token_m
+```
+
+### 5.5 Performance model
+
+Per step, per sub-module (WQKV, WO, MLP1, MLP2), three paths run concurrently:
+
+- **GPU path**: GPU compute on `(1 − f_cpu_compute − f_prefetch_compute)` of the weight, from `gpu_layer_timing`.
+- **Prefetch path**: PCIe H2D of `f_prefetch_compute × weight_bytes` (from `pcie_h2d_bw`), then GPU compute on the prefetched slice.
+- **CPU path**: CPU GEMM on `f_cpu_compute × weight_bytes` (from `cpu_gemm_curve`), plus activation round-trip.
+
+Per-sub-module critical path: `t = max(t_gpu, t_prefetch, t_cpu_compute)`. Plus attention-path cost when attention offload is active (GPU prefix attention + CPU suffix attention + merge via online softmax). Layer time is the sum over sub-modules; decode wall-clock is layer time × num_layers × num_decode_tokens.
+
+### 5.6 Objective and solution method
+
+**Two-stage optimization**:
+
+1. *Placement stage* — per model, minimize representative-bucket decode wall-clock subject to constraints. Representative bucket for generator is small `num_tokens` (≈ `n`); for verifier is medium (≈ `n × tokens_per_step`).
+2. *Dispatch stage* — for each captured bucket, closed-form single-scalar solve over `f_cpu` (with `f_prefetch = f_cpu_store − f_cpu`). Small `num_tokens` lean on CPU-compute (hides in GPU idle); medium/large shift toward prefetch (GPU compute-bound). The dispatch is uniform across WQKV/MLP1/MLP2, enabled empirically by uniform CPU μs/MB at decode (`phase0_findings.md §0.2`).
+
+Grid search over the 3–4 placement scalars is tractable (sub-second). See `planner_design.md` for the full formulation.
+
+---
+
+## 6. Scheduler
+
+The Scheduler executes the Planner's output. Its responsibilities:
+
+- **Tier-aware admission** — respects both `KV_gpu` and `KV_cpu` pools.
+- **KV migration** — spills suffix blocks to CPU on beam growth, reclaims on pruning, promotes shared-prefix blocks.
+- **Dispatch lookup** — maps runtime `BatchDescriptor` to the Planner's dispatch entry.
+- **Back-pressure** — signals FastTTS to throttle beam expansion when `KV_cpu` is near full.
+
+Runtime adds no new decisions — batch composition and graph-bucket selection remain with vLLM's existing scheduler and `CudagraphDispatcher`.
+
+See `scheduler_design.md`.
+
+---
+
+## 7. Reference Architecture
 
 ### Qwen2.5 Model Specs
 
@@ -169,112 +253,7 @@ All methods compose to maximize utilization of all available resources.
 | CPU compute (full layer) | 5.8 ms | 6.9 ms | 12.2 ms |
 | **PCIe : GPU ratio** | **~42×** | **~42×** | **~40×** |
 
-The ~40× ratio is the fundamental problem: **pure prefetch cannot hide latency for BF16 decode.**
-
----
-
-## 6. Analysis
-
-### 6.1 Attention Offloading
-
-With attention offloading, GPU KV holds only the shared prefix (e.g., ~0.5 GB for 4096 prefix tokens). All per-beam suffix KV moves to CPU — attention over suffix is computed on CPU in parallel with GPU prefix attention, merged via online softmax. No suffix KV is prefetched to GPU; all PCIe bandwidth is reserved for weight prefetch (see `pcie_bandwidth_allocation_design.md`).
-
-**Tradeoff**: GPU prefix attention time is fixed (shared cache, constant size). As batch size grows, CPU suffix attention time grows proportionally. Beyond a crossover point, CPU attention becomes the bottleneck and the GPU idles after its own attention finishes. **Batch size is our control variable** — if CPU attention becomes too slow, reduce B (more scheduling rounds, each faster). The optimal batch size balances linear layer efficiency gains against CPU attention overhead.
-
-### 6.2 Resident Hybrid: Free GPU Memory (f_cpu ≈ 9%)
-
-For GPU-resident layers, permanently place ~9% of weights on CPU. CPU computes its fraction in parallel with GPU. At small f_cpu, CPU compute fits within GPU idle time (GPU is memory-bound):
-
-```
-Crossover: f_cpu ≤ CPU_BW / (CPU_BW + GPU_BW) + adjustment_for_overhead ≈ 8–10%
-```
-
-| f_cpu | Layer time vs baseline | Memory saved (7B, L=28) |
-|---|---|---|
-| 0% | baseline | 0 |
-| 5% | −3% (faster) | 0.65 GB |
-| **9%** | **~0% (free)** | **1.17 GB** |
-| 15% | +40% | 1.96 GB |
-
-**At f_cpu ≈ 9%: save ~1.2 GB for free.** Universally applicable — even models that fit benefit from increased batch capacity.
-
-### 6.3 Offloaded Hybrid: Freeing More GPU Memory
-
-For offloaded layers (necessity or elective), hybrid compute reduces the PCIe prefetch requirement. This can operate at different granularities (see `weight_offload_design.md` for full comparison):
-
-**Group granularity (vLLM PrefetchOffloader)**: Controlled by **group_size (G)**: with M=1, there are (G−1) resident layers between each offloaded layer, providing hiding time for prefetch.
-
-**Hiding constraint** (with `prefetch_step=1`, `M=1`):
-```
-(G-1) × resident_layer_time ≥ (1-f_cpu) × layer_weight / PCIe_BW
-```
-
-| Group size G | Hiding time (7B) | Min f_cpu | Buffer (1 slot) | # offloaded (L=28) | Memory freed | Decode |
-|---|---|---|---|---|---|---|
-| 4 | 1.5 ms | 93% | 33 MB | 7 | 2.9 GB | 49 ms |
-| 7 | 3.0 ms | 86% | 65 MB | 4 | 1.6 GB | 32 ms |
-| 14 | 6.5 ms | 69% | 144 MB | 2 | 0.7 GB | 22 ms |
-| 28 | 13.5 ms | 36% | 298 MB | 1 | 0.1 GB | 16 ms |
-
-- **Small G**: many offloaded layers, high f_cpu, tiny buffer → maximum memory freed, large latency cost
-- **Large G**: few offloaded layers, lower f_cpu, larger buffer → less freed, near-baseline latency
-
-The ~40× BF16 ratio means offloaded layers always need f_cpu > ~36% (even at G=28) — they can never match resident-layer speed. Uniform f_cpu across all layers is not viable.
-
-**Tensor granularity (our approach)**: Instead of binary per-layer decisions, each sub-module (WQKV, WO, MLP1, MLP2) has independently tuned f_gpu/f_prefetch/f_cpu. This enables:
-- **Variable f_cpu per sub-module**: MLP1 (large, preceded by short WO phase) can have high f_gpu; MLP2 (preceded by long MLP1 phase) can rely more on f_prefetch. The self-bootstrapping pipeline cascades prefetch budgets.
-- **Smaller buffers**: only max(f_prefetch_i × W_i) vs full layer_weight for group granularity.
-- **All PCIe for weight**: sub-layer pipeline dedicates all PCIe to weight prefetch (no KV prefetch contention).
-
-**Elective offloading**: Even models that fit on GPU can offload a few layers. This is a latency-throughput tradeoff: per-step time increases, but larger batch capacity reduces scheduling rounds.
-
-### 6.4 vLLM PrefetchOffloader
-
-Key implementation (`vllm/model_executor/offloader/prefetch.py`):
-
-- **Group-based selection**: `group_size=G`, `num_in_group=M` → offload last M layers per group of G. **Use M=1** — M>1 creates consecutive offloaded layers with no hiding between them, requiring extra buffer slots for no benefit (G=8,M=2 ≡ G=4,M=1 in offload ratio, but worse hiding).
-- **Circular buffer**: `StaticBufferPool` with `prefetch_step` slots. Buffer = `prefetch_step` × per-offloaded-layer GPU weight.
-- **Pipeline**: `wait_prefetch(N)` → compute → `start_prefetch(N + prefetch_step)`. Indices are over **offloaded layers only**. With M=1, `prefetch_step=1` means "1 group ahead" — (G−1) resident layers of natural hiding time.
-- **prefetch_step=1 is sufficient for M=1**. Higher values are only needed for M>1 (consecutive offloaded layers).
-
----
-
-## 7. End-to-End Scenarios
-
-Overhead: ~3 GB (embeddings, activations, prefix KV, framework). All resident layers at f_cpu=9%. Offloaded layers use M=1, P=1; f_cpu set to minimum that hides prefetch for the chosen G.
-
-### 7.1 Qwen2.5-7B (L=28, 14.1 GB)
-
-Fits on GPU. Resident hybrid + attention offloading maximize batch capacity.
-
-| Config | Res | Off | GPU weight | Decode | Free GPU |
-|---|---|---|---|---|---|
-| Baseline | 28 | 0 | 14.1 GB | 15.4 ms | 6.9 GB |
-| **Resident hybrid** | **28** | **0** | **12.9 GB** | **14.7 ms** | **8.1 GB** |
-| + Elective 2 off | 26 | 2 | 12.0 + 0.1 GB | 24.1 ms | 8.9 GB |
-| + Elective 4 off | 24 | 4 | 11.1 + 0.1 GB | 33.5 ms | 9.9 GB |
-
-Elective offloading: +4.7 ms and −424 MB GPU per offloaded layer. Worthwhile when beams exceed batch capacity.
-
-### 7.2 Qwen2.5-14B (L=48, 28 GB)
-
-Must offload. Resident hybrid saves ~2.3 GB but model still exceeds 24 GB.
-
-| Config | Res | Off | GPU weight | Decode | Free GPU |
-|---|---|---|---|---|---|
-| Min offload (7 off) | 41 | 7 | 20.5 + 0.1 GB | 70 ms | 0.4 GB |
-| Partial (13 off) | 35 | 13 | 17.5 + 0.1 GB | 105 ms | 3.4 GB |
-| Full offload | 0 | 48 | 0.1 GB | 300 ms | 20.9 GB |
-
-### 7.3 Qwen2.5-32B (L=64, 64 GB)
-
-Heavy offload. Max ~23 resident layers (887 MB each).
-
-| Config | Res | Off | GPU weight | Decode | Free GPU |
-|---|---|---|---|---|---|
-| Min offload (41 off) | 23 | 41 | 20.4 + 0.2 GB | 476 ms | 0.4 GB |
-| Partial (48 off) | 16 | 48 | 14.2 + 0.2 GB | 546 ms | 6.6 GB |
-| Full offload | 0 | 64 | 0.2 GB | 709 ms | 20.8 GB |
+The ~40× ratio is the fundamental constraint: **pure prefetch cannot hide latency for BF16 decode.** The Planner's CPU-compute path exists because prefetch alone is insufficient.
 
 ---
 
@@ -287,50 +266,84 @@ Heavy offload. Max ~23 resident layers (887 MB each).
 | Cascade attention + online softmax merge | `flash_attn.py:1038`, `merge_attn_states.py` |
 | CPU attention + KV offload | `cpu_attn.py`, `kv_offload/` |
 | Prefetch offloader + circular buffer | `offloader/prefetch.py` |
+| CUDA graph dispatcher | `cudagraph_dispatcher.py` |
 | QKVParallelLinear, MergedColumnParallelLinear | `layers/linear.py` |
 
 ### 8.2 Engineering Gaps
 
-1. Column-parallel weight split + CPU matmul + partial result concat (tensor granularity three-way split)
-2. CPU attention kernel returning per-head LSE values (required for online softmax merge)
-3. CUDA Graph compatibility with CPU compute — `cudaLaunchHostFunc` callbacks (KTransformers approach) to embed CPU task submission in CUDA Graphs. Prerequisite for production vLLM integration.
-4. Per-tensor f_gpu/f_prefetch/f_cpu configuration and sub-layer pipeline scheduling
+1. Mixed col/row weight split at tensor granularity: col-parallel for WQKV/MLP1 (partial-result concat), row-parallel for MLP2 (add-reduce), CPU matmul on both axes, with MLP1↔MLP2 index-set matching for the col→row pipelining save
+2. CPU attention kernel returning per-head LSE (for online softmax merge)
+3. `cudaLaunchHostFunc` glue for CUDA Graph + CPU task co-scheduling (Phase 4)
+4. Per-model, per-bucket `(f_cpu_compute, f_prefetch_compute)` configuration and dispatch
+5. Profiler implementation (schema → cached tables)
+6. Planner implementation (two-stage optimization)
 
-### 8.3 Roadmap
+### 8.3 CUDA Graph Integration
 
-See `implementation_roadmap.md` for the detailed, up-to-date implementation plan.
+vLLM's default `FULL_AND_PIECEWISE` mode captures per-bucket graphs. Our mechanisms integrate via `cudaLaunchHostFunc`:
+
+- Non-attention regions (MLP, QKV/O projections) — CPU-compute and prefetch paths captured inline.
+- Attention regions — same technique for CPU suffix attention; `merge_attn_states` on GPU joins prefix + suffix.
+
+Prototype with `enforce_eager=True`; `cudaLaunchHostFunc` retrofit is a localized swap in `CpuComputeDispatcher` (Phase 4).
+
+### 8.4 Roadmap
+
+See `implementation_roadmap.md`.
 
 ---
 
-## 9. Key Risks
+## 9. Evaluation Plan
+
+### 9.1 Ablations
+
+Attribute gains by enabling one component at a time:
+
+1. **Baseline** — FastTTS + vLLM, no offloading.
+2. **Mechanism-only, manual tuning** — weight + attention offload enabled, placement and dispatch hand-tuned per model.
+3. **+ Planner** — Planner sets placement and dispatch. Expected: matches or beats manual tuning.
+4. **+ Scheduler (tiered KV admission + migration)** — full system.
+
+### 9.2 Workload sweeps
+
+- **`n` sweep**: `n ∈ {1, 4, 16, 64, 256}`. Report throughput, latency, Planner output (`f_cpu_store`, `KV_*_bytes`) per `n`.
+- **Model size sweep**: 7B generator (fits), 14B generator (mandatory offload). Verifier (1.5B) fixed.
+- **Search strategy**: beam search vs best-of-N, to exercise the prefix-sharing asymmetry.
+
+### 9.3 System-paper specifics
+
+- **Planner runtime**: measured wall-clock at launch; target ≤ 1 s.
+- **Dispatch-heuristic vs exhaustive**: on a small bucket set, exhaustive per-bucket optimization vs closed-form heuristic. Verify near-optimality.
+- **What we did NOT make dynamic**: explicit statement (placement + dispatch table are static; runtime scheduling is vLLM's scheduler + our tiered KV policy).
+- **VRAM accounting**: breakdown per ablation — weights, KV pools, prefetch buffer, vLLM overhead.
+
+### 9.4 Accuracy
+
+MATH-500 accuracy across all configurations. Expected: unchanged (mathematical exactness of col-parallel and row-parallel splits, and of the online-softmax merge).
+
+---
+
+## 10. Key Risks
 
 | Risk | Mitigation |
 |---|---|
-| CPU GEMM below theoretical bandwidth | Profile; adjust f_cpu |
-| CPU attention + weight matmul contend for memory BW | Batch size is our control variable — reduce B when CPU saturates |
-| Column-parallel numerical differences | Mathematically exact; unit tests |
-| CUDA Graph breaks with CPU compute (f_cpu) | `cudaLaunchHostFunc` (KTransformers approach) — prerequisite for production. CUDA Graphs can be disabled for prototyping. |
+| CPU GEMM below theoretical bandwidth | Profile measures directly; Planner adapts. |
+| CPU attention bottleneck at long contexts | Batch size clamping via Scheduler; Planner can reduce `KV_cpu_bytes` to force shorter effective suffix. |
+| Column-parallel numerical differences | Mathematically exact; unit tests assert bit-identical. |
+| CUDA Graph incompatibility with CPU compute | `cudaLaunchHostFunc` (KTransformers pattern) is graph-capturable. Prototype with `enforce_eager=True`, retrofit in Phase 4. |
+| Planner solver runtime dominates launch | Closed-form dispatch + small grid outer loop; measured runtime reported. |
 
 ---
 
-## 10. Summary
-
-| | |
-|---|---|
-| **Problem** | BF16 on 24 GB consumer GPU: weights dominate memory, PCIe ~40× slower than GPU compute. TTC needs large batch sizes; vLLM processes excess beams round by round. |
-| **Attention offloading** | Partition KV by topology: prefix on GPU, suffix on CPU. Batch size is the control variable for CPU attention bottleneck. |
-| **Hybrid weight computation** | Column-parallel GPU/CPU split. f_cpu≈9%: CPU computes ~9% of weights for free (hides within GPU idle time). Saves ~1.2 GB. Universal. |
-| **PCIe weight prefetch** | All PCIe → weight prefetch. Small models: replaces f_gpu (frees memory). Large models: replaces f_cpu (reduces latency). No KV prefetch. |
-| **Performance model** | Determines optimal partition fractions (f_gpu, f_prefetch, f_cpu) per sub-module, accounting for generator vs. verifier characteristics. |
-| **Implementation** | See `implementation_roadmap.md` |
-
----
-
-## Detailed Design Documents
+## 11. Detailed Design Documents
 
 | Document | Scope |
 |---|---|
-| `implementation_roadmap.md` | Phased implementation plan with benchmarking, dependencies, and design decisions |
-| `weight_offload_design.md` | Granularity comparison (group/layer/tensor), three-way split, sub-layer pipeline, buffer sizing, CUDA Graph compatibility |
-| `attention_offload_design.md` | KV three-way split, CPU suffix attention, batch size tradeoff, implementation gaps (CPU attention LSE) |
-| `pcie_bandwidth_allocation_design.md` | Why all PCIe goes to weight prefetch — equivalence analysis, model size regimes, no KV prefetch rationale |
+| `profiler_design.md` | Profile schema, methodology, caching |
+| `planner_design.md` | Inputs/outputs, constraints, objective, solution method (primary contribution) |
+| `scheduler_design.md` | Tier-aware admission, KV migration, dispatch lookup |
+| `weight_offload_design.md` | Storage-vs-compute separation, tensor granularity, buffer sizing |
+| `attention_offload_design.md` | CPU suffix attention, KV pool sizing |
+| `pcie_bandwidth_allocation_design.md` | Why 100% PCIe → weight prefetch |
+| `implementation_roadmap.md` | Phased implementation plan |
+| `phase0_findings.md` | First-iteration Profiler output on RTX 4090 + Qwen2.5-7B |

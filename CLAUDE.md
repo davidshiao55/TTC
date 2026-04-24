@@ -4,15 +4,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Master thesis project on **Test-Time Compute (TTC)** optimization for single consumer GPU-CPU systems (target: NVIDIA RTX 4090, 24 GB VRAM). The thesis extends FastTTS (a test-time search framework) with **weight offloading** and **attention offloading** to overcome GPU memory limitations.
+Master thesis project on **Test-Time Compute (TTC)** optimization for single consumer GPU-CPU systems (target: NVIDIA RTX 4090, 24 GB VRAM). The thesis extends FastTTS (a test-time search framework) with hybrid CPU-GPU offloading to overcome GPU memory limitations.
 
 ### Core Problem
 FastTTS assumes model weights stay GPU-resident, which limits max model size to VRAM and bounds batch size/throughput by leftover GPU memory. This project introduces hybrid CPU-GPU offloading to break these constraints.
 
-### Proposed Approach (Three-Pronged Offloading)
-1. **Attention Offloading**: Shared prefix KV cache + attention on GPU; per-beam suffix KV cache + attention on CPU. Merged via online softmax (exact, no approximation). Batch size is the control variable for CPU attention bottleneck.
-2. **Hybrid Weight Computation**: Column-parallel split — f_cpu≈9% computed on CPU in parallel with GPU. At 9%, CPU compute hides within GPU idle time (GPU is memory-BW-bound), so the split is effectively free. Universally applicable. Saves ~1.2 GB for 7B.
-3. **PCIe Weight Prefetch**: Three-way split per sub-module: `W = [W_gpu_permanent | W_gpu_prefetched | W_cpu]`. All PCIe H2D bandwidth dedicated to weight prefetch (no KV prefetch). Small models: replaces f_gpu to free GPU memory. Large models: replaces f_cpu to reduce latency.
+### System Architecture
+
+Three components on three timescales (see `David/Docs/thesis_proposal.md`):
+
+- **Profiler** (offline) — measures HW/model behavior; produces cached tables. See `David/Docs/profiler_design.md`.
+- **Planner** (load-time) — at engine launch, solves for placement + per-`BatchDescriptor` dispatch table from profile + budgets + workload target. **Primary contribution.** See `David/Docs/planner_design.md`.
+- **Scheduler** (runtime) — executes the plan: tier-aware KV admission, KV migration, dispatch lookup. See `David/Docs/scheduler_design.md`.
+
+Three fundamental partitions the components orchestrate:
+
+1. **Weight: 3-way compute split**. Every matmul sub-module (WQKV, WO, MLP1, MLP2) partitions across GPU compute / prefetch-to-GPU / CPU compute paths so GPU, CPU, and PCIe all contribute concurrently. Storage is static (Planner sets `f_cpu_store_m` at load time); compute dispatch is per-`BatchDescriptor` (Planner emits `(f_cpu_compute, f_prefetch_compute)` table, runtime is table lookup). Invariant: `f_cpu_compute + f_prefetch_compute ≤ f_cpu_store`. WQKV uses K/V-biased column assignment (KV-head groups on CPU slice first).
+2. **KV: 2-way pool**. `KV_gpu_bytes` (shared prefix) + `KV_cpu_bytes` (per-beam suffix) per model. Prefix-on-GPU / suffix-on-CPU is a mechanism invariant, not a tunable knob. Prefix attention (GPU) and suffix attention (CPU) run concurrently, merged via online softmax (`merge_attn_states`).
+3. **PCIe H2D: 100% weight prefetch**. No KV prefetch — weight prefetch strictly dominates at every scale. KV spill-to-CPU uses idle PCIe D2H.
 
 The ~40× PCIe:GPU ratio (BF16, small-batch decode) is the fundamental constraint — pure prefetch cannot hide latency for BF16.
 
@@ -147,9 +156,9 @@ These are the existing building blocks in vLLM relevant to the thesis:
 See `David/Docs/implementation_roadmap.md` for the full plan. Summary:
 
 0. **Pre-Implementation Benchmarking** — Validate CPU GEMM throughput, GPU layer timing, PCIe bandwidth, CPU attention latency. Gates all subsequent phases.
-1a. **Resident Hybrid (WO, MLP1, MLP2)** — Column-parallel split at f_cpu≈9%. Python `CpuComputeDispatcher` prototype + `enforce_eager=True`. Frees ~1.2 GB (7B).
-1b+2. **WQKV Split + Attention Offloading** — Split WQKV along Q|K|V dimension: Q on GPU (prefix attention), K/V on CPU (suffix KV cache). CPU attention with LSE + online softmax merge.
-3. **Tensor-Granularity Prefetch** — Per-sub-module three-way split (permanent/prefetch/cpu) with sub-layer pipeline. All PCIe for weight prefetch. Enables 14B+.
+1. **Resident Hybrid Weight Split (all sub-modules)** — Unified column-parallel split for WQKV, WO, MLP1, MLP2. WQKV uses K/V-biased column assignment. Python `CpuComputeDispatcher` prototype + `enforce_eager=True`. Planner emits `f_cpu_store` only (single-entry dispatch). Frees ~1.2 GB (7B) at the phase0-observed ~9% split.
+2. **Attention Offloading** — CPU suffix attention + online softmax merge. Requires CPU attention kernel with per-head LSE. Two-pool KV allocated by Planner (`KV_gpu_bytes`, `KV_cpu_bytes`).
+3. **Tensor-Granularity Prefetch** — Per-sub-module three-way dispatch (permanent/prefetch/cpu) with sub-layer pipeline. Planner gains `f_prefetch_compute` axis per `BatchDescriptor`. Enables 14B+.
 4. **End-to-End Benchmarking** — RTX 4090: 7B / 14B across all configurations.
 5. **CUDA Graph Integration** — Port KTransformers `CPUInfer` + `cudaLaunchHostFunc` pattern. Swap `CpuComputeDispatcher` internals; forward pass unchanged.
 
@@ -161,7 +170,7 @@ See `David/Docs/implementation_roadmap.md` for the full plan. Summary:
 ## Key Technical Constraints
 
 - Target BF16 weights (no quantization) — PCIe:GPU ratio ~40× makes pure prefetch infeasible.
-- Optimal resident `f_cpu` ≈ 9% — universal across all model sizes; CPU compute hides within GPU idle time (GPU is memory-BW-bound). Beyond ~10%, latency increases sharply.
+- Placement fractions are Planner outputs, not universal constants. `f_cpu_store` is per-model (load-time); `f_cpu_compute` is per-`BatchDescriptor` (per-bucket). `~9%` is the observed optimum at B=1 decode on RTX 4090 + Qwen2.5-7B BF16; see `David/Docs/phase0_findings.md`.
 - Column-parallel weight splits are mathematically exact — verify with unit tests.
 - All PCIe H2D bandwidth goes to weight prefetch; no KV prefetch (see `David/Docs/pcie_bandwidth_allocation_design.md`).
 - CUDA Graph compatibility via `cudaLaunchHostFunc` is deferred to Phase 5; prototype with `enforce_eager=True`. `CpuComputeDispatcher` abstraction ensures the retrofit is localized.
@@ -172,8 +181,12 @@ Detailed analysis lives in `David/Docs/`:
 
 | Document | Scope |
 |---|---|
-| `thesis_proposal.md` | Full proposal: problem, approach, analysis |
-| `implementation_roadmap.md` | Phased implementation plan, dependencies, design decisions |
-| `weight_offload_design.md` | Granularity comparison, three-way split, sub-layer pipeline, buffer sizing |
-| `attention_offload_design.md` | KV topology split, CPU suffix attention, batch size tradeoff |
+| `thesis_proposal.md` | Full proposal: problem, system architecture, offloading strategy |
+| `profiler_design.md` | Profile schema, methodology, caching |
+| `planner_design.md` | Inputs/outputs, constraints, objective, solution method (primary contribution) |
+| `scheduler_design.md` | Tier-aware admission, KV migration, dispatch lookup |
+| `implementation_roadmap.md` | Phased implementation plan, phase-to-component mapping |
+| `weight_offload_design.md` | Storage-vs-compute separation, tensor granularity, buffer sizing |
+| `attention_offload_design.md` | Two-pool KV, CPU suffix attention, batch size tradeoff |
 | `pcie_bandwidth_allocation_design.md` | Why all PCIe goes to weight prefetch |
+| `phase0_findings.md` | First-iteration Profiler output on RTX 4090 + Qwen2.5-7B |

@@ -137,9 +137,11 @@ Naive layer-level prefetch offloading is fundamentally incompatible with BF16 de
 - CUDA graph replay serializes the stall into every step
 - More layers offloaded = more stalls = worse throughput, while KV cache gains are marginal
 
-## 5. Summary and Implications for Thesis
+## 5. Profiler-Informed Constraints
 
-### The Problem Chain (Confirmed)
+These benchmarks characterize the constraints the Profiler must model and the Planner must reason about (see `profiler_design.md`, `planner_design.md`).
+
+### KV Pressure is the Dominant Bottleneck
 
 ```
 Large model weights (14 GiB for 7B BF16)
@@ -148,24 +150,27 @@ Large model weights (14 GiB for 7B BF16)
   → Lower throughput (7,435 vs 9,369 tok/s = 20% loss)
 ```
 
-### Why Naive Offloading Fails
+Consequence: the Planner's objective must weight KV pool capacity seriously — freeing GPU memory for more KV enables more beams per step and reduces total search wall-clock.
 
-The existing vLLM prefetch offloader moves entire layers to CPU and streams them back. For BF16:
+### Naive Layer-Level Prefetch is Infeasible at BF16
+
+The vLLM PrefetchOffloader benchmarks confirm the ~10× PCIe:GPU mismatch:
 - Transfer cost: ~500 MB/layer × 20 ms
 - Compute cost: ~2 ms/layer (decode batch)
-- **Transfer is 10x slower than compute — overlap is impossible**
+- **Transfer is 10× slower than compute — overlap is impossible at layer granularity**
 
-### Why Hybrid Weight Computation Should Work
+This rules out whole-layer offloading for BF16 decode. The Planner's prefetch decisions must operate at **tensor granularity** (sub-module level), where smaller transfers can hide in preceding compute. See `weight_offload_design.md` and `pcie_bandwidth_allocation_design.md`.
 
-Instead of transferring full layer weights (500 MB), split the weight matrix:
-- 90% stays on GPU, computed normally
-- 10% on CPU, computed via CPU matmul
+### Why Tensor-Granularity CPU Compute Works
+
+Instead of transferring full layer weights (500 MB), the column-parallel split:
+- ~90% stays on GPU, computed normally
+- ~10% on CPU, computed via `F.linear`
 - Only **activation results** (~300 KB) transfer CPU→GPU
 
-This eliminates the PCIe bottleneck:
-- No large weight transfers
-- Activation transfers are 1000x smaller than weight transfers
+This eliminates the PCIe-weight-transfer bottleneck entirely for the CPU-compute path:
+- No large weight transfers per step
+- Activation transfers are ~1000× smaller than weight transfers
 - CPU and GPU compute in parallel on their respective weight portions
-- Transfer uses opposite PCIe direction from any weight prefetch (full duplex)
 
-Expected outcome: freeing ~10% of weights across 28 layers = ~1.4 GiB more KV cache, with minimal latency impact (~10% from the CPU compute path).
+The Planner's dispatch table (§`planner_design.md` §4) uses this mechanism in buckets where GPU has idle time (memory-BW-bound decode), and falls back to prefetch in buckets where GPU is compute-bound.

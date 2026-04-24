@@ -1,0 +1,41 @@
+name: aime
+output_dir: benchmark_results/7B-instruct/aime/beam_search/fasttts_kvoff/
+
+dataset:
+  name: HuggingFaceH4/aime_2024
+  split: train
+
+enable_spec_diff: true
+offload_enabled: false
+prefix_aware_scheduling: true
+
+# Generator
+generator_model:
+  model: "Qwen/Qwen2.5-7B-Instruct"
+  max_model_len: 8192
+  gpu_memory_utilization: 0.74
+  tensor_parallel_size: 1
+  enable_prefix_caching: true
+  seed: 42
+  # V1 CPU KV offload — extends GPU prefix cache into pinned CPU memory.
+  # Sized to absorb the eviction footprint at N=256 on a 24 GB RTX 4090.
+  kv_offloading_size: 32.0
+  kv_offloading_backend: native
+
+# Verifier (Skywork PRM, 1.5B, fixed)
+verifier_model:
+  model: "Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B"
+  gpu_memory_utilization: 0.16
+  tensor_parallel_size: 1
+  enable_prefix_caching: true
+  seed: 42
+  kv_offloading_size: 8.0
+  kv_offloading_backend: native
+
+search_config:
+  approach: beam_search
+  beam_width: 4
+  n: 4
+  num_iterations: 40
+  temperature: 0.7
+  spec_truncation_ratio: 0.0  # R=0 for true vanilla beam equivalence (paper §4.1.1)

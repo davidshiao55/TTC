@@ -91,12 +91,16 @@ def _dynamic_branching_duplicate_beams(state: SearchState, tokenizer):
                 duplicate.parent_id = beam.beam_id
                 duplicate.born_at_iteration = i
                 if beam.pending_steps:
-                    first_text = truncate_sentence_by_tokens(
-                        beam.pending_steps[0].text, tokenizer
-                    )
-                    duplicate.pending_steps = [
-                        StepChunk(text=first_text, is_complete_step=False, terminal=False)
-                    ]
+                    if config.spec_truncation_ratio <= 0.0:
+                        duplicate.pending_steps = []
+                    else:
+                        first_text = truncate_sentence_by_tokens(
+                            beam.pending_steps[0].text, tokenizer,
+                            mean_ratio=config.spec_truncation_ratio,
+                        )
+                        duplicate.pending_steps = [
+                            StepChunk(text=first_text, is_complete_step=False, terminal=False)
+                        ]
                     duplicate.scores = beam.scores[:i]
                     duplicate.step_hashes = beam.step_hashes[:i]
                 final_beams.append(duplicate)

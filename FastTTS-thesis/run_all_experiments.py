@@ -31,11 +31,35 @@ from matplotlib.patches import Patch
 # Configuration — thesis experimental setup
 # ============================================================================
 
-GENERATORS = ["7B-instruct", "1.5B-instruct"]
-DATASETS = ["math500", "aime"]
-METHODS = ["fasttts", "baseline"]
-# N=1 is the "no TTC" reference point (single CoT chain, beam_width=1).
-# At N=1 there's no pruning, so all four metrics collapse to the same value.
+GENERATORS = ["7B-instruct"]
+DATASETS = ["aime", "math500"]
+
+# Two experimental axes. Each run is a (search_strategy, optimization) pair.
+# Config layout: configs/{gen}/{dataset}/{strategy}/{optimization}/n{N}.yaml
+#
+# Only the fasttts optimization variant runs: (beam_search, baseline) is the
+# un-optimized reference for full fasttts, and comparing against it would
+# just duplicate the thesis's own internal ablation. The thesis's primary
+# comparison is FastTTS (beam_search + SBE + prefix-aware + asymmetric
+# memory) vs. BoN. (best_of_n, baseline) is also omitted: for BoN the only
+# difference between baseline and fasttts yamls is the memory split, since
+# SBE and prefix-aware scheduling are no-ops for a single-call strategy.
+COMBO_ORDER_KEYS: List[Tuple[str, str]] = [
+    ("beam_search", "fasttts"),
+    ("best_of_n", "fasttts"),
+]
+
+# Display labels shown in plot legends and DataFrame columns. Both runs
+# apply the fasttts optimization; the axis that actually differs is the
+# search strategy, so labels name the strategy.
+COMBO_DISPLAY_MAP: Dict[Tuple[str, str], str] = {
+    ("beam_search", "fasttts"): "Beam Search",
+    ("best_of_n", "fasttts"): "BoN",
+}
+COMBO_ORDER: List[str] = [COMBO_DISPLAY_MAP[k] for k in COMBO_ORDER_KEYS]
+
+# N=1 is the "no TTC" reference point (single CoT chain). For beam_search
+# at N=1 there's no pruning; for best_of_n at N=1 it's a single greedy sample.
 N_VALUES = [1, 4, 16, 64, 256]
 
 BENCHMARK_DIR = Path(__file__).parent / "benchmarks"
@@ -43,11 +67,20 @@ DEFAULT_DATA_DIR = BENCHMARK_DIR / "benchmark_results"
 FIGURES_DIR = Path(__file__).parent / "figures"
 ACCURACY_EVAL_DIR = Path(__file__).parent / "accuracy_evaluation"
 
-METHOD_DISPLAY_MAP = {"baseline": "Baseline", "fasttts": "FastTTS"}
-METHOD_ORDER = ["Baseline", "FastTTS"]
 PROBLEM_LIMITS = {"aime": 30, "amc": 40, "math500": 500}
 
 _N_IN_FILENAME = re.compile(r"_n(\d+)_")
+
+
+def _combo_key(strategy: str, optimization: str) -> str:
+    """Flat string key used in nested result dicts (JSON-friendly)."""
+    return f"{strategy}/{optimization}"
+
+
+def _combo_from_key(key: str) -> Tuple[str, str]:
+    """Inverse of :func:`_combo_key`."""
+    strategy, optimization = key.split("/", 1)
+    return strategy, optimization
 
 
 # ============================================================================
@@ -99,9 +132,9 @@ PLOT_STYLE_ACCURACY = {
 def _planned_runs():
     for generator in GENERATORS:
         for dataset in DATASETS:
-            for method in METHODS:
+            for strategy, optimization in COMBO_ORDER_KEYS:
                 for n in N_VALUES:
-                    yield (generator, dataset, method, n)
+                    yield (generator, dataset, strategy, optimization, n)
 
 
 def run_experiments(data_dir: Path):
@@ -114,20 +147,20 @@ def run_experiments(data_dir: Path):
     log_dir.mkdir(parents=True, exist_ok=True)
     os.chdir(BENCHMARK_DIR)
 
-    for generator, dataset, method, n in _planned_runs():
-        config_path = f"configs/{generator}/{dataset}/{method}/n{n}.yaml"
+    for generator, dataset, strategy, optimization, n in _planned_runs():
+        config_path = f"configs/{generator}/{dataset}/{strategy}/{optimization}/n{n}.yaml"
         if not Path(config_path).exists():
             print(f"Config not found: {config_path}, skipping...")
             continue
 
-        label = f"{generator}_{dataset}_{method}_n{n}"
+        label = f"{generator}_{dataset}_{strategy}_{optimization}_n{n}"
         log_file = log_dir / f"{label}.log"
         print(f"\n{'=' * 60}")
-        print(f"Running: {generator}/{dataset}/{method}/n={n}")
+        print(f"Running: {generator}/{dataset}/{strategy}/{optimization}/n={n}")
         print(f"Log:     {log_file}")
         print(f"{'=' * 60}")
 
-        output_dir = data_dir / generator / dataset / method
+        output_dir = data_dir / generator / dataset / strategy / optimization
         output_dir.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
         env["BENCHMARK_OUTPUT_DIR"] = str(output_dir)
@@ -229,16 +262,23 @@ def parse_jsonl_folder(folder_path: Path, dataset: str) -> Dict[str, Dict[str, f
 
 
 def collect_results(data_dir: Path):
-    """Collect results from benchmark output files and compute metrics."""
+    """Collect results from benchmark output files and compute metrics.
+
+    Output shape:
+        results[dataset][generator][combo_key][n] -> metrics
+
+    where ``combo_key`` = ``"{strategy}/{optimization}"``.
+    """
     print(f"Collecting results from {data_dir}...")
     results = {}
     for dataset in DATASETS:
         results[dataset] = {}
         for generator in GENERATORS:
             results[dataset][generator] = {}
-            for method in METHODS:
-                folder = data_dir / generator / dataset / method
-                results[dataset][generator][method] = parse_jsonl_folder(folder, dataset)
+            for strategy, optimization in COMBO_ORDER_KEYS:
+                folder = data_dir / generator / dataset / strategy / optimization
+                key = _combo_key(strategy, optimization)
+                results[dataset][generator][key] = parse_jsonl_folder(folder, dataset)
     return results
 
 
@@ -273,10 +313,10 @@ def run_accuracy_evaluation(eval_script: Path, result_file: Path,
 
 
 def evaluate_accuracy(data_dir: Path):
-    """Evaluate accuracy for every (generator, dataset, method, N) combination.
+    """Evaluate accuracy for every (generator, dataset, combo, N) combination.
 
-    Each N-value result file is a separate beam-search run, so the metric is
-    computed on that file independently.
+    Output shape mirrors ``collect_results``:
+        accuracy_results[dataset][generator][combo_key] -> List[per-N dict]
     """
     print(f"Evaluating accuracy from {data_dir}...")
     accuracy_json_path = data_dir / "accuracy.json"
@@ -292,12 +332,12 @@ def evaluate_accuracy(data_dir: Path):
         accuracy_results[dataset] = {}
         for generator in GENERATORS:
             accuracy_results[dataset][generator] = {}
-            for method in METHODS:
-                method_results = _evaluate_method(
-                    data_dir, eval_script, dataset, generator, method,
+            for strategy, optimization in COMBO_ORDER_KEYS:
+                combo_results = _evaluate_combo(
+                    data_dir, eval_script, dataset, generator, strategy, optimization,
                 )
-                if method_results:
-                    accuracy_results[dataset][generator][method] = method_results
+                if combo_results:
+                    accuracy_results[dataset][generator][_combo_key(strategy, optimization)] = combo_results
 
     if accuracy_results:
         os.makedirs(data_dir, exist_ok=True)
@@ -308,15 +348,26 @@ def evaluate_accuracy(data_dir: Path):
     return accuracy_results
 
 
-def _evaluate_method(
-    data_dir: Path, eval_script: Path, dataset: str, generator: str, method: str,
+def _evaluate_combo(
+    data_dir: Path, eval_script: Path, dataset: str, generator: str,
+    strategy: str, optimization: str,
 ) -> List[dict]:
-    result_dir = data_dir / generator / dataset / method
-    method_results = []
-    # N=1 uses beam_width=1, others use beam_width=4 — glob to tolerate either.
-    suffix = "_specdiff" if method == "fasttts" else ""
+    """Glob all per-N result files for one (strategy, optimization) combo and
+    run the accuracy evaluator on each.
+    """
+    result_dir = data_dir / generator / dataset / strategy / optimization
+    combo_results = []
+
+    # `_specdiff` suffix only fires when SBE actually activated at runtime —
+    # that's beam_search/fasttts only. BoN/fasttts keeps enable_spec_diff=false
+    # (SBE is a no-op without an iteration loop), so its filenames carry no
+    # suffix. `_iter*` widens across beam_search's iter10 vs BoN's default
+    # iter40; `_n{n}_` keeps each file uniquely identified by N.
+    is_sbe_active = (strategy == "beam_search" and optimization == "fasttts")
+    suffix = "_specdiff" if is_sbe_active else ""
+
     for n in N_VALUES:
-        glob_pat = f"{dataset}_bw*_n{n}_iter10{suffix}_results.jsonl"
+        glob_pat = f"{dataset}_bw*_n{n}_iter*{suffix}_results.jsonl"
         matches = list(result_dir.glob(glob_pat))
         if not matches:
             print(f"Result not found: {result_dir}/{glob_pat}")
@@ -324,12 +375,12 @@ def _evaluate_method(
         eval_data = run_accuracy_evaluation(eval_script, matches[0])
         if eval_data and "result" in eval_data:
             r = eval_data["result"]
-            method_results.append(r)
+            combo_results.append(r)
             print(
-                f"{dataset}/{generator}/{method} N={r['n']}: "
+                f"{dataset}/{generator}/{strategy}/{optimization} N={r['n']}: "
                 f"pass@n={r['pass_at_n']}% pass@1={r['pass_at_1']}%"
             )
-    return method_results
+    return combo_results
 
 
 # ============================================================================
@@ -341,17 +392,21 @@ def _build_records_df(
     metric_extractor,
     min_n_values: int = 2,
 ) -> pd.DataFrame:
-    """Flatten nested ``data[dataset][generator][method][n] -> metrics`` into a DataFrame.
+    """Flatten ``data[dataset][generator][combo_key][n] -> metrics`` into a DataFrame.
 
-    ``metric_extractor(metrics: dict) -> dict`` pulls the columns relevant
-    to a specific plot; the caller receives a DataFrame indexed by
-    ``(Dataset, Combination, Method, n)`` plus whatever extractor returns.
+    Columns: Dataset, Combination (= generator), Strategy, Optimization,
+    Method (= display label), n, plus whatever ``metric_extractor`` returns.
     """
     records = []
     for dataset, generators in data.items():
-        for generator, methods in generators.items():
-            for method, n_values in methods.items():
-                if method not in METHOD_DISPLAY_MAP:
+        for generator, combos in generators.items():
+            for combo_key, n_values in combos.items():
+                try:
+                    strategy, optimization = _combo_from_key(combo_key)
+                except ValueError:
+                    continue
+                display = COMBO_DISPLAY_MAP.get((strategy, optimization))
+                if display is None:
                     continue
                 if len(n_values) < min_n_values:
                     continue
@@ -359,7 +414,9 @@ def _build_records_df(
                     record = {
                         "Dataset": dataset.upper(),
                         "Combination": generator,
-                        "Method": METHOD_DISPLAY_MAP[method],
+                        "Strategy": strategy,
+                        "Optimization": optimization,
+                        "Method": display,
                         "n": int(n),
                     }
                     record.update(metric_extractor(metrics))
@@ -397,6 +454,12 @@ def _lighten(color, amount=0.45) -> Tuple[float, float, float]:
     return tuple(1 - amount * (1 - c))
 
 
+def _combo_palette() -> Dict[str, Tuple[float, float, float]]:
+    """Display label → base color, one per (strategy, optimization) combo."""
+    palette = sns.color_palette(n_colors=len(COMBO_ORDER))
+    return {label: palette[i] for i, label in enumerate(COMBO_ORDER)}
+
+
 # ============================================================================
 # Plot: goodput
 # ============================================================================
@@ -424,10 +487,7 @@ def plot_goodput(data, output_path):
     )
     axes = axes.flatten()
 
-    color_palette = {
-        "Baseline": sns.color_palette()[0],
-        "FastTTS": sns.color_palette()[1],
-    }
+    color_palette = _combo_palette()
 
     ax_idx = 0
     for i, dataset in enumerate(datasets):
@@ -439,7 +499,7 @@ def plot_goodput(data, output_path):
             sns.lineplot(
                 data=subset, x="n", y="Goodput", hue="Method", style="Method",
                 ax=ax, marker="o", markersize=16, linewidth=4.5, legend=False,
-                hue_order=METHOD_ORDER, style_order=METHOD_ORDER, palette=color_palette,
+                hue_order=COMBO_ORDER, style_order=COMBO_ORDER, palette=color_palette,
             )
             if j == len(combos) // 2:
                 ax.set_title(f"{dataset}", fontsize=32, fontweight="bold")
@@ -456,12 +516,13 @@ def plot_goodput(data, output_path):
     _draw_dataset_separators(fig, axes, dataset_split_indices, x_offset=0.013)
 
     legend_elements = [
-        Patch(facecolor=sns.color_palette()[0], edgecolor="k", label="Baseline"),
-        Patch(facecolor=sns.color_palette()[1], edgecolor="k", label="FastTTS"),
+        Patch(facecolor=color_palette[label], edgecolor="k", label=label)
+        for label in COMBO_ORDER
     ]
     fig.legend(
         handles=legend_elements, loc="lower center",
-        bbox_to_anchor=(0.515, -0.07), ncol=2, title="", fontsize=35,
+        bbox_to_anchor=(0.515, -0.07), ncol=len(COMBO_ORDER), title="",
+        fontsize=30,
     )
     plt.tight_layout()
     _save_figure(output_path)
@@ -472,7 +533,12 @@ def plot_goodput(data, output_path):
 # ============================================================================
 
 def plot_latency(data, output_path):
-    """Generator + verifier latency per N as a grouped bar chart."""
+    """Generator + verifier latency per N as a grouped bar chart.
+
+    For each N-group on the x-axis, we draw ``2*k`` bars where
+    ``k = len(COMBO_ORDER)``: one generator bar per combo, then one verifier
+    bar per combo (the verifier is twin-colored and hatched).
+    """
     df = _build_records_df(
         data,
         lambda m: {
@@ -488,9 +554,19 @@ def plot_latency(data, output_path):
     plt.style.use("seaborn-v0_8-whitegrid")
     plt.rcParams.update(PLOT_STYLE_LATENCY)
 
-    base_color = sns.color_palette()[0]
-    fasttts_color = sns.color_palette()[1]
-    colors = [base_color, _lighten(base_color), fasttts_color, _lighten(fasttts_color)]
+    color_palette = _combo_palette()
+    k = len(COMBO_ORDER)
+
+    # Half-integer offsets centered on 0 for 2*k bars per group.
+    offsets = np.linspace(-(2 * k - 1) / 2, (2 * k - 1) / 2, 2 * k)
+    bar_width = min(0.18, 0.8 / (2 * k))
+
+    # Stack order: gen-combo1, gen-combo2, …, ver-combo1, ver-combo2, …
+    bar_colors = [color_palette[label] for label in COMBO_ORDER] + \
+                 [_lighten(color_palette[label]) for label in COMBO_ORDER]
+    hatches = [None] * k + ["//"] * k
+    labels = [f"{label} Generator" for label in COMBO_ORDER] + \
+             [f"{label} Verifier" for label in COMBO_ORDER]
 
     combos_per_dataset = _combos_per_dataset(df, datasets)
     total_axes = sum(len(c) for c in combos_per_dataset)
@@ -501,14 +577,6 @@ def plot_latency(data, output_path):
     )
     axes = axes.flatten()
 
-    offsets = [-1.5, -0.5, 0.5, 1.5]
-    bar_colors = [colors[0], colors[2], colors[1], colors[3]]
-    hatches = [None, None, "//", "//"]
-    labels = [
-        "Baseline Generator", "FastTTS Generator",
-        "Baseline Verifier", "FastTTS Verifier",
-    ]
-
     ax_idx = 0
     for dataset_idx, dataset in enumerate(datasets):
         dataset_df = df[df["Dataset"] == dataset]
@@ -517,28 +585,26 @@ def plot_latency(data, output_path):
             ax = axes[ax_idx]
             subset = dataset_df[dataset_df["Combination"] == combo].sort_values("n")
             n_vals = sorted(subset["n"].unique())
-            bar_width = 0.18
             x = np.arange(len(n_vals))
 
-            # Stack: Baseline-gen, FastTTS-gen, Baseline-ver, FastTTS-ver
-            bar_vals = []
-            for method in METHOD_ORDER:
+            bar_vals: List[np.ndarray] = []
+            for method in COMBO_ORDER:  # generator bars
                 d = subset[subset["Method"] == method].set_index("n").reindex(n_vals)
                 bar_vals.append(d["mean_generator_latency"].values)
-            for method in METHOD_ORDER:
+            for method in COMBO_ORDER:  # verifier bars
                 d = subset[subset["Method"] == method].set_index("n").reindex(n_vals)
                 bar_vals.append(d["mean_verifier_latency"].values)
 
-            for k in range(4):
+            for bi in range(2 * k):
                 ax.bar(
-                    x + offsets[k] * bar_width,
-                    bar_vals[k],
+                    x + offsets[bi] * bar_width,
+                    bar_vals[bi],
                     width=bar_width,
-                    color=bar_colors[k],
+                    color=bar_colors[bi],
                     edgecolor="black",
                     linewidth=1.2,
-                    hatch=hatches[k],
-                    label=labels[k] if ax_idx == 0 else None,
+                    hatch=hatches[bi],
+                    label=labels[bi] if ax_idx == 0 else None,
                     zorder=2,
                 )
 
@@ -560,15 +626,16 @@ def plot_latency(data, output_path):
     _draw_dataset_separators(fig, axes, dataset_split_indices, x_offset=0.0155)
 
     legend_elements = [
-        Patch(facecolor=base_color, edgecolor="k", label="Baseline"),
-        Patch(facecolor=fasttts_color, edgecolor="k", label="FastTTS"),
+        Patch(facecolor=color_palette[label], edgecolor="k", label=label)
+        for label in COMBO_ORDER
+    ] + [
         Patch(facecolor="w", edgecolor="k", label="Generator"),
         Patch(facecolor="w", edgecolor="k", hatch="//", label="Verifier"),
     ]
     fig.legend(
         handles=legend_elements, loc="lower center",
-        bbox_to_anchor=(0.525, -0.06), ncol=4, frameon=False,
-        borderaxespad=0.2, handletextpad=0.6, columnspacing=0.8, fontsize=30,
+        bbox_to_anchor=(0.525, -0.06), ncol=len(legend_elements), frameon=False,
+        borderaxespad=0.2, handletextpad=0.6, columnspacing=0.8, fontsize=26,
     )
     plt.tight_layout()
     _save_figure(output_path)
@@ -590,53 +657,73 @@ _ACCURACY_METRIC_MARKERS = {
     "pass_at_n": "s",
     "pass_at_1": "D",
 }
-# fasttts: solid + filled; baseline: dashed + hollow.
-_ACCURACY_METHOD_STYLES = {
-    "fasttts": dict(linestyle="-", linewidth=2.5, markersize=8, markerfacecolor=None),
-    "baseline": dict(linestyle="--", linewidth=2.0, markersize=8, markerfacecolor="white"),
+
+# Visual distinction per (strategy, optimization) combo. The `fill` flag
+# controls whether the marker face is filled with the metric color (True) or
+# left hollow/white (False). Line style distinguishes the combos at a glance.
+_ACCURACY_COMBO_STYLES: Dict[Tuple[str, str], Dict[str, Any]] = {
+    ("beam_search", "fasttts"):  dict(linestyle="-",  linewidth=2.5, markersize=8, fill=True),
+    ("best_of_n", "fasttts"):    dict(linestyle="-.", linewidth=2.5, markersize=8, fill=True),
 }
 
 
-def _collect_accuracy_panels(accuracy_data) -> List[Tuple[str, str, List[dict], List[dict]]]:
+def _collect_accuracy_panels(
+    accuracy_data,
+) -> List[Tuple[str, str, Dict[Tuple[str, str], List[dict]]]]:
+    """Flatten ``accuracy_data`` → one (dataset, generator, combo_results) triple per panel.
+
+    ``combo_results`` maps ``(strategy, optimization)`` → list of per-N eval dicts.
+    """
     panels = []
     for dataset in accuracy_data:
         for generator in accuracy_data[dataset]:
-            methods = accuracy_data[dataset][generator]
-            fasttts = methods.get("fasttts") or []
-            baseline = methods.get("baseline") or []
-            if fasttts or baseline:
-                panels.append((dataset, generator, fasttts, baseline))
+            combo_results: Dict[Tuple[str, str], List[dict]] = {}
+            for combo_key, results in accuracy_data[dataset][generator].items():
+                if not results:
+                    continue
+                try:
+                    combo = _combo_from_key(combo_key)
+                except ValueError:
+                    continue
+                if combo in COMBO_DISPLAY_MAP:
+                    combo_results[combo] = results
+            if combo_results:
+                panels.append((dataset, generator, combo_results))
     return panels
 
 
-def _draw_accuracy_panel(ax, fasttts_res, baseline_res) -> List[int]:
+def _draw_accuracy_panel(
+    ax, combo_results: Dict[Tuple[str, str], List[dict]],
+) -> List[int]:
     all_n_vals = set()
-    for method_name, results in [("fasttts", fasttts_res), ("baseline", baseline_res)]:
+    for combo_key in COMBO_ORDER_KEYS:  # draw in consistent order
+        results = combo_results.get(combo_key)
         if not results:
             continue
         results = sorted(results, key=lambda r: r["n"])
         n_vals = [r["n"] for r in results]
         all_n_vals.update(n_vals)
-        mstyle = _ACCURACY_METHOD_STYLES[method_name]
-        method_label_short = "FastTTS" if method_name == "fasttts" else "Baseline"
+        mstyle = _ACCURACY_COMBO_STYLES[combo_key]
+        combo_label = COMBO_DISPLAY_MAP[combo_key]
         for metric_key, metric_label in _ACCURACY_METRIC_LABELS.items():
             vals = [r[metric_key] for r in results]
-            kwargs = dict(mstyle)
-            if method_name == "fasttts":
-                kwargs["markerfacecolor"] = _ACCURACY_METRIC_COLORS[metric_key]
+            kwargs = {k: v for k, v in mstyle.items() if k != "fill"}
+            kwargs["markerfacecolor"] = (
+                _ACCURACY_METRIC_COLORS[metric_key] if mstyle["fill"] else "white"
+            )
             ax.plot(
                 n_vals, vals,
                 color=_ACCURACY_METRIC_COLORS[metric_key],
                 marker=_ACCURACY_METRIC_MARKERS[metric_key],
                 markeredgecolor=_ACCURACY_METRIC_COLORS[metric_key],
-                label=f"{metric_label} ({method_label_short})",
+                label=f"{metric_label} ({combo_label})",
                 **kwargs,
             )
     return sorted(all_n_vals)
 
 
 def plot_accuracy(accuracy_data, output_path):
-    """One panel per (dataset, generator), overlaying pass@n and pass@1 (PRM-Vote)."""
+    """One panel per (dataset, generator), overlaying pass@n + pass@1 per combo."""
     plt.rcParams.update(PLOT_STYLE_ACCURACY)
 
     panels = _collect_accuracy_panels(accuracy_data)
@@ -650,14 +737,14 @@ def plot_accuracy(accuracy_data, output_path):
     _, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 5 * nrows), squeeze=False)
     axes = axes.flatten()
 
-    for ax, (dataset, generator, fasttts_res, baseline_res) in zip(axes, panels):
-        sorted_n = _draw_accuracy_panel(ax, fasttts_res, baseline_res)
+    for ax, (dataset, generator, combo_results) in zip(axes, panels):
+        sorted_n = _draw_accuracy_panel(ax, combo_results)
         ax.set_xscale("log", base=2)
         ax.set_xlabel("N (completions)")
         ax.set_ylabel("Accuracy (%)")
         ax.set_title(f"{dataset.upper()} — {generator}")
         ax.grid(True, alpha=0.3)
-        ax.legend(loc="lower right", framealpha=0.9, ncol=2)
+        ax.legend(loc="lower right", framealpha=0.9, ncol=2, fontsize=7)
         ax.set_xticks(sorted_n)
         ax.set_xticklabels([str(n) for n in sorted_n])
 

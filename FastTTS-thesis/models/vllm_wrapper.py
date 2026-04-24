@@ -118,6 +118,179 @@ def _handle_decode(ctx, request):
     return {"text": ctx.tokenizer.decode(request["token_ids"])}
 
 
+class _CacheStatsAcc:
+    """Running sum of PrefixCacheStats across engine steps."""
+    __slots__ = ("queries", "hits", "requests")
+
+    def __init__(self):
+        self.queries = 0
+        self.hits = 0
+        self.requests = 0
+
+    def add(self, s) -> None:
+        if s is None:
+            return
+        self.queries += getattr(s, "queries", 0) or 0
+        self.hits += getattr(s, "hits", 0) or 0
+        self.requests += getattr(s, "requests", 0) or 0
+
+    def to_dict(self) -> dict:
+        return {"queries": self.queries, "hits": self.hits, "requests": self.requests}
+
+
+class _TransferStatsAcc:
+    """Running sum of KV transfer bytes/time across engine steps."""
+
+    def __init__(self):
+        self.by_type: dict[str, dict] = {}  # e.g. "cpu_to_gpu" -> {bytes, time_s, count}
+
+    def add(self, kv_connector_stats) -> None:
+        """Accumulate from SchedulerStats.kv_connector_stats (a dict or None)."""
+        if not kv_connector_stats:
+            return
+        for transfer_type, ops in kv_connector_stats.items():
+            if not isinstance(ops, list):
+                continue
+            if transfer_type not in self.by_type:
+                self.by_type[transfer_type] = {"bytes": 0, "time_s": 0.0, "count": 0}
+            acc = self.by_type[transfer_type]
+            for op in ops:
+                acc["bytes"] += op.get("op_size", 0) if isinstance(op, dict) else 0
+                acc["time_s"] += op.get("op_time", 0) if isinstance(op, dict) else 0
+                acc["count"] += 1
+
+    def to_dict(self) -> dict | None:
+        return self.by_type if self.by_type else None
+
+
+class _BatchStatsAcc:
+    """Per-step histogram of scheduler batch sizes.
+
+    Populated from SchedulerStats.num_running_reqs / num_waiting_reqs /
+    kv_cache_usage on every make_stats() call. Useful for answering
+    "how many beams were actually in-flight concurrently" without adding
+    per-step logging noise.
+    """
+
+    # Right-open bin edges: a step's running_reqs lands in the first bin
+    # whose upper edge is > running_reqs. The implicit final bin catches
+    # anything above the last edge (>=256 under our configs).
+    BINS = (1, 8, 32, 64, 128, 256)
+    BIN_LABELS = ("0", "1-7", "8-31", "32-63", "64-127", "128-255", "256+")
+
+    def __init__(self):
+        self.steps_total = 0
+        self.steps_nonzero = 0  # steps with num_running_reqs > 0
+        self.steps_queued = 0  # steps with num_waiting_reqs > 0 — throttling signal
+        self.running_sum = 0
+        self.running_max = 0
+        self.waiting_sum = 0  # sum over steps_queued, for mean-when-queued
+        self.waiting_max = 0
+        self.kv_usage_max = 0.0
+        self.histogram = [0] * (len(self.BINS) + 1)
+
+    def add(self, stats) -> None:
+        if stats is None:
+            return
+        n_run = getattr(stats, "num_running_reqs", 0) or 0
+        n_wait = getattr(stats, "num_waiting_reqs", 0) or 0
+        kv = getattr(stats, "kv_cache_usage", 0.0) or 0.0
+        self.steps_total += 1
+        if n_run > 0:
+            self.steps_nonzero += 1
+            self.running_sum += n_run
+        if n_wait > 0:
+            self.steps_queued += 1
+            self.waiting_sum += n_wait
+        if n_run > self.running_max:
+            self.running_max = n_run
+        if n_wait > self.waiting_max:
+            self.waiting_max = n_wait
+        if kv > self.kv_usage_max:
+            self.kv_usage_max = kv
+        # Find the first bin edge strictly greater than n_run; if none, land
+        # in the final overflow bucket.
+        idx = len(self.BINS)
+        for i, edge in enumerate(self.BINS):
+            if n_run < edge:
+                idx = i
+                break
+        self.histogram[idx] += 1
+
+    def to_dict(self) -> dict:
+        mean_running = (
+            self.running_sum / self.steps_nonzero if self.steps_nonzero else 0.0
+        )
+        mean_waiting_when_queued = (
+            self.waiting_sum / self.steps_queued if self.steps_queued else 0.0
+        )
+        frac_steps_queued = (
+            self.steps_queued / self.steps_total if self.steps_total else 0.0
+        )
+        return {
+            "steps_total": self.steps_total,
+            "steps_nonzero": self.steps_nonzero,
+            "steps_queued": self.steps_queued,
+            "frac_steps_queued": frac_steps_queued,
+            "mean_running": mean_running,  # mean over non-idle steps
+            "max_running": self.running_max,
+            "mean_waiting_when_queued": mean_waiting_when_queued,
+            "max_waiting": self.waiting_max,
+            "max_kv_usage": self.kv_usage_max,
+            "histogram": dict(zip(self.BIN_LABELS, self.histogram)),
+        }
+
+
+def _install_prefix_cache_accumulator(scheduler) -> None:
+    """Wrap scheduler.make_stats so per-step stats are summed for end-of-run reporting.
+
+    Accumulates four categories:
+    - GPU prefix cache (queries/hits)
+    - CPU prefix cache (queries/hits, from OffloadingConnector)
+    - KV transfer volume (bytes/time per direction, from OffloadingConnectorStats)
+    - Per-step batch sizes (num_running_reqs histogram, KV usage peak)
+
+    All are drained every engine step by make_stats; the wrapper intercepts
+    the returned SchedulerStats and adds to the accumulators.
+    """
+    if getattr(scheduler, "_prefix_cache_acc_installed", False):
+        return
+    scheduler._acc_gpu_prefix = _CacheStatsAcc()
+    scheduler._acc_cpu_prefix = _CacheStatsAcc()
+    scheduler._acc_transfers = _TransferStatsAcc()
+    scheduler._acc_batch = _BatchStatsAcc()
+    original = scheduler.make_stats
+
+    def wrapped(*args, **kwargs):
+        stats = original(*args, **kwargs)
+        if stats is not None:
+            scheduler._acc_gpu_prefix.add(getattr(stats, "prefix_cache_stats", None))
+            scheduler._acc_cpu_prefix.add(getattr(stats, "connector_prefix_cache_stats", None))
+            scheduler._acc_transfers.add(getattr(stats, "kv_connector_stats", None))
+            scheduler._acc_batch.add(stats)
+        return stats
+
+    scheduler.make_stats = wrapped
+    scheduler._prefix_cache_acc_installed = True
+
+
+def _handle_get_run_stats(ctx, request):
+    """Report run-total prefix cache counters, KV transfer volume, batch stats."""
+    scheduler = ctx.model.llm_engine.engine_core.engine_core.scheduler
+    gpu = getattr(scheduler, "_acc_gpu_prefix", None)
+    cpu = getattr(scheduler, "_acc_cpu_prefix", None)
+    xfer = getattr(scheduler, "_acc_transfers", None)
+    batch = getattr(scheduler, "_acc_batch", None)
+    return {
+        "result": {
+            "gpu": gpu.to_dict() if gpu else None,
+            "cpu": (cpu.to_dict() if (cpu and cpu.requests > 0) else None),
+            "transfers": xfer.to_dict() if xfer else None,
+            "batch": batch.to_dict() if batch else None,
+        }
+    }
+
+
 _WORKER_HANDLERS: Dict[str, Callable] = {
     "generate": _handle_generate,
     "score": _handle_score,
@@ -126,6 +299,7 @@ _WORKER_HANDLERS: Dict[str, Callable] = {
     "tokenize": _handle_tokenize,
     "encode": _handle_encode,
     "decode": _handle_decode,
+    "get_run_stats": _handle_get_run_stats,
 }
 
 
@@ -197,6 +371,19 @@ class BaseVLLMModelWrapper(ABC):
             return self.parent_conn.recv().get("tokenizer_info")
         return None
 
+    def get_run_stats(self):
+        """Snapshot per-engine run totals. Should be called once near
+        end-of-run before shutdown. Returns a dict with keys 'gpu', 'cpu',
+        'transfers', 'batch' — each either None or a stats sub-dict.
+        """
+        if self.process:
+            try:
+                self.parent_conn.send({"action": "get_run_stats"})
+                return self.parent_conn.recv().get("result")
+            except (BrokenPipeError, EOFError):
+                return None
+        return None
+
     def shutdown(self):
         if self.process:
             try:
@@ -225,6 +412,15 @@ def _model_process_worker(conn, model_kwargs, model_type):
         _ensure_v1_env()
 
         model = TTSLLM(**model_kwargs)
+        # Wrap make_stats to accumulate prefix-cache counters across steps.
+        # Required because vLLM resets counters on every read (make_stats is
+        # called each engine step), so the raw end-of-run read is ~empty.
+        try:
+            _install_prefix_cache_accumulator(
+                model.llm_engine.engine_core.engine_core.scheduler
+            )
+        except Exception as install_exc:  # non-fatal
+            logger.warning(f"prefix cache accumulator not installed: {install_exc}")
         ctx = WorkerContext(
             model=model,
             tokenizer=model.get_tokenizer(),

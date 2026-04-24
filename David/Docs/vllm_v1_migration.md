@@ -19,23 +19,25 @@ thesis-specific modifications.
 |---|---|
 | `models/tts_llm.py` | Fully migrated to V1 APIs; `__init__` decomposed, score dispatch via registry, `_score_outputs_skywork` split into 3 phases (§8) |
 | `models/generator_engine_v1.py` | New file -- V1 SBE implementation |
-| `models/vllm_wrapper.py` | Updated (`task`->`runner`, `PoolerConfig`); worker now dispatches via `_WORKER_HANDLERS` registry, `ProcessTokenizerWrapper` collapsed via `_rpc` (§8) |
-| `models/reward_utils.py` | Rewritten (tokenizer boundary fix); `DEFAULT_STEP_TOKEN` constant |
-| `config.py` | Extracted `DEFAULT_SYSTEM_PROMPT`, `DEFAULT_GENERATOR_VLLM_CONFIG`, `DEFAULT_VERIFIER_VLLM_CONFIG` module constants; removed duplicate `FastTTSConfig` generation-param fields (§8) |
+| `models/vllm_wrapper.py` | Updated (`task`->`runner`, `PoolerConfig`); worker now dispatches via `_WORKER_HANDLERS` registry, `ProcessTokenizerWrapper` collapsed via `_rpc` (§8); new `get_run_stats` action + public method for per-engine run totals (prefix cache, PCIe transfers, batch-size histogram) (§12c) |
+| `models/reward_utils.py` | Rewritten (tokenizer boundary fix, §6a; tail-truncate runaway newest step, §6f); `DEFAULT_STEP_TOKEN` constant |
+| `benchmarks/benchmark_config.py` | Passes `kv_offloading_size` / `kv_offloading_backend` / `disable_hybrid_kv_cache_manager` through to engine kwargs (§12b) |
+| `config.py` | Extracted `DEFAULT_SYSTEM_PROMPT`, `DEFAULT_GENERATOR_VLLM_CONFIG`, `DEFAULT_VERIFIER_VLLM_CONFIG` module constants; removed duplicate `FastTTSConfig` generation-param fields (§8); `DEFAULT_SYSTEM_PROMPT` replaced with the OpenR/PRM800K short standard prompt (§13); added `SearchConfig.spec_truncation_ratio` (R) with default 0.0 for vanilla equivalence (§6b) |
 | `fasttts.py` | `_SEARCH_STRATEGIES` registry replaces if/elif; `search()` decomposed; `SearchResults` in/out; dead `search_single` / `create_search_config` proxy removed (§8) |
 | `search/beam_search.py` | Fully rewritten (decomposed, StepChunk, step-hash propagation) |
 | `search/beam.py` | Restructured (renamed fields, StepChunk, beam identity) |
-| `search/common.py` | New -- shared infrastructure (SearchState, phase functions, generate/score/parse); `package_results` returns `SearchResults` |
+| `search/common.py` | New -- shared infrastructure (SearchState, phase functions, generate/score/parse); `package_results` returns `SearchResults`; duplicate blocks (lines 359-, 377-) gated by `spec_truncation_ratio` (§6b) |
 | `search/results.py` | New -- `SearchResults` dataclass, canonical return type (§8) |
-| `search/dvts.py` | Fully migrated -- uses shared infrastructure + DVTS-specific subtree pruning |
-| `search/best_of_n.py` | Fully migrated -- now routes through `common.package_results` (dedupe) |
-| `search/dynamic_branching.py` | Fully migrated -- uses shared infrastructure + score-proportional duplication |
+| `search/dvts.py` | Fully migrated -- uses shared infrastructure + DVTS-specific subtree pruning; duplicate block gated by `spec_truncation_ratio` (§6b) |
+| `search/best_of_n.py` | Fully migrated -- now routes through `common.package_results` (dedupe); added comment documenting that SBE and prefix-aware scheduling are no-ops for single-iteration BoN (§14) |
+| `search/dynamic_branching.py` | Fully migrated -- uses shared infrastructure + score-proportional duplication; duplicate block gated by `spec_truncation_ratio` (§6b) |
 | `search/vg_search.py` | Fully migrated -- uses shared infrastructure + 3-stage sampling params |
 | PRM plugin (`prm_model.py`) | Migrated to V1 TokenPooler |
-| `accuracy_evaluation/evaluation/evaluate.py` | Rewritten; headline metrics `pass@n` + `pass@1` (PRM-Vote), no test-set tuning |
+| `accuracy_evaluation/evaluation/evaluate.py` | Rewritten; headline metrics `pass@n` + `pass@1` (PRM-Vote), no test-set tuning; per-problem entries now carry `reference_answer` / `selected_answer` / `selected_idx` for error inspection (§8, §14) |
 | `accuracy_evaluation/evaluation/evaluate_full.py` | **New** — full 4-metric × 4-aggregation-strategy utility for appendix/ablation tables |
-| `run_all_experiments.py` | Updated (removed `top_n` sweep, new N sweep `{1, 4, 16, 64, 256}`, scaling curve plots) |
-| `benchmarks/run_benchmarks.py` | Calls `results.to_dict()` before JSONL serialization |
+| `run_all_experiments.py` | Updated (removed `top_n` sweep, new N sweep `{1, 4, 16, 64, 256}`, scaling curve plots); refactored to two-axis `(search_strategy, optimization)` sweep when BoN joined the grid (§14) |
+| `benchmarks/run_benchmarks.py` | Calls `results.to_dict()` before JSONL serialization; dumps `{jsonl_stem}.runstats.json` sidecar before shutdown (§12c) |
+| `vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py` | Fork patch: store transfer records as dicts rather than `OffloadingOperationMetrics` dataclass to match `reduce`/`observe` invariants in single-process mode (§12a) |
 | `migration_verification/worker_e2e_thesis.py` | Uses `SearchResults` attribute access |
 
 All 5 search strategies (`beam_search`, `dvts`, `best_of_n`,
@@ -463,34 +465,60 @@ Duplicates consumed parent's speculative steps unchanged -- no divergence.
 This contradicts the FastTTS paper's Algorithm 1 line 19
 (`DuplicateThenTruncate`).
 
-**Fix:** Truncate the FIRST speculative step, clear all subsequent
-steps. Trim `scores[:i]` to remove speculative scores:
+**Fix:** Controlled by `SearchConfig.spec_truncation_ratio` (R). The
+duplicate's `pending_steps` is set based on R, and `scores` /
+`step_hashes` are trimmed to remove speculative entries:
 
 ```python
 if beam.pending_steps:
-    # Thesis uses R=0 for algorithm equivalence with vanilla beam search.
-    first_text = truncate_sentence_by_tokens(
-        beam.pending_steps[0].text, tokenizer,
-        mean_ratio=0.0, std_ratio=0.0,
-    )
-    duplicate.pending_steps = [
-        StepChunk(text=first_text, is_complete_step=False, terminal=False)
-    ]
+    if config.spec_truncation_ratio <= 0.0:
+        # R = 0  → true vanilla beam search equivalence. Duplicate starts
+        # with no speculative seed; regenerates from current_text.
+        duplicate.pending_steps = []
+    else:
+        # R > 0  → paper-SBE behavior: inherit ~R fraction of parent's
+        # speculative first step as a divergence seed. Clears subsequent
+        # speculative steps.
+        first_text = truncate_sentence_by_tokens(
+            beam.pending_steps[0].text, tokenizer,
+            mean_ratio=config.spec_truncation_ratio,
+        )
+        duplicate.pending_steps = [
+            StepChunk(text=first_text, is_complete_step=False, terminal=False)
+        ]
     duplicate.scores = beam.scores[:i]
     duplicate.step_hashes = beam.step_hashes[:i]
 ```
 
-The FastTTS paper's default is R=0.85 (keep 85% of speculative tokens,
-trading a tiny bit of beam diversity for throughput). Our thesis sets
-**R=0** (`mean_ratio=0`, `std_ratio=0`) so duplicates regenerate step
-k+1 from scratch — guaranteeing vanilla beam search diversity and
-algorithmic accuracy equivalence. The FastTTS paper's §6.5.2 Fig. 17
-reports this as the equivalence configuration. The original beam still
-benefits from SBE's step-overlap throughput; only duplicates lose the
-extra speedup.
+Parent beam keeps full scores and pending_steps unchanged; duplicates
+diverge immediately.
 
-Parent beam keeps full scores and pending_steps unchanged. Duplicate gets
-truncated first step + cleared rest for immediate divergence.
+**Default is R = 0.0** (vanilla equivalence) — gives the cleanest baseline
+for comparing orthogonal optimizations like kv_offload. Every SBE-enabled
+yaml under `benchmarks/configs/*/*/beam_search/fasttts*/` pins
+`spec_truncation_ratio: 0.0` explicitly so the record is unambiguous.
+Switching to paper-SBE behavior is a single yaml edit:
+
+```yaml
+search_config:
+  ...
+  spec_truncation_ratio: 0.85    # paper §4.1.1 recommended value
+```
+
+Why R = 0 needs the empty-list branch rather than relying on the
+`min_words=1` default inside `truncate_sentence_by_tokens`: the minimum
+was designed to keep the duplicate's `pending_steps` non-empty (avoiding
+a degenerate `StepChunk(text="", ...)`), but a single-token seed still
+biases the duplicate's next generation slightly away from vanilla. The
+explicit branch produces true algorithmic equivalence — the child
+regenerates from `current_text` with no carryover content.
+
+The same R-gate is applied to the three duplicate call sites:
+`search/common.py:359-` (two blocks — reverse-iteration and forward-
+iteration paths), `search/dvts.py:73-`, `search/dynamic_branching.py:93-`.
+All four take `config.spec_truncation_ratio` from the `SearchState`'s
+`SearchConfig`, which `benchmark_config.py:42` unpacks from the yaml
+via `SearchConfig(**search_cfg)` — no manual plumbing required.
 
 ### 6c. All-step lookahead scoring (paper SS4.1.3)
 
@@ -733,13 +761,9 @@ scaling but **flat selection metrics**. Confirmed pre-existing in AE
   plus N=1 as the "no TTC" reference point (`beam_width=1`, no search).
 - Methods: `fasttts` (FastTTS with all optimizations enabled) and
   `baseline` (vanilla beam search). Both swept across every N.
-- SBE truncation ratio **R = 0** (`mean_ratio=0.0, std_ratio=0.0` in
-  `_duplicate_beams`). Duplicates regenerate step k+1 from scratch,
-  preserving vanilla beam search diversity. This is the FastTTS paper's
-  algorithm-equivalence setting (Fig. 17 ablation). Trades a small amount
-  of SBE throughput for a clean accuracy claim — the main thesis
-  contribution (offloading) is not conflated with SBE's accuracy/throughput
-  trade-off.
+- SBE truncation ratio **R = 0.85** (the FastTTS paper's default — keep
+  85% of speculative tokens for duplicates). Matches the published
+  FastTTS configuration.
 - Headline metrics: **pass@n** (search coverage) and **pass@1** (deployed
   accuracy via PRM-Vote). Full 4-metric × 4-aggregation-strategy table
   in the appendix via `evaluate_full.py`.
@@ -862,19 +886,27 @@ RPC boundary anyway). `num_samples` was removed for the same reason:
 only by the now-removed `__post_init__` sync. Now reads
 `self.config.search_config.system_prompt` directly.
 
-**`run_all_experiments.py`** (843 -> 763 lines). Extracted plot-styling
-constants (`PLOT_STYLE_{GOODPUT,LATENCY,ACCURACY}`, `METHOD_DISPLAY_MAP`).
-Shared plot helpers: `_build_records_df`, `_combos_per_dataset`,
-`_draw_dataset_separators`, `_save_figure`, `_lighten`. `parse_jsonl_folder`
-(81 lines) split into `_extract_n_from_filename` / `_load_jsonl_records`
-/ `_compute_folder_metrics`. `plot_accuracy` extracted
-`_collect_accuracy_panels` + `_draw_accuracy_panel`.
+**`run_all_experiments.py`.** Extracted plot-styling constants
+(`PLOT_STYLE_{GOODPUT,LATENCY,ACCURACY}`) and shared plot helpers
+(`_build_records_df`, `_combos_per_dataset`, `_draw_dataset_separators`,
+`_save_figure`, `_lighten`). `parse_jsonl_folder` (81 lines) split into
+`_extract_n_from_filename` / `_load_jsonl_records` / `_compute_folder_metrics`.
+`plot_accuracy` extracted `_collect_accuracy_panels` + `_draw_accuracy_panel`.
+Subsequently refactored to a **two-axis sweep** over `(search_strategy,
+optimization)` once Best-of-N joined the benchmark grid — see Section 14.
 
 **`accuracy_evaluation/evaluation/evaluate.py`.** Headline pipeline
 keeps only `_extract_and_check` + `_select_prm_vote`. `ProblemMetrics` /
 `AggregatedResult` dataclasses carry `pass_at_n` + `pass_at_1_correct`.
-The richer 4-metric × 4-aggregation-strategy ablation variant lives in
-`evaluate_full.py` and caches extract-and-grade across strategies.
+Per-problem entries additionally carry `reference_answer`,
+`selected_answer`, and `selected_idx` so a reader can diff model vs
+ground truth for a wrong problem without re-parsing the source JSONL.
+Full completion text is intentionally *not* stored (bloats the file across
+batched configs); `selected_idx` points into
+`solutions.completions[0]` in the corresponding `*_results.jsonl` for
+on-demand lookup. The richer 4-metric × 4-aggregation-strategy ablation
+variant lives in `evaluate_full.py` and caches extract-and-grade across
+strategies.
 
 **Dead file removal.**
 - `example.py`, `run_aime_fasttts.py` -- standalone single-run entry
@@ -1029,3 +1061,486 @@ without producing `\boxed{}` answers. Raising the limit would require
 variants, 32K native context) at `max_model_len=8192`. Every YAML config
 under `benchmarks/configs/*/` pins this value. The Math variants are no
 longer referenced in the benchmark grid.
+
+---
+
+## 12. KV Offload Integration (v0.19.0)
+
+Enables stock V1 `OffloadingConnector` for the Phase 0.7 POC comparing
+FastTTS latency with and without CPU KV offload on the memory-tightest
+7B+1.5B config. Four coordinated patches bridge the thesis experiment
+harness to vLLM's kv_offload feature. The upstream bugs are pre-existing
+and reproduce on both v0.18.1 and v0.19.0.
+
+### 12a. vLLM fork: dict-vs-dataclass fix
+
+**File:** `vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py`
+(was `offloading_connector.py` in v0.18.1 — same bug, file moved in the
+v0.19.0 refactor)
+
+`OffloadingConnectorStats.record_transfer` stored each operation as an
+`OffloadingOperationMetrics` dataclass instance, but both `reduce()` and
+`OffloadPromMetrics.observe()` assert `isinstance(op, dict)`. The
+discrepancy hides in multi-process mode because IPC serialization
+converts the dataclass into a dict; in single-process mode (required by
+SBE via `VLLM_ENABLE_V1_MULTIPROCESSING=0`) no serialization happens and
+the assertion fires on the first KV transfer.
+
+```python
+# Bug (upstream):
+op = OffloadingOperationMetrics(num_bytes, time)     # dataclass
+# ...later...
+assert isinstance(op, dict)                           # consumer expects dict
+
+# Fix:
+op = {"op_size": num_bytes, "op_time": time}         # dict matches consumer
+```
+
+Dataclass definition left intact for API compat. Both consumer call
+sites (`reduce` at the local stats logger, `observe` at the Prometheus
+logger) now produce correct aggregates.
+
+### 12b. HMA auto-disable workaround
+
+**File:** `FastTTS-thesis/benchmarks/benchmark_config.py`
+
+`VllmConfig.__post_init__` has an ordering bug: the Hybrid KV Cache
+Manager auto-disable check runs **before** `_post_init_kv_transfer_config`
+materialises `kv_transfer_config` from `cache_config.kv_offloading_size`.
+When yamls use the `kv_offloading_size` shortcut (cleaner than writing a
+full `kv_transfer_config`), HMA stays on and `OffloadingConnector`'s
+factory rejects it:
+
+```
+ValueError: Connector OffloadingConnector does not support HMA but HMA is
+enabled. Please set `--disable-hybrid-kv-cache-manager`.
+```
+
+`OffloadingConnector` in v0.19.0 still does not implement the
+`SupportsHMA` mixin despite the "multiple KV groups" / "hybrid model
+support" release notes, so the workaround is still required.
+
+**Fix:** inject `disable_hybrid_kv_cache_manager=True` on **every**
+benchmark engine, not just the kvoff variant. For the thesis workload
+this is a strict no-op: every model is pure full-attention
+(`FullAttentionSpec` for all layers), so `unify_hybrid_kv_cache_specs`
+early-returns on uniform specs
+(`vllm/v1/core/kv_cache_utils.py:get_kv_cache_groups`) and both paths
+land in `UnitaryKVCacheCoordinator`. Forcing the flag off unconditionally
+removes a confound in the `OffloadingConnector` A/B — previously only the
+kvoff arm had HMA disabled, so any HMA-vs-no-HMA difference would have
+been attributed to kv_offload.
+
+```python
+gen_vllm_config = {
+    ...,
+    "disable_hybrid_kv_cache_manager": True,  # no-op on uniform-spec models
+}
+ver_vllm_config = {
+    ...,
+    "disable_hybrid_kv_cache_manager": True,
+}
+```
+
+A hybrid-attention verifier (Gemma 3, gpt-oss, Llama 4, Mamba models)
+would need to revisit this — HMA-off upcasts sliding-window specs to
+full attention and loses the per-layer KV memory savings.
+
+### 12c. Per-run stats extraction (prefix cache + KV transfer traffic)
+
+**Files:** `models/vllm_wrapper.py`, `benchmarks/run_benchmarks.py`
+
+#### What we capture
+
+Three categories of per-run stats, all sourced directly from vLLM's
+engine internals:
+
+1. **GPU prefix cache** — `PrefixCacheStats(queries, hits, requests)`
+   from `scheduler.kv_cache_manager`. Only **prefill admission**
+   contributes (`get_computed_blocks` gated by `num_computed_tokens == 0`);
+   decode steps never touch the counter.
+2. **CPU prefix cache** — same shape, from
+   `scheduler.connector_prefix_cache_stats` (populated only when
+   `OffloadingConnector` is active). CPU hit rate is conditional on a GPU
+   miss: `(1 − gpu_hit) × cpu_hit` gives the unconditional fraction of
+   tokens kv_offload recovered.
+3. **KV transfer volume** — per-direction (`cpu_to_gpu`, `gpu_to_cpu`)
+   totals of `bytes`, `time_s`, and `count` from
+   `OffloadingConnectorStats.record_transfer`. Bytes are hardware-exact
+   (`dst_sub_block_count * total_block_size_in_bytes`); times are
+   CUDA-event-measured (`start_event.elapsed_time(end_event)`). These
+   quantify the PCIe traffic kv_offload produces — critical for
+   determining how much H2D bandwidth remains for weight prefetch
+   (Phase 3).
+
+#### Per-step reset vs run-total: accumulator pattern
+
+**Upstream gotcha:** vLLM's `EngineCore.step` loop calls
+`scheduler.make_stats()` every engine step. `make_stats` drains and
+resets all three counter families atomically. A naive "read at shutdown"
+captures only the idle tail window and produces all-zero output.
+
+**Fix:** install accumulator wrappers at worker init. In
+`models/vllm_wrapper.py`:
+
+```python
+class _CacheStatsAcc:
+    """Running sum of PrefixCacheStats across engine steps."""
+    __slots__ = ("queries", "hits", "requests")
+    def __init__(self):
+        self.queries = self.hits = self.requests = 0
+    def add(self, s):
+        if s is None: return
+        self.queries += getattr(s, "queries", 0) or 0
+        self.hits    += getattr(s, "hits", 0) or 0
+        self.requests += getattr(s, "requests", 0) or 0
+
+
+class _TransferStatsAcc:
+    """Running sum of KV transfer bytes/time per direction."""
+    def __init__(self):
+        self.by_type = {}  # "cpu_to_gpu" -> {bytes, time_s, count}
+    def add(self, kv_connector_stats):
+        if not kv_connector_stats: return
+        for xfer_type, ops in kv_connector_stats.items():
+            if not isinstance(ops, list): continue
+            if xfer_type not in self.by_type:
+                self.by_type[xfer_type] = {"bytes": 0, "time_s": 0.0, "count": 0}
+            acc = self.by_type[xfer_type]
+            for op in ops:
+                acc["bytes"]  += op.get("op_size", 0)
+                acc["time_s"] += op.get("op_time", 0)
+                acc["count"]  += 1
+
+
+def _install_prefix_cache_accumulator(scheduler):
+    """Wrap scheduler.make_stats to sum per-step stats for end-of-run reporting."""
+    if getattr(scheduler, "_prefix_cache_acc_installed", False):
+        return
+    scheduler._acc_gpu_prefix = _CacheStatsAcc()
+    scheduler._acc_cpu_prefix = _CacheStatsAcc()
+    scheduler._acc_transfers  = _TransferStatsAcc()
+    original = scheduler.make_stats
+    def wrapped(*args, **kwargs):
+        stats = original(*args, **kwargs)
+        if stats is not None:
+            scheduler._acc_gpu_prefix.add(getattr(stats, "prefix_cache_stats", None))
+            scheduler._acc_cpu_prefix.add(getattr(stats, "connector_prefix_cache_stats", None))
+            scheduler._acc_transfers.add(getattr(stats, "kv_connector_stats", None))
+        return stats
+    scheduler.make_stats = wrapped
+    scheduler._prefix_cache_acc_installed = True
+```
+
+The wrapper is installed once per worker, right after
+`TTSLLM(**model_kwargs)` returns, before the `status: initialized` ack
+is sent. Every subsequent engine step feeds its per-step counters into
+the accumulators before they're reset for the next step.
+
+A fourth accumulator, `_BatchStatsAcc`, tracks the per-step batch size
+distribution (min/mean/max `num_running_reqs`, max waiting queue depth,
+peak `kv_cache_usage`, and a histogram by bucket). Same wrapping site,
+same cost profile — a single stats read per step already drives the
+wrapper; adding one more sub-accumulator is noise.
+
+`_handle_get_run_stats` reads the four accumulators directly:
+
+```python
+def _handle_get_run_stats(ctx, request):
+    scheduler = ctx.model.llm_engine.engine_core.engine_core.scheduler
+    gpu  = getattr(scheduler, "_acc_gpu_prefix", None)
+    cpu  = getattr(scheduler, "_acc_cpu_prefix", None)
+    xfer = getattr(scheduler, "_acc_transfers", None)
+    batch = getattr(scheduler, "_acc_batch", None)
+    return {"result": {
+        "gpu": gpu.to_dict() if gpu else None,
+        "cpu": cpu.to_dict() if (cpu and cpu.requests > 0) else None,
+        "transfers": xfer.to_dict() if xfer else None,
+        "batch": batch.to_dict() if batch else None,
+    }}
+```
+
+Zero-admission steps and zero-transfer steps contribute zero summands —
+correct by construction. Overhead is ~100 ns of integer additions per
+engine step (6 adds for prefix caches + a small dict scan for transfers
++ a bin-search for batch), negligible against the millisecond-scale step
+cost.
+
+`BaseVLLMModelWrapper.get_run_stats()` public method dispatches the
+action across the multiprocessing pipe and returns the nested dict.
+
+**Benchmark sidecar** — in `run_benchmarks.py`'s `finally` block, snapshot
+both engines before `fast_tts.shutdown()` and dump
+`{jsonl_stem}.runstats.json` next to the results jsonl. If the sidecar
+already exists (from a prior partial run), it is **not overwritten** — the
+earlier file covers more problems and is more representative. Expected
+schema for a kvoff run:
+
+```json
+{
+  "generator": {
+    "gpu": {"queries": 468646, "hits": 458880, "requests": 768},
+    "cpu": {"queries": 9766, "hits": 16, "requests": 768},
+    "transfers": {
+      "cpu_to_gpu": {"bytes": 123456789, "time_s": 1.23, "count": 456},
+      "gpu_to_cpu": {"bytes": 987654321, "time_s": 4.56, "count": 789}
+    },
+    "batch": {
+      "steps_total": 12043, "steps_nonzero": 11980,
+      "mean_running": 187.4, "max_running": 256,
+      "max_waiting": 42, "max_kv_usage": 0.82,
+      "histogram": {"0": 63, "1-7": 210, "8-31": 418,
+                    "32-63": 902, "64-127": 1834, "128-255": 8573, "256+": 43}
+    }
+  },
+  "verifier": { "gpu": {...}, "cpu": {...}, "transfers": {...}, "batch": {...} },
+  "num_problems": 30
+}
+```
+
+For the fasttts (no offload) variant, both `cpu` and `transfers` are
+`null`. Snapshot failures are logged as warnings and never abort a
+completed run.
+
+**PCIe contention analysis** from the sidecar: compare
+`transfers.cpu_to_gpu.bytes / wall_clock_time` against the RTX 4090's
+PCIe Gen4 ×16 peak (~25 GB/s) to determine what fraction of H2D
+bandwidth kv_offload consumes. That fraction is the budget the thesis's
+weight prefetch (Phase 3) would have to share.
+
+### 12d. POC harness (`bench_kv_offload.py`)
+
+**File:** `David/Benchmarks/phase0/bench_kv_offload.py`
+
+Extended from a single-dataset sweep to a dataset × method × N matrix:
+
+- `DATASETS = ["aime", "math500"]`, triple-nested loop, 16 cells total
+- `collect_results()` merges each cell's `.runstats.json` sidecar into
+  the metrics dict (and falls back to legacy `.cachestats.json` when
+  present), exposing `gen_gpu_hit`, `gen_cpu_hit`, `ver_gpu_hit`,
+  `ver_cpu_hit` fields (hit rate = `hits / queries`, or `None` when not
+  applicable) plus the generator batch-stats fields
+- `print_table` adds four hit-rate columns per row, one block per dataset
+- `plot_results` produces a 6-panel PDF: two rows (one per dataset) × three
+  columns (latency / goodput / paired speedup vs N)
+- Log filenames include the dataset prefix: `{dataset}_{method}_n{N}.log`
+- `summary.json` is now keyed by `dataset → method → N` (was `method → N`)
+
+Sanity expectations:
+
+- `fasttts` variant: `cpu_hit_rate` should be `None` (no CPU cache exists)
+- `fasttts_kvoff` variant at N ≥ 16: `cpu_hit_rate > 0` (GPU cache spills
+  under pressure, CPU tier catches evictions)
+- GPU hit rates should be very close between the two variants for each
+  cell — kv_offload doesn't change GPU prefix caching semantics, it only
+  catches what GPU evicts
+- Expected: CPU hit rate **correlates** with the latency speedup across
+  cells; this is the attribution signal
+
+---
+
+## 13. Generator System Prompt Standardization
+
+**File:** `config.py` (`DEFAULT_SYSTEM_PROMPT`)
+
+Replaced the inherited search-and-learn "long schema" prompt
+(`"Solve ... efficiently and clearly: ## Step 1: [Concise description] ..."`)
+with the OpenAI MATH / PRM800K / OpenR standard:
+
+```
+Please reason step by step, and put your final answer within \boxed{}.
+```
+
+**Rationale:**
+- Community-standard prompt used by OpenR, PRM800K labeling, Math-Shepherd,
+  Skywork/Qwen PRM training, and `lm-evaluation-harness`. The long schema
+  was search-and-learn-specific.
+- PRM scoring is prompt-agnostic: `models/reward_utils.py:prepare_input`
+  builds raw `[BOS] + problem + "\n" + response`, no chat template — the
+  PRM never sees the system prompt. Cross-prompt PRM compatibility preserved.
+
+**n=4 AIME validation** (bw=4, iter=10, 30 problems):
+
+| | Long (old) | Short (new) |
+|---|---|---|
+| Mean tokens/beam | 735 | 734 |
+| Accuracy | 3/30 | 6/30 |
+| `\boxed{}` extraction | 28/30 | 30/30 |
+| Uses `## Step N:` | 14/30 | 2/30 |
+| Uses numbered `1. 2. …` | 5/30 | 15/30 |
+
+Format shifts from `## Step N:` to numbered lists but `\n\n` separators and
+terminal `\boxed{}` remain; PRM per-step scores stay monotonic. Dropping
+brevity cues did **not** lengthen output — mean tokens unchanged.
+
+**Temperature update:** the prior note deferred an OpenR 0.7 A/B. When
+BoN joined the benchmark grid (Section 14), the reference framework's
+BoN default of 0.7 (Liu et al. `run.sh:99`) became load-bearing for
+paper-aligned pass@1 reporting. All yamls under `benchmarks/configs/`
+were normalized to `temperature: 0.7` in one pass, replacing the
+inherited 0.8. The 7B/math500 fasttts config was already at 0.7 (hand
+tuning artifact), so the change is a no-op there; every other file
+moves from 0.8 to 0.7.
+
+**Reproduction:** `benchmarks/configs/7B-instruct/aime/fasttts_openr_prompt/n4.yaml`.
+
+**Baseline re-run required.** Existing results under
+`benchmarks/benchmark_results/7B-instruct/*/fasttts*` were generated with the
+old prompt; archive before re-running (e.g.
+`mv .../fasttts .../fasttts_longprompt_archive`) — `run_benchmarks.py` skips
+already-processed IDs and would otherwise mix prompts into the same JSONL.
+The temperature shift from 0.8 → 0.7 also invalidates pre-standardization
+numbers; re-run is therefore unconditional across the full `(search,
+optimization)` grid.
+
+---
+
+## 14. Best-of-N as a First-Class Benchmark Method
+
+Best-of-N was already implemented as a search strategy in
+`search/best_of_n.py` and registered in `fasttts.py:_SEARCH_STRATEGIES`,
+but the experiment sweep (`run_all_experiments.py`) hardcoded
+`METHODS = ["fasttts", "baseline"]` — both beam_search variants — so BoN
+had never been run through the pipeline. This section adds BoN as a peer
+strategy so the thesis's end-to-end story is not restricted to
+beam-search-family methods.
+
+### Which FastTTS optimizations apply to BoN
+
+Three optimizations live under the existing `fasttts/` configs. Their
+surface for BoN:
+
+1. **SBE** (`enable_spec_diff`) — two mechanisms: (a) strip
+   `SamplingParams.stop` before submit so the engine ignores `\n\n`,
+   and (b) Phase 1 / Phase 2 queue-pressure logic across a multi-iteration
+   loop. BoN passes no `stop` strings (`best_of_n.py:44-50`) and does not
+   use the iterative `SearchState` / `_filter_active` loop —
+   **no-op for BoN.**
+
+2. **Prefix-aware scheduling** (`prefix_aware_scheduling`) — has exactly
+   one effect: `_duplicate_beams` in `search/common.py:346-370` reorders
+   duplicate beams so they sit adjacent to their parent. BoN never calls
+   `_duplicate_beams` — **no-op for BoN.**
+
+3. **Asymmetric GPU memory split** — yaml-only. The fasttts configs give
+   the generator 0.74 and the verifier 0.16 (vs. baseline's 0.68/0.22 on
+   7B). **This IS meaningful for BoN:** the single big `generate(n=N)`
+   call holds N parallel KV caches in the generator, while the verifier
+   runs exactly once at the end over N short scoring inputs. BoN benefits
+   at least as much as beam_search from the generator-heavy allocation.
+
+`best_of_n.py` now carries a comment near the `SamplingParams`
+construction documenting the no-op relationship for SBE and
+prefix-aware scheduling.
+
+### Config tree restructure (flat → two-axis)
+
+Old layout conflated search strategy with optimization:
+
+```
+configs/{gen}/{dataset}/{baseline,fasttts,baseline_kvoff,fasttts_kvoff}/n{N}.yaml
+```
+
+`baseline` and `fasttts` were implicitly beam_search. Adding BoN
+without restructuring would leave the naming inconsistent. New layout:
+
+```
+configs/{gen}/{dataset}/{search_strategy}/{optimization}/n{N}.yaml
+```
+
+- All existing 56 yamls moved under `configs/{gen}/{dataset}/beam_search/`
+  (including the transient `baseline_kvoff`, `fasttts_kvoff` variants).
+  `output_dir:` lines updated to mirror the new path.
+- 20 new `configs/{gen}/{dataset}/best_of_n/fasttts/n{1,4,16,64,256}.yaml`
+  generated from the corresponding `beam_search/fasttts` yamls via sed:
+  `approach: beam_search → best_of_n`, `output_dir` substitution, drop
+  `beam_width` and `num_iterations` (BoN ignores them), flip
+  `enable_spec_diff: true → false` and `prefix_aware_scheduling: true → false`
+  (no-ops; keeping them false avoids installing `SBETracker` and the
+  `make_stats` scheduler hook so the A/B against beam_search is clean).
+  Asymmetric memory split preserved verbatim.
+
+**`(best_of_n, baseline)` is intentionally omitted from the grid.** For
+BoN the only difference between a baseline and a fasttts yaml is the
+generator/verifier memory split (SBE and prefix-aware scheduling are
+no-ops). Running both duplicates effort without producing a new data
+point; a single BoN row is sufficient. Revisit only if 7B / N=256 OOMs
+and the baseline (less generator headroom) behaves differently.
+
+### Experiment runner refactor (`run_all_experiments.py`)
+
+`METHODS` replaced with an explicit `COMBO_ORDER_KEYS` list of
+`(search_strategy, optimization)` tuples. The sweep runs two combos:
+`(beam_search, fasttts)` and `(best_of_n, fasttts)`. Planned-run count
+is `len(GENERATORS) × len(DATASETS) × 2 × len(N_VALUES)` — with the
+current `GENERATORS = ["7B-instruct"]` and two datasets, that is
+**20 runs**.
+
+`(beam_search, baseline)` is intentionally omitted from the sweep. It
+is the un-optimized reference for full fasttts — comparing against it
+would just duplicate the thesis's own internal SBE / prefix-aware
+ablations. The primary thesis comparison is full-fasttts beam search vs.
+BoN (both with the asymmetric memory split). The `beam_search/baseline`
+yamls remain on disk so the ablation can be re-run on demand, but are
+not part of the headline sweep.
+
+Display labels: `COMBO_DISPLAY_MAP` maps the two combos to `"Beam Search"`
+and `"BoN"`. Both runs apply the fasttts optimization stack, so the axis
+that actually differs between the two plotted lines is the **search
+strategy**, not the optimization — labels name the strategy accordingly.
+
+Helper changes:
+
+- `_combo_key(strategy, opt) → "{strategy}/{optimization}"` — JSON-friendly
+  key used throughout `collect_results`, `main_results.json`, and
+  `accuracy.json`.
+- `_planned_runs()` yields 5-tuples `(gen, dataset, strategy, optimization, n)`.
+- `run_experiments()` builds config path from the 5-tuple; `label` and
+  `output_dir` mirror the new shape.
+- `collect_results()` and `evaluate_accuracy()` walk
+  `{data_dir}/{gen}/{dataset}/{strategy}/{optimization}/`.
+- `_evaluate_combo()` replaces `_evaluate_method()`. The result-file glob
+  widens `_iter10` → `_iter*` so any `num_iterations` value matches. Both
+  strategies currently use `num_iterations=40`: BoN's single-call
+  semantics make it a no-op (the loop exits after iteration 1), and
+  beam_search was raised from 10 to 40 after a wall-clock measurement
+  showed iter=40 is actually ~8% faster on 7B AIME — the earlier
+  last-iteration free-run in iter=10 triggers expensive PRM-unguided tail
+  generation on beams that would otherwise have been pruned. Keeping the
+  glob pattern iteration-agnostic means future tuning of this knob won't
+  require runner changes. The `_specdiff` suffix is only applied when
+  SBE is actually active (`strategy == "beam_search" and optimization == "fasttts"`);
+  `(best_of_n, fasttts)` keeps `enable_spec_diff: false`, so its filenames
+  carry no suffix.
+
+Plotting generalizes over `COMBO_ORDER`:
+
+- `plot_goodput` rebuilds `color_palette` from
+  `{label: sns.color_palette()[i] for i, label in enumerate(COMBO_ORDER)}`
+  and loops over `COMBO_ORDER` for legend patches.
+- `plot_latency` computes `k = len(COMBO_ORDER)` and lays out `2*k` bars
+  per N-group: `k` generator bars, then `k` verifier bars (twin-colored
+  via `_lighten` + hatched). `offsets = np.linspace(-(2*k-1)/2, (2*k-1)/2, 2*k)`
+  replaces the hardcoded 4-bar layout.
+- `plot_accuracy` replaces `_ACCURACY_METHOD_STYLES` with
+  `_ACCURACY_COMBO_STYLES` keyed on `(strategy, optimization)`. Active
+  styles: `(beam_search, fasttts)` solid+filled, `(best_of_n, fasttts)`
+  dash-dot+filled. The `(beam_search, baseline)` style (dashed+hollow) is
+  retained in the dict so an ad-hoc re-run of the baseline ablation still
+  plots correctly without further code changes.
+
+### Temperature alignment
+
+In the same pass, all yamls were normalized to `temperature: 0.7` to match
+the reference framework's BoN default (see Section 13 for the rationale).
+
+### Files touched
+
+- `search/best_of_n.py` — SBE + prefix-aware no-op rationale comment.
+- `run_all_experiments.py` — two-axis sweep (full rewrite of runner,
+  collector, evaluator, plotting helpers).
+- `accuracy_evaluation/evaluation/evaluate.py` — `ProblemMetrics` enriched
+  with `reference_answer`, `selected_answer`, `selected_idx`;
+  `_select_prm_vote` returns `(correct, idx_in_valid, selected_key)`.
+- `benchmarks/configs/` — 56 yamls moved under `beam_search/`, 20 new
+  yamls created under `best_of_n/fasttts/`, all 76 normalized to T=0.7.

@@ -75,8 +75,14 @@ run_benchmark "0.1" "CPU/GPU Overlap Feasibility (BF16 F.linear)" \
 run_benchmark "0.3" "PCIe Bandwidth Sweep" \
     "python ${SCRIPT_DIR}/bench_pcie_sweep.py --output-json ${RESULTS_DIR}/pcie_sweep.json"
 
-run_benchmark "0.4" "Column-Split Correctness" \
-    "python ${SCRIPT_DIR}/bench_column_split.py"
+run_benchmark "0.4" "Tensor Split Correctness (mixed col/row)" \
+    "python ${SCRIPT_DIR}/bench_split_correctness.py"
+
+run_benchmark "0.10a" "MLP Block Pipeline: uniform col vs col→row" \
+    "python ${SCRIPT_DIR}/bench_mlp_pipeline.py --output-json ${RESULTS_DIR}/mlp_pipeline.json"
+
+run_benchmark "0.10b" "WO Offload Alt A vs Alt B" \
+    "python ${SCRIPT_DIR}/bench_wo_offload_tradeoff.py --output-json ${RESULTS_DIR}/wo_offload_tradeoff.json"
 
 # --- vLLM-level benchmarks (need model weights) ---
 
