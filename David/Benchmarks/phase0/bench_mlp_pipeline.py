@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 0.10a — MLP Block Pipeline: Uniform Col vs Col→Row
+"""Phase 0.4.1 — MLP Block Pipeline: Uniform Col vs Col→Row
 
 Empirical wall-clock comparison of the MLP block under two split patterns:
 
@@ -20,7 +20,7 @@ col-shape vs row-shape MLP2, and (c) a small CPU-side SwiGLU in col→row.
 
 Measurement: for each pattern, time the CPU-side serial critical path. The
 GPU portions on the off-path device run in the background with lower latency;
-CPU is the bottleneck in this regime (§0.2 confirms CPU GEMM is the slowest
+CPU is the bottleneck in this regime (§0.3 confirms CPU GEMM is the slowest
 link). GPU steps where the CPU must wait are timed via `torch.cuda.Event` and
 included in the sum. This captures the Planner-relevant wall-clock.
 
@@ -272,7 +272,7 @@ def main():
     args = p.parse_args()
 
     cfg = MODEL_CONFIGS[args.model]
-    print(f"Phase 0.10a — MLP Block Pipeline  ({cfg['display_name']})")
+    print(f"Phase 0.4.1 — MLP Block Pipeline  ({cfg['display_name']})")
     print(f"GPU: {torch.cuda.get_device_name(0)}  CPU threads: {torch.get_num_threads()}")
     print(f"N={args.num_tokens}  f={args.slice_fracs}")
 

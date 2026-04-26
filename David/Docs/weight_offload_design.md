@@ -19,8 +19,8 @@ Before describing the three-way split, an important distinction: this thesis sep
   - Plus `B_prefetch`, a fixed-size GPU scratch buffer for streaming
 - **Compute dispatch** is three-way and **varies per `BatchDescriptor` bucket**:
   - GPU-permanent path — compute on GPU from `W_gpu_permanent`
-  - Prefetch path — stream `W_cpu` into `B_prefetch`, compute on GPU
-  - CPU-compute path — compute on CPU from `W_cpu`, return result via PCIe
+  - Prefetch path — stream `W_cpu` into `B_prefetch` via `cudaMemcpyAsync` on CE0 (H2D copy engine), compute on GPU
+  - CPU-compute path — compute on CPU from `W_cpu`, return result via SM-issued UVA copy kernel (bypasses CE0; runs concurrently with bg prefetch — see `phase0_findings.md §0.5`)
 
 The same `W_cpu` bytes feed both the prefetch path and the CPU-compute path at different times in different buckets. Nothing moves between storage tiers at runtime.
 
@@ -134,7 +134,7 @@ Row-split  (input-sharded):   Y = X[:, gpu_cols] @ W_gpu + X[:, cpu_cols] @ W_cp
 
 For WQKV specifically, the column dimension corresponds to the head dimension — the same dimension tensor parallelism splits across GPU ranks (`QKVParallelLinear` inherits from `ColumnParallelLinear` in vLLM). For MLP2, the input dim corresponds to the intermediate expansion — the same dim `RowParallelLinear` shards in `down_proj`. Our CPU offload maps directly onto these existing vLLM conventions — nothing invented; just applied across the device boundary instead of across GPU ranks.
 
-**WQKV, MLP1, and MLP2 share the `[f_gpu, f_prefetch, f_cpu]` three-path structure and receive the same per-bucket `(f_cpu, f_prefetch)` pair from the Planner**. WO is fully GPU-resident in Phase 1/2 (not offloaded) and carries no dispatch state. Storage is set uniformly: at load time, `f_cpu_store` is a single scalar applied to WQKV, MLP1, and MLP2 alike. This uniform dispatch is empirically justified by the measured uniform CPU μs/MB across sub-modules at decode-regime batch sizes (`phase0_findings.md §0.2` — 1.02–1.07× spread at B ∈ {16, 64, 128}); per-sub-module optimization buys at most ~1 percentage point of extra f efficiency, within the rounding error of reasonable operating points.
+**WQKV, MLP1, and MLP2 share the `[f_gpu, f_prefetch, f_cpu]` three-path structure and receive the same per-bucket `(f_cpu, f_prefetch)` pair from the Planner**. WO is fully GPU-resident in Phase 1/2 (not offloaded) and carries no dispatch state. Storage is set uniformly: at load time, `f_cpu_store` is a single scalar applied to WQKV, MLP1, and MLP2 alike. This uniform dispatch is empirically justified by the measured uniform CPU μs/MB across sub-modules at decode-regime batch sizes (`phase0_findings.md §0.3.4` — 1.02–1.07× spread at B ∈ {16, 64, 128}); per-sub-module optimization buys at most ~1 percentage point of extra f efficiency, within the rounding error of reasonable operating points.
 
 Prefetch distance is committed to **layer-ahead**: the Planner schedules prefetch against the full layer compute-time budget, with a single prefetch queue per layer and one sync per layer boundary. Tensor-ahead (per-sub-phase prefetch) was considered and rejected — its topological constraint (`f_prefetch_{m+1} × W_{m+1} ≤ compute_time_m × PCIe_BW`) would *force* per-sub-module f tuning to avoid prefetch starvation on short-compute sub-modules, a cost we avoid by committing to uniform dispatch. `pcie_bandwidth_allocation_design.md` carries the full comparison.
 
@@ -180,9 +180,9 @@ SwiGLU-on-slice is safe because `MergedColumnParallelLinear` (gate_up) stores ga
 
 ### WO Split Axis Decision
 
-**WO is not offloaded in Phase 1/2 — fully GPU-resident, no CPU path, no prefetch path.** This is stricter than the original §0.10c Alt B (which only ruled out CPU compute for WO): we additionally exclude `f_prefetch_WO` to avoid the load-time dispatch asymmetry that would arise if WO participated in prefetch-only while other sub-modules have the full three-path structure. At 7B on RTX 4090, WO weight is ~686 MB across layers — a small fraction of the 24 GB budget after MLP/WQKV offload, not worth the design complication.
+**WO is not offloaded in Phase 1/2 — fully GPU-resident, no CPU path, no prefetch path.** This is stricter than the original §0.4.3 Alt B (which only ruled out CPU compute for WO): we additionally exclude `f_prefetch_WO` to avoid the load-time dispatch asymmetry that would arise if WO participated in prefetch-only while other sub-modules have the full three-path structure. At 7B on RTX 4090, WO weight is ~686 MB across layers — a small fraction of the 24 GB budget after MLP/WQKV offload, not worth the design complication.
 
-§0.10c measured both alternatives that were on the table:
+§0.4.2 measured both alternatives that were on the table:
 
 **Alternative A — WO col-split with merge-before-WO.** Col-split weight offload applied to the merged attention output: GPU merges prefix + suffix via online softmax, sends merged `attn_out` slice to CPU, CPU computes its WO slice, returns partial for concat. Saves `f_cpu_store_WO · 686 MB` of GPU weight (~69 MB at f=10%, ~206 MB at f=30%). **Rejected**: 3 PCIe round trips per layer + ~0.4 ms added critical-path latency per layer (~11 ms per decode step across 28 layers).
 
@@ -190,7 +190,7 @@ SwiGLU-on-slice is safe because `MergedColumnParallelLinear` (gate_up) stores ga
 
 **Phase 3 revisit condition.** At 14B, WO weight is ~2.5 GB (48 layers × 52 MB). If 14B memory pressure exceeds what MLP+WQKV offload can relieve, Phase 3 can add `f_prefetch_WO` as a late extension — adds a prefetch-only dispatch path for WO, no CPU compute (Alt B's no-f_cpu rule still stands). The asymmetry is accepted in exchange for the 2.5 GB of GPU memory relief.
 
-**Note on the withdrawn "merge-after-WO fusion" idea.** An earlier design considered duplicating WO on CPU and merging at the WO-output level via the linearity of WO (`WO @ merge(a_p, a_s) = α_p · WO(a_p) + α_s · WO(a_s)`). Withdrawn after timing analysis: adds CPU_WO (~2–3 ms for 7B) to CPU's critical path, which is already the bottleneck from memory-bound CPU attention. D2H bytes identical either way, no comm win. See Phase 0 §0.9 and §0.10c for the measurement.
+**Note on the withdrawn "merge-after-WO fusion" idea.** An earlier design considered duplicating WO on CPU and merging at the WO-output level via the linearity of WO (`WO @ merge(a_p, a_s) = α_p · WO(a_p) + α_s · WO(a_s)`). Withdrawn after timing analysis: adds CPU_WO (~2–3 ms for 7B) to CPU's critical path, which is already the bottleneck from memory-bound CPU attention. D2H bytes identical either way, no comm win. See Phase 0 §0.5 and §0.4.2 for the measurement.
 
 **Key parameters**: f_gpu, f_prefetch, f_cpu per tensor (WQKV, WO, MLP1, MLP2).
 
@@ -243,7 +243,7 @@ Layers have roughly uniform total compute time. But within a layer, sub-modules 
 
 **Tensor granularity with layer-ahead prefetch** (our committed design) assigns one per-bucket `(f_cpu, f_prefetch)` pair uniformly to WQKV, MLP1, MLP2 (see opening of this section for the empirical justification). The prefetch budget is global across the full layer time; any sub-module's `f_prefetch × W_m` draw from the shared pool. This is simpler than per-sub-module tuning and — given uniform CPU μs/MB at decode — sacrifices no meaningful optimality.
 
-The alternative, **tensor-ahead prefetch with per-sub-module tuning** (rejected), would assign different `f` values per sub-module to navigate the topological constraint `f_prefetch_{m+1} × W_{m+1} ≤ compute_time_m × PCIe_BW`. WO's short compute phase (~0.02 ms at small decode) would starve MLP1's prefetch budget, forcing MLP1 to high `f_cpu` just to extend its own compute phase and unblock MLP2's prefetch (a "self-bootstrapping" cascade). Tensor-ahead's one remaining advantage — fine-grained per-phase control over PCIe contention — is also moot: `phase0_findings.md §0.9` measured PCIe contention under fg-first stream ordering and found activation transfers do not meaningfully disturb weight prefetch throughput (~23.6 GB/s H2D with concurrent activation traffic). With contention already resolved at the ordering level, tensor-ahead's fine control has nothing to control. We avoid this complexity entirely by using layer-ahead and uniform dispatch.
+The alternative, **tensor-ahead prefetch with per-sub-module tuning** (rejected), would assign different `f` values per sub-module to navigate the topological constraint `f_prefetch_{m+1} × W_{m+1} ≤ compute_time_m × PCIe_BW`. WO's short compute phase (~0.02 ms at small decode) would starve MLP1's prefetch budget, forcing MLP1 to high `f_cpu` just to extend its own compute phase and unblock MLP2's prefetch (a "self-bootstrapping" cascade). Tensor-ahead's one remaining advantage — fine-grained per-phase control over PCIe contention — is moot under our layer-grain mechanism: `phase0_findings.md §0.5` shows that fg activation returns route through SM-issued UVA loads on a separate hardware path from CE0 (the H2D copy engine), so fg events don't queue behind bg prefetches regardless of how bg is scheduled (fg_s2c stays at ~30–35 μs across all bg chunk sizes). With the queue dependency eliminated at the layer grain, tensor-ahead's fine control has nothing to control. We avoid this complexity entirely by using layer-ahead and uniform dispatch.
 
 Group granularity cannot exploit sub-module non-uniformity — it sees one 466 MB block, not four differently-sized sub-modules.
 

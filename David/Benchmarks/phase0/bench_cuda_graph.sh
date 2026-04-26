@@ -1,5 +1,5 @@
 #!/bin/bash
-# Phase 0.6 — CUDA Graph Impact Benchmark
+# Phase 0.7 — CUDA Graph Impact Benchmark
 #
 # Measures decode latency with CUDA Graphs enabled vs disabled (enforce_eager).
 # Quantifies the performance cost of prototyping without CUDA Graphs.
@@ -9,7 +9,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-RESULTS_DIR="${SCRIPT_DIR}/results"
+RESULTS_DIR="${SCRIPT_DIR}/results/0.7_cuda_graph"
 mkdir -p "$RESULTS_DIR"
 
 MODEL="Qwen/Qwen2.5-7B-Instruct"
@@ -28,7 +28,7 @@ OUTFILE="${RESULTS_DIR}/cuda_graph_impact.csv"
 echo -e "batch_size\tmode\tavg_latency_ms\tp50_ms\tp99_ms" > "$OUTFILE"
 
 echo "================================================================"
-echo "  Phase 0.6: CUDA Graph Impact"
+echo "  Phase 0.7: CUDA Graph Impact"
 echo "  Model: $MODEL"
 echo "  Input/Output: $INPUT_LEN / $OUTPUT_LEN tokens"
 echo "================================================================"

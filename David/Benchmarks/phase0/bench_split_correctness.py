@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 0.4 — Tensor Split Correctness (mixed col/row per TP convention)
+"""Phase 0.2 — Tensor Split Correctness (mixed col/row per TP convention)
 
 Verifies that per-sub-module GPU-CPU splits produce numerically equivalent
 results to unsplit computation, covering the full mechanism space used by
@@ -11,7 +11,7 @@ Current axis assignment:
   WQKV → col (K/V-biased picker)
   MLP1 → col
   MLP2 → row
-  WO   → col if Alt A wins in §0.10c, else no offload (not split)
+  WO   → col if Alt A wins in §0.4.2, else no offload (not split)
 
 Test families:
 
@@ -395,7 +395,7 @@ def run_col_contiguous(cfg, f_values, batch_sizes):
     """A. Col-parallel contiguous — WQKV, MLP1, and WO (if Alt A chosen).
 
     Note on WO: included here so Alt A's correctness is covered if that's what
-    §0.10c picks. If Alt B wins, WO stays GPU-resident and this row is unused
+    §0.4.2 picks. If Alt B wins, WO stays GPU-resident and this row is unused
     at runtime; the test remains a useful sanity check of the mechanism.
     """
     print("\n--- A. Col-parallel contiguous (WQKV / MLP1 / WO-Alt-A) ---")

@@ -31,7 +31,7 @@ Used by the Planner to compute the GPU idle budget in each bucket (memory-BW-bou
 
 ### 1.2 `cpu_gemm_curve`
 
-CPU matmul time as a function of `(batch_size, slice_frac)` for each sub-module shape. Must be measured with `F.linear` (oneDNN BF16 path), **never** `torch.mm` — the BF16 `torch.mm` path on non-AMX CPUs falls back to a scalar loop and is 100–250× slower. This is the single most important implementation detail in the Profiler (see `phase0_findings.md` §"Critical Discovery").
+CPU matmul time as a function of `(batch_size, slice_frac)` for each sub-module shape. Must be measured with `F.linear` (oneDNN BF16 path), **never** `torch.mm` — the BF16 `torch.mm` path on non-AMX CPUs falls back to a scalar loop and is 100–250× slower. This is the single most important implementation detail in the Profiler (see `phase0_findings.md §0.3.2`).
 
 **Per-sub-module axis envelope.** Each sub-module has exactly one split axis fixed by the design (see `weight_offload_design.md §Per-Sub-Module Split Axis`): col for WQKV, MLP1, and WO (Alt A); row for MLP2. The axis is stored once per sub-module in the table's envelope, not as an extra key dimension:
 

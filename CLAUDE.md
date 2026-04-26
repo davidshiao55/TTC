@@ -125,6 +125,39 @@ cd /TTC/FastTTS-thesis && python run_all_experiments.py --exp --plot --dir /TTC/
 > `vllm` — before the editable-install finder returns the real package at `/TTC/vllm/vllm/`.
 > Always `cd /TTC/FastTTS-thesis` (or any directory without a `vllm` subdirectory) first.
 
+### Profiling with Nsight Systems
+
+`nsys` is installed at `/opt/nvidia/nsight-compute/2024.1.1/host/target-linux-x64/nsys` and symlinked to `/usr/local/bin/nsys`, so it's on PATH in any shell or conda env. Use it whenever the question is "did this actually overlap?", "which engine ran this memcpy?", or "where is the GPU stalled?".
+
+Annotate phases of interest with NVTX so they're easy to spot in the timeline:
+
+```python
+import torch.cuda.nvtx as nvtx
+nvtx.range_push("prefetch_layer_5")
+# ... work ...
+nvtx.range_pop()
+```
+
+Common invocations (from any directory):
+
+```bash
+# CUDA + NVTX trace, output report next to the script
+nsys profile -o trace.nsys-rep --trace=cuda,nvtx --force-overwrite=true \
+    python my_benchmark.py
+
+# Per-memcpy timeline (rows tagged Pinned↔Device, with Stream ID, duration, throughput).
+# Useful for engine-attribution questions and overlap verification.
+nsys stats trace.nsys-rep --report gputrace | head -80
+
+# Aggregate kernel/memcpy summaries
+nsys stats trace.nsys-rep --report cuda_gpu_kern_sum --report cuda_gpu_mem_time_sum
+
+# Open the timeline GUI on the host machine (forwards via X11 / XQuartz / etc.)
+nsys-ui trace.nsys-rep   # if a GUI is available
+```
+
+`.nsys-rep` files can be opened in the Nsight Systems GUI on the host (the repo is bind-mounted, so no copy needed). For dense traces, use small focused probes (e.g., `David/Benchmarks/phase0/probe_engines.py`) rather than the full bench trace — easier to visually inspect a single behavior.
+
 ## FastTTS Architecture
 
 **Two-model system**: A generator LLM produces candidate solutions step-by-step; a verifier (PRM) scores each step to guide search.

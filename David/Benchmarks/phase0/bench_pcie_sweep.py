@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 0.3 — PCIe Bandwidth Sweep (Explicit Copy vs UVA)
+"""Phase 0.5.0 — PCIe Bandwidth Sweep (Explicit Copy vs UVA)
 
 Measures effective PCIe bandwidth for two mechanisms by which GPU code can
 access CPU-resident data:
@@ -27,7 +27,7 @@ The Planner picks the right curve for the right purpose:
   - Weight prefetch (MB scale, reused many times) → explicit copy
   - CPU-produced data that is consumed once (activation return) → explicit
     copy is still the right choice because UVA access patterns that re-read
-    (e.g. matmul) cannot use L2 cache; see `phase0_findings.md §0.3`.
+    (e.g. matmul) cannot use L2 cache; see `phase0_findings.md §0.5`.
 
 Usage:
     python bench_pcie_sweep.py

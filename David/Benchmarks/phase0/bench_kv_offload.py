@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Phase 0.7 - KV Offload Impact on FastTTS (Proof of Concept)
+Phase 0.8/0.9 - V1 FastTTS Baseline (§0.8) and KV Offload Impact (§0.9)
 
 A/B test: fasttts (SBE + prefix-aware scheduling on) vs. fasttts_kvoff
 (same plus CPU prefix-cache extension). Directly measures whether
@@ -36,7 +36,7 @@ Usage
 
 Outputs
 -------
-    David/Benchmarks/phase0/results/kv_offload/
+    David/Benchmarks/phase0/results/0.8_0.9_v1_offload/
         {dataset}_{method}_n{N}.log      per-run stdout/stderr
         summary.json                     parsed metrics, both methods, both datasets
         kv_offload_comparison.pdf        rows=datasets, cols={latency,
@@ -60,7 +60,7 @@ FASTTTS_DIR = Path("/TTC/FastTTS-thesis")
 # ----------------------------------------------------------------------------
 
 PHASE0_DIR = Path(__file__).resolve().parent
-RESULTS_DIR = PHASE0_DIR / "results" / "kv_offload"
+RESULTS_DIR = PHASE0_DIR / "results" / "0.8_0.9_v1_offload"
 
 GENERATOR = "7B-instruct"
 DATASETS = ["aime", "math500"]
@@ -112,7 +112,7 @@ def run_experiments(
             raise ValueError(f"unknown dataset {d!r}; expected one of {DATASETS}")
 
     print("=" * 72)
-    print(f"  Phase 0.7: KV Offload POC - {GENERATOR} / {datasets} / {methods}")
+    print(f"  Phase 0.8/0.9: V1 baseline + KV offload - {GENERATOR} / {datasets} / {methods}")
     print("=" * 72)
 
     for dataset in datasets:
@@ -469,7 +469,7 @@ def plot_results(results: dict, output_path: Path) -> None:
         ax_speedup.set_title(f"Paired kv_offload speedup — {dataset}")
 
     fig.suptitle(
-        "Phase 0.7 - KV Offload Impact on FastTTS",
+        "Phase 0.8/0.9 - V1 baseline + KV offload Impact on FastTTS",
         fontsize=14, fontweight="bold",
     )
     fig.tight_layout()
@@ -485,7 +485,7 @@ def plot_results(results: dict, output_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Phase 0.7 KV offload POC for FastTTS (7B + {aime, math500})"
+        description="Phase 0.8/0.9 V1 baseline + KV offload POC for FastTTS (7B + {aime, math500})"
     )
     parser.add_argument(
         "--exp", action="store_true", help="Run the full sweep (16 cells)"

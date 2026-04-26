@@ -177,6 +177,7 @@ CPU-resident weights are CPU-computed each forward; `f_prefetch = 0`. Ships as a
 - WO is untouched — stays fully GPU-resident, no CPU path, no prefetch path.
 - At model load: split each sub-module's weights into `W_gpu` and `W_cpu` along its assigned axis per the Planner's single `f_cpu_store` output (applied to WQKV/MLP1/MLP2 uniformly).
 - At forward: CPU and GPU compute their slices in parallel; assembly is `concat` for col-parallel and `add_` for row-parallel. For the MLP block, SwiGLU runs locally on each device's intermediate slice between MLP1 and MLP2 — no intermediate transfer (matched-index invariant is automatic under uniform dispatch).
+- **Activation return path: SM-issued UVA copy kernel** — CPU's GEMM output lands in pinned memory; a one-shot Triton kernel reads it via UVA mapping and writes to a GPU buffer for the assembly step. This bypasses CE0 (the H2D copy engine), so fg returns don't queue behind bg weight prefetches once Phase 1b ships. fg_s2c stays at ~30 μs/event regardless of bg state (`phase0_findings.md §0.5`). Downstream consumers always read from the GPU buffer, never from UVA — the one-shot access pattern is a load-bearing contract.
 
 **Planner output at this sub-milestone:** `f_cpu_store` (load-time scalar) and `f_cpu` per bucket (with `f_prefetch = 0`). Dispatch table collapses to a 1-D bucket → `f_cpu` lookup.
 
@@ -186,7 +187,7 @@ Add `f_prefetch` to the per-bucket dispatch: CPU-stored bytes not covered by `f_
 
 **Scope:**
 
-- Add layer-ahead prefetch queue: one prefetch operation per layer boundary covering `Σ_m (f_prefetch × W_m)` across WQKV/MLP1/MLP2. One `cudaStreamWaitEvent` per layer.
+- Add layer-ahead prefetch queue: one `cudaMemcpyAsync` (on CE0, the H2D copy engine) per layer boundary covering `Σ_m (f_prefetch × W_m)` across WQKV/MLP1/MLP2. One `cudaStreamWaitEvent` per layer. Bg prefetch and fg activation return use different PCIe paths (CE0 vs SM-issued UVA), so they share link BW but don't serialize on each other (`phase0_findings.md §0.5`).
 - Extend `CpuComputeDispatcher` to accept the `f_prefetch` share — prefetched weights land in the circular buffer and are consumed by the layer's GEMMs from GPU memory. `f_cpu_compute + f_prefetch_compute = f_cpu_store` exactly.
 - K/V-pin guard on WQKV (from 1a) ensures prefetch on WQKV only applies to Q columns above the K/V-bias boundary.
 - Planner's per-bucket output becomes a single `(f_cpu, f_prefetch)` pair — see `planner_design.md §4.2` and §7.3.
@@ -361,14 +362,16 @@ Phase 1a and 1b are sequential sub-milestones of the same mechanism (1b extends 
 3. **Uniform per-bucket dispatch across WQKV/MLP1/MLP2.** The Planner emits a
    single `(f_cpu, f_prefetch)` pair per bucket applied uniformly to the
    three offloaded sub-modules. Justified empirically by uniform CPU μs/MB
-   at decode (`phase0_findings.md §0.2`). The MLP1↔MLP2 matched-index
+   at decode (`phase0_findings.md §0.3.4`). The MLP1↔MLP2 matched-index
    invariant is automatic under uniform dispatch.
 
 4. **Layer-ahead prefetch (Phase 1b).** One prefetch queue per layer
    boundary, one sync per layer. Rejected tensor-ahead because its
    topological constraint would force per-sub-module f tuning to avoid
    prefetch starvation — needless given uniform CPU throughput and
-   resolved PCIe contention (`phase0_findings.md §0.9`).
+   layer-grain fg-wait bypass via SM-issued UVA copy kernel
+   (`phase0_findings.md §0.5`: fg activation returns use a separate
+   PCIe path from CE0, so they don't queue behind bg DMA prefetches).
 
 5. **K/V-biased WQKV column choice + K/V-pin guard.** Picker assigns CPU
    columns in priority order (K+V head pairs first, then Q tail). Runtime

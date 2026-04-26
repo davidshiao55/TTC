@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 0.2 — GPU / CPU Sub-Module Profiler
+"""Phase 0.3 — GPU / CPU Sub-Module Profiler
 
 Produces the first iteration of the Profiler's output for the generator
 (Qwen2.5-7B-Instruct) and verifier (Skywork-o1-Open-PRM-Qwen-2.5-1.5B).
@@ -125,7 +125,7 @@ def submodules(cfg) -> list[SubModule]:
         SubModule("WQKV", hidden, qkv_dim,                  axis="col"),
         # WO is col under Alt A (weight offloaded to CPU) and has no CPU path
         # under Alt B (WO stays GPU-resident). We profile it as col here so
-        # the Planner has the data if Alt A is chosen in §0.10c; if Alt B
+        # the Planner has the data if Alt A is chosen in §0.4.2; if Alt B
         # wins, this entry is unused at runtime but costs nothing to keep.
         SubModule("WO",   hidden, hidden,                   axis="col"),
         SubModule("MLP1", hidden, 2 * cfg["intermediate"],  axis="col"),
@@ -271,7 +271,7 @@ def measure_gpu_reduced_timing(cfg, num_tokens_buckets, slice_fracs):
 
 # ---------------------------------------------------------------------------
 # Note: num_tokens axis unification validation lives in `bench_num_tokens_axis.py`
-# (Phase 0.1) and covers both GPU and CPU F.linear paths.
+# (Phase 0.1) and covers both GPU and CPU F.linear paths. See §0.3 of phase0_findings.md.
 # ---------------------------------------------------------------------------
 
 
@@ -392,7 +392,7 @@ def main():
 
     cfg = MODEL_CONFIGS[args.model]
 
-    print(f"Phase 0.1+0.2 Profiler — {cfg['display_name']}")
+    print(f"Phase 0.3 Profiler — {cfg['display_name']}")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"PyTorch: {torch.__version__}  CPU threads: {torch.get_num_threads()}")
     print(f"MKL: {torch.backends.mkl.is_available()}  "

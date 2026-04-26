@@ -7,13 +7,32 @@ PyTorch 2.10.0+cu128, MKL enabled, oneDNN enabled.
 
 ---
 
-## 0.1: num_tokens axis unification
+## Contents
+
+**Compute substrate**
+- §0.1 — Dispatch axis: num_tokens unification
+- §0.2 — Split mechanism correctness
+- §0.3 — CPU/GPU compute characterization
+- §0.4 — Per-sub-module split-axis design
+
+**PCIe behavior**
+- §0.5 — PCIe behavior: bandwidth, contention, UVA bypass
+
+**System reference**
+- §0.6 — CPU attention latency (Phase 2 reference)
+- §0.7 — CUDA graph impact (Phase 4 priority)
+- §0.8 — vLLM V1 FastTTS baseline
+- §0.9 — vLLM V1 KV offload impact
+
+---
+
+## 0.1: Dispatch axis — num_tokens unification
 
 The Planner's dispatch table is keyed on a single scalar — the forward call's `num_tokens` (see `thesis_proposal.md §5.1` and `planner_design.md §4.5`). This requires that **GEMM arithmetic intensity depend only on `num_tokens`** and not on how those tokens are distributed across requests / prefill / decode. A failure of this assumption would force a second dispatch axis (prefill/decode ratio or per-request batch size).
 
 ### Why the claim should hold
 
-Mathematically, the matmul sees input `[num_tokens, hidden]` after vLLM's scheduler flattens all tokens into a single batch dimension. The shape is identical regardless of whether N tokens came from 1 prefill × N, N decodes × 1, or any mixed split — so the matmul cost should be identical too. Attention is a separate case (cost depends on `q_len` and `kv_len` per request) and is measured in §0.5 by its own `(B, S)` curve, not by the num_tokens dispatch.
+Mathematically, the matmul sees input `[num_tokens, hidden]` after vLLM's scheduler flattens all tokens into a single batch dimension. The shape is identical regardless of whether N tokens came from 1 prefill × N, N decodes × 1, or any mixed split — so the matmul cost should be identical too. Attention is a separate case (cost depends on `q_len` and `kv_len` per request) and is measured in §0.6 by its own `(B, S)` curve, not by the num_tokens dispatch.
 
 ### Empirical test — `bench_num_tokens_axis.py`
 
@@ -101,14 +120,36 @@ At very small CPU matmuls (≤2 ms absolute), OpenMP thread-scheduling variance 
 
 ---
 
-## 0.2: CPU/GPU Overlap Feasibility
+## 0.2: Split mechanism correctness
 
-### Split Axis Per Sub-Module: Matches vLLM TP
+Script: `David/Benchmarks/phase0/bench_split_correctness.py`.
 
-Our CPU offloading split follows vLLM's tensor-parallelism conventions,
-applying col-parallel or row-parallel per sub-module rather than uniformly
-column-parallel. TP shards across multiple GPUs; we shard across the
-GPU-CPU boundary — same mechanism, different destination.
+Verifies that the per-sub-module split mechanisms chosen in `weight_offload_design.md §Per-Sub-Module Split Axis` produce numerically equivalent results to unsplit computation. Four test families cover the full mechanism space used by Phase 1:
+
+| Family | Covers | Assembly op |
+|---|---|---|
+| A. Col-parallel contiguous   | WQKV, MLP1, WO (if Alt A)     | `concat` |
+| B. Col-parallel K/V-biased   | WQKV (design invariant)       | `index_copy_` into full shape |
+| C. Row-parallel contiguous   | MLP2                          | `add_` (partial-sum reduce) |
+| D. MLP1→MLP2 col→row pipeline | end-to-end MLP block         | `add_` on MLP2 partial sum |
+
+Sweep: `f_cpu ∈ {3%, 9%, 15%, 22%, 30%, 50%}` × `B ∈ {1, 8, 32}` for both models.
+
+**Tolerance**: 2% × output scale. BF16 has a 7-bit mantissa (~1.5% ulp at the top of its exponent range); large reductions (inner dim up to 18944) in different orders on GPU vs CPU amplify this to ~2%. `EXACT` means bitwise equal; `close` means within tolerance.
+
+**Result: ALL TESTS PASSED** for both Qwen2.5-7B-Instruct and Skywork-PRM-1.5B. Every `(f, B)` point across the four families falls within tolerance. The K/V-biased picker passes its structural invariants (head alignment, KV-group pairing below the boundary, full K+V + tail-Q above the boundary). Family D specifically validates the **matched-index invariant**: with CPU holding the same intermediate index set for MLP1's output and MLP2's input, each device applies SwiGLU on its local slice and MLP2 consumes the local slice directly, yielding output equal to the unsplit MLP block.
+
+This closes the correctness question for Phase 1's mixed col/row mechanism. The design-validation numbers (activation byte savings from col→row pipelining, and the Phase 2 WO offload decision) live in §0.4.
+
+---
+
+## 0.3: CPU/GPU compute characterization
+
+Three measurements gate weight-offload viability: GPU time per sub-module (the budget the CPU must fit inside), CPU time per sub-module (does it fit?), and concurrent overlap (does scheduling actually overlap them?). The Planner consumes these as `gpu_layer_timing`, `cpu_gemm_curve`, and `gpu_reduced_timing` curves; this section establishes their values for RTX 4090 + i9-14900KF and surfaces two implementation gotchas (`F.linear` mandatory; `μs/MB` uniformity).
+
+### Split axis per sub-module — matches vLLM TP
+
+Our CPU offloading split follows vLLM's tensor-parallelism conventions, applying col-parallel or row-parallel per sub-module rather than uniformly column-parallel. TP shards across multiple GPUs; we shard across the GPU-CPU boundary — same mechanism, different destination.
 
 ```
 WQKV, MLP1 — column-parallel (shard output dim)
@@ -119,23 +160,30 @@ MLP2       — row-parallel    (shard input dim)
   GPU:  [ (1-f_cpu) of input cols ]    CPU:  [ f_cpu of input cols ]
   Assembly: add-reduce (GPU_partial + CPU_partial).
 
-WO         — col if Alt A; no offload if Alt B (decided in §0.10c).
+WO         — col if Alt A; no offload if Alt B (decided in §0.4.2).
 ```
 
-This matches vLLM's `ColumnParallelLinear` (qkv_proj, gate_up_proj) and
-`RowParallelLinear` (down_proj, o_proj) pairing. For MLP1→MLP2 specifically,
-the col→row pairing keeps the intermediate activation local on each device —
-no GPU↔CPU round-trip on the MLP block. See `weight_offload_design.md
-§Per-Sub-Module Split Axis` for the full design, and §0.10 in this document
-for the measured split-axis correctness + MLP pipeline validation.
+This matches vLLM's `ColumnParallelLinear` (qkv_proj, gate_up_proj) and `RowParallelLinear` (down_proj, o_proj) pairing. For MLP1→MLP2 specifically, the col→row pairing keeps the intermediate activation local on each device — no GPU↔CPU round-trip on the MLP block. See `weight_offload_design.md §Per-Sub-Module Split Axis` for the full design, §0.2 for split-mechanism correctness, and §0.4.1 for the MLP pipeline validation.
 
-The key difference from TP: TP splits to a fast GPU with NVLink/PCIe
-interconnect; our split sends work to a slower CPU with the partial result
-returned via PCIe. The overlap question is whether CPU finishes its portion
-before the GPU finishes its portion — if yes, the split is free (like TP
-where both ranks finish together).
+The key difference from TP: TP splits to a fast GPU with NVLink/PCIe interconnect; our split sends work to a slower CPU with the partial result returned via PCIe. The overlap question is whether CPU finishes its portion before the GPU finishes its portion — if yes, the split is free (like TP where both ranks finish together).
 
-### Critical Discovery: `F.linear` vs `torch.mm` for BF16 on CPU
+### 0.3.1: GPU layer baseline
+
+GPU is memory-bandwidth-bound during decode — layer time is nearly constant across batch sizes, determined by weight read time at ~1008 GB/s.
+
+| Sub-module | Weight (BF16) | GPU time (B=1) | GPU time (B=16) | GPU BW% |
+|---|---|---|---|---|
+| WQKV | 33.0 MB | 0.019 ms | 0.020 ms | ~83% |
+| WO | 25.7 MB | 0.017 ms | 0.019 ms | ~80% |
+| MLP1 | 271.6 MB | 0.287 ms | 0.295 ms | ~94% |
+| MLP2 | 135.8 MB | 0.148 ms | 0.153 ms | ~92% |
+| **Total** | **466.1 MB** | **0.470 ms** | **0.487 ms** | |
+
+WQKV and WO achieve >100% of DRAM bandwidth at B≥4 due to L2 cache effects (33 MB and 26 MB weights vs RTX 4090's 72 MB L2).
+
+### 0.3.2: CPU compute path
+
+#### Critical discovery — `F.linear` vs `torch.mm` for BF16 on CPU
 
 **`torch.mm` with BF16 on CPU is catastrophically slow** — 100-250x slower than FP32.
 It falls back to a naive scalar path because the i9-14900KF lacks AMX/AVX512-BF16
@@ -161,7 +209,7 @@ model weight format.
 **Design decision: use `F.linear` with BF16 weights on CPU.** No FP32 weight
 duplication needed. The `CpuComputeDispatcher` must use `F.linear`, not `torch.mm`.
 
-### BF16 F.linear Scaling with Batch Size
+#### BF16 `F.linear` scaling with batch size
 
 BF16 `F.linear` loses its advantage at higher batch sizes as the operation
 transitions from memory-BW-bound to compute-bound. The BF16→FP32 software
@@ -182,23 +230,7 @@ Despite the scaling penalty, BF16 is the correct choice because:
 2. TTC decode batch sizes are moderate (4-32 beams)
 3. The absolute times still allow useful overlap with GPU at small f_cpu
 
-### GPU Layer Time Baseline (RTX 4090, BF16 F.linear)
-
-GPU is memory-bandwidth-bound during decode — layer time is nearly constant
-across batch sizes, determined by weight read time at ~1008 GB/s.
-
-| Sub-module | Weight (BF16) | GPU time (B=1) | GPU time (B=16) | GPU BW% |
-|---|---|---|---|---|
-| WQKV | 33.0 MB | 0.019 ms | 0.020 ms | ~83% |
-| WO | 25.7 MB | 0.017 ms | 0.019 ms | ~80% |
-| MLP1 | 271.6 MB | 0.287 ms | 0.295 ms | ~94% |
-| MLP2 | 135.8 MB | 0.148 ms | 0.153 ms | ~92% |
-| **Total** | **466.1 MB** | **0.470 ms** | **0.487 ms** | |
-
-WQKV and WO achieve >100% of DRAM bandwidth at B≥4 due to L2 cache effects
-(33 MB and 26 MB weights vs RTX 4090's 72 MB L2).
-
-### Per-Sub-Module Overlap Results
+### 0.3.3: Per-sub-module overlap
 
 Each CPU sub-module runs in parallel with its GPU counterpart. The constraint
 is per-sub-module: CPU time ≤ GPU time for zero overhead.
@@ -238,7 +270,9 @@ Key observations:
 - **MLP1 dominates offloaded-layer cost.** At f_cpu=30%, MLP1 accounts for ~78%
   of the layer overhead.
 
-### Throughput Tradeoff Framing
+**Visual evidence — `probe_overlap.py`.** A 1-second nsys probe at WQKV, f_cpu=9%, B=1 timeline-confirms CPU+GPU concurrency. Phase A (`A_gpu_only`) and B (`B_cpu_only`) ground-truth the per-side durations; Phase C (`C_concurrent`) shows the GPU bar and CPU `F.linear` bar overlapping in time. Run `nsys profile -o probe_overlap.nsys-rep --trace=cuda,nvtx,osrt --force-overwrite=true python probe_overlap.py` and inspect in Nsight Systems GUI.
+
+#### Throughput tradeoff framing
 
 The claim that "f_cpu≈9% is free" holds **only at B=1 decode** on this hardware:
 - At B=1, all sub-modules fit within GPU time → genuinely free.
@@ -248,7 +282,7 @@ The claim that "f_cpu≈9% is free" holds **only at B=1 decode** on this hardwar
 
 The specific number `9%` is a property of this (HW, model, dtype) combination at B=1, not a universal constant. The Planner (see `planner_design.md`) derives bucket-specific values from the profile, so the number used in practice varies per `BatchDescriptor`.
 
-### CPU μs/MB Uniformity Across Sub-Modules
+### 0.3.4: CPU μs/MB uniformity across sub-modules
 
 The Planner's single-`(f_cpu, f_prefetch)`-per-bucket design (see `planner_design.md §4.2`) rests on the empirical claim that **CPU GEMM throughput in μs/MB is uniform across the four sub-modules** at decode-regime batch sizes. This subsection documents the measurement that justifies the claim.
 
@@ -276,105 +310,268 @@ At B=16 and B=64 (the dominant decode regime), the per-MB throughput is flat wit
 
 ---
 
-## Profiler Outputs and Constraints
+## 0.4: Per-sub-module split-axis design
 
-These measurements feed directly into the Planner's profile tables (see `profiler_design.md` §1):
+§0.2 closed the correctness question for the mixed col/row split mechanism. This section covers the two measured design claims that commit Phase 1 and Phase 2 to specific axis choices: the MLP1→MLP2 col→row pipelining saves activation PCIe, and the WO offload alternatives (Alt A weight-split vs. Alt B GPU-resident) diverge enough to pick one globally.
 
-1. **Use `F.linear` for CPU compute, never `torch.mm`** — the single most
-   important implementation detail. BF16 on non-AMX CPUs goes through a scalar
-   fallback in `torch.mm` (100–250× slower). `F.linear` dispatches to oneDNN's
-   optimized kernel. The Profiler's `cpu_gemm_curve` must be measured with
-   `F.linear`.
+### 0.4.1: MLP1→MLP2 pipelining — empirical wall-clock & PCIe comparison
 
-2. **BF16 weights on CPU** — no FP32 conversion needed, saving memory.
+Script: `David/Benchmarks/phase0/bench_mlp_pipeline.py`.
 
-3. **Non-uniform GPU idle budget per sub-module** — WQKV/WO have tiny GPU
-   budgets (~0.02 ms), MLP1/MLP2 have large ones (~0.15–0.29 ms). The Planner's
-   dispatch table naturally produces non-uniform `f_cpu_compute` per sub-module
-   because its idle-budget heuristic uses these per-sub-module timings.
+The col→row pairing eliminates the intermediate round-trip that uniform-col would require between MLP1 and MLP2. Under uniform col, CPU computes a slice of `gate_up` (MLP1 output), returns it to GPU, GPU concatenates and applies SwiGLU on the full intermediate, then GPU re-sends the full intermediate back to CPU as MLP2's input. With col→row, CPU keeps its `gate_up` slice locally, applies SwiGLU in place on its slice, and feeds the local slice into its row slice of `W_down` — zero intermediate transfer.
 
-4. **For resident layers (7B), WQKV CPU offload is marginal** — the small
-   k,v result (~32 KB at B=16) can just be transferred to CPU suffix KV
-   after GPU computation. The Q|K|V split is primarily useful for offloaded
-   layers where weights must be on CPU anyway.
+To empirically validate the savings claim, we implemented both patterns end-to-end on the real CPU/GPU critical path and compared per-MLP-block wall-clock time and PCIe byte count. Each step is timed in its actual position in the serial CPU critical path, with GPU steps timed via CUDA events. CPU is the bottleneck in the decode regime (CPU GEMM ≫ GPU compute at small-batch decode), so the serial CPU-side sum approximates block wall-clock.
 
-5. **MLP1 is the dominant target for prefetch** — it's the largest sub-module
-   (271 MB) and limits offloaded-layer latency at f_cpu > ~15%. Phase 3
-   prefetch sizing should prioritize MLP1.
+**Qwen2.5-7B-Instruct:**
 
-6. **Hardware dependency**: CPUs with AMX (Sapphire Rapids+) would eliminate
-   the BF16 scaling penalty, making higher `f_cpu_compute` viable at larger
-   batch sizes. The mechanisms (column-parallel split, CpuComputeDispatcher)
-   are hardware-independent; the Planner re-derives optimal values from a new
-   profile on different hardware.
+|   N |    f | col total | col→row total | Δ (ms) | col PCIe | col→row PCIe | PCIe ratio |
+|----:|-----:|----------:|--------------:|-------:|---------:|-------------:|-----------:|
+|  16 |  10% |   2.25 ms |       2.30 ms |  -0.05 |  0.85 MB |      0.23 MB |    **3.72×** |
+|  16 |  30% |   6.81 ms |       6.81 ms |  +0.00 |  1.12 MB |      0.23 MB |    **4.88×** |
+|  64 |  10% |   8.99 ms |       9.14 ms |  -0.15 |  3.41 MB |      0.92 MB |    **3.72×** |
+|  64 |  30% |  27.24 ms |      27.12 ms |  +0.13 |  4.48 MB |      0.92 MB |    **4.88×** |
+| 128 |  10% |  18.28 ms |      18.48 ms |  -0.19 |  6.83 MB |      1.84 MB |    **3.72×** |
+| 128 |  30% |  54.48 ms |      57.71 ms |  -3.24 |  8.95 MB |      1.84 MB |    **4.88×** |
+
+**Skywork-PRM-1.5B:**
+
+|   N |    f | col total | col→row total | Δ (ms) | col PCIe | col→row PCIe | PCIe ratio |
+|----:|-----:|----------:|--------------:|-------:|---------:|-------------:|-----------:|
+|  16 |  10% |   0.55 ms |       0.52 ms |  +0.03 |  0.40 MB |      0.10 MB |    **4.05×** |
+|  16 |  30% |   1.46 ms |       1.44 ms |  +0.02 |  0.52 MB |      0.10 MB |    **5.32×** |
+|  64 |  10% |   2.03 ms |       2.02 ms |  +0.01 |  1.59 MB |      0.39 MB |    **4.05×** |
+|  64 |  30% |   5.79 ms |       5.70 ms |  +0.10 |  2.09 MB |      0.39 MB |    **5.32×** |
+| 128 |  10% |   4.01 ms |       4.00 ms |  +0.01 |  3.18 MB |      0.79 MB |    **4.05×** |
+| 128 |  30% |  11.63 ms |      11.46 ms |  +0.17 |  4.18 MB |      0.79 MB |    **5.32×** |
+
+Δ (ms) = col_total − col→row_total. Positive Δ means col→row is faster.
+
+**Observations.**
+
+1. **PCIe byte savings are real and large**: 3.72–5.32× less activation PCIe per MLP block, independent of `N` and `f`. This matches the analytical byte count: the dominant saving is eliminating the full-intermediate H2D that uniform col requires for MLP2's input.
+
+2. **Wall-clock is essentially flat between patterns** (Δ within ±0.5 ms in all but one point). CPU GEMM dominates the MLP block critical path, and the CPU GEMM FLOPs are identical between patterns (MLP1 is the same shape; MLP2's row-slice has the same FLOP count as col-slice, just a different matmul shape). Saving PCIe bytes does not shorten the MLP block wall-clock in this regime because PCIe is not the bottleneck of the MLP block.
+
+3. **The saved bytes are not wasted, though.** PCIe H2D is a contended resource with weight prefetch (§0.5). Col→row's 3.72–5.32× reduction means weight prefetch sees that much less activation-traffic contention — a Phase-3-critical property. At N=128 on 7B, uniform col injects ~9 MB of activation H2D per MLP block × 28 layers ≈ 250 MB/decode step (~11 ms at 22 GB/s), while col→row injects only ~51 MB/step (~2.3 ms). The difference is time the Phase 3 weight-prefetch pipeline recovers.
+
+4. **One wall-clock anomaly**: at 7B, N=128, f=30%, col→row is 3.24 ms slower. Traceable to the `cpu_mlp1` step: oneDNN picks a different microkernel for the contiguous `2·cpu_inter × hidden` weight shape in col→row vs. the larger same-axis col weight in uniform col. Noise from oneDNN heuristic crossing at that shape; not a design defect.
+
+**Conclusion.** The design claim "col→row eliminates the intermediate round-trip and saves ~3–5× activation PCIe" is empirically confirmed on both models. The saving is in PCIe bytes, not in MLP-block wall-clock — but the saved bytes translate directly into weight-prefetch bandwidth for Phase 3, where activation vs prefetch contention was called out in §0.5 as a real concern. Col→row pays no wall-clock tax and frees real PCIe budget. Adopted for Phase 1.
+
+### 0.4.2: WO offload — Alt A vs Alt B decision
+
+Script: `David/Benchmarks/phase0/bench_wo_offload_tradeoff.py`.
+
+Two alternatives for WO after the Phase 2 attention merge, described in `weight_offload_design.md §WO Split Axis Decision`:
+
+- **Alt A (col-split WO with merge-before-WO)**: CPU holds `f · WO_bytes` of weight. GPU merges `attn_out`, sends CPU's input slice via H2D, CPU computes its partial, D2H back for concat on GPU. Saves `f · 686 MB` of GPU WO weight at 7B.
+- **Alt B (no WO offload)**: GPU does full WO after merge. No H2D/D2H of merged `attn_out`. CPU has no WO work. WO occupies 686 MB on GPU at 7B.
+
+**TL;DR — WO is the smallest matmul in the layer, and sits in the worst place for offload.** Per-layer BF16 weight sizes on Qwen2.5-7B: MLP1 272 MB, MLP2 136 MB, WQKV 37 MB, **WO 26 MB** (smallest). The per-MB CPU latency tax of offloading is roughly constant across sub-modules (CPU matmul throughput doesn't care which weight it's computing — just shape and FLOPs), so offloading WO pays the **same tax rate** as MLP1 but saves **~10× fewer bytes per unit of f**. MLP1 justifies the tax rate because its absolute memory gain is large enough to matter; WO does not.
+
+On top of the size disadvantage, Alt A has a structural communication cost the MLP offload does not: WO sits **after** the attention merge, so Alt A forces 3 PCIe hops per layer (CPU→GPU for attn merge → GPU→CPU to hand merged attn_out to CPU → CPU→GPU to return the partial), vs. the 2 natural hops of MLP's col→row pattern. Either the per-MB argument or the extra-hop argument alone would reject Alt A at 7B; together they make the decision robust.
 
 ---
 
-## 0.3: PCIe Bandwidth (Explicit Copy vs. UVA Read)
+The attention / merge phases are identical in both alternatives, so the comparison reduces to a post-merge differential:
 
-Measured by `bench_pcie_sweep.py` on RTX 4090 + i9-14900KF with pinned memory. Two mechanisms for moving CPU-resident data where GPU code can use it:
+```
+Δ_latency(f, N) = max(t_WO_reduced_gpu,  H2D_merged + t_WO_cpu + D2H_partial)
+                  − t_WO_full_gpu
+```
 
-1. **Explicit copy** (`cudaMemcpyAsync`, PyTorch `tensor.copy_()` on pinned memory). Lands in GDDR6X. Subsequent GPU reads hit GDDR6X at ~1 TB/s.
-2. **UVA** (Unified Virtual Addressing via `get_cuda_view_from_cpu_tensor`). No physical copy — GPU kernels read pinned CPU memory directly over PCIe during execution. No L2 caching of PCIe BAR reads.
+Measured on RTX 4090 + i9-14900KF, BF16, pinned-memory PCIe, sweep `N ∈ {1, 16, 64, 128}` × `f ∈ {10%, 20%, 30%, 50%}`:
 
-### Size Sweep
+**Qwen2.5-7B-Instruct (hidden=3584, WO total = 686 MB across 28 layers):**
 
-| Size | H2D copy (GB/s) | D2H copy (GB/s) | UVA read (GB/s) |
-|---:|---:|---:|---:|
-| 0.25 MB | 11.30 | 15.29 | 13.98 |
-| 1 MB | 20.18 | 22.20 | 20.01 |
-| 4 MB | 22.80 | 25.16 | 23.05 |
-| 10 MB | 23.51 | 25.89 | 23.65 |
-| 100 MB | 23.80 | 26.31 | 23.96 |
-| 500 MB | 23.92 | 26.38 | 24.01 |
+|   f | max Δ / layer | max Δ / decode step (28 layers) | GPU memory saved | % of 24 GB budget |
+|----:|----:|----:|----:|----:|
+| 10% | +1.14 ms | +32.1 ms | 72 MB | 0.3% |
+| 20% | +4.62 ms | +129.4 ms | 144 MB | 0.6% |
+| 30% | +8.33 ms | +233.2 ms | 216 MB | 0.9% |
+| 50% | +12.40 ms | +347.2 ms | 360 MB | 1.5% |
 
-Asymptotic H2D ≈ 24 GB/s (~76% of PCIe 4.0 x16 theoretical 31.5 GB/s); D2H ≈ 26 GB/s. Explicit copy and UVA read track each other within a few percent across the full range — the underlying PCIe link is the bottleneck, not the mechanism.
+**Skywork-PRM-1.5B (hidden=1536, WO total = 132 MB across 28 layers):**
 
-### Key Transfer Sizes for the Thesis
+|   f | max Δ / layer | max Δ / decode step | GPU memory saved | % of 24 GB budget |
+|----:|----:|----:|----:|----:|
+| 10% | +4.28 ms | +119.7 ms | 13 MB | 0.05% |
+| 20% | +6.30 ms | +176.5 ms | 26 MB | 0.11% |
+| 30% | +11.95 ms | +334.5 ms | 40 MB | 0.17% |
+| 50% | +9.73 ms | +272.5 ms | 66 MB | 0.28% |
 
-| Purpose | Size | H2D copy | UVA read |
-|---|---:|---:|---:|
-| CPU K+V output per step (B=16, kv_dim=1024, bf16) | 33 KB | 3.57 GB/s | 4.10 GB/s |
-| Activation result (B=16, hidden=3584, bf16) | 115 KB | 9.40 GB/s | 8.04 GB/s |
-| 9% MLP1 weight slice | 4 MB | 22.85 GB/s | 23.09 GB/s |
-| Full layer weight (7B) | 466 MB | 23.91 GB/s | 24.00 GB/s |
+**Reading the numbers.** The latency tax is expressed as a fraction of a typical decode step (~30 ms), the memory gain as a fraction of the 24 GB GPU budget. At 7B f=10%, Alt A roughly doubles decode step time to save 0.3% of the GPU budget — a bad trade by any reading. The ratio gets worse with `f` (latency scales super-linearly with CPU GEMM size once oneDNN tiling crosses microkernel boundaries, while memory scales linearly).
 
-### Design Implications
+**Decision: Alt B.** Phase 2 keeps WO fully GPU-resident. WO has no entry in `cpu_gemm_curve` at runtime (though the profile table keeps it under the "col" axis — §0.2 validated correctness for Alt A in case a future phase revisits the decision). This commits `weight_offload_design.md §WO Split Axis Decision` to the no-offload alternative.
+
+**When to revisit.** The argument reverses when GPU memory becomes the binding constraint. At 14B in Phase 3, the model weights alone (~28 GB BF16) exceed the 24 GB budget before any offload. Even with aggressive offload on the larger sub-modules, every MB of GPU memory matters — and WO at 14B is ~1.3 GB, so a 30% offload frees ~390 MB, which is 3–5% of the remaining budget rather than 1%. In that regime the memory fraction gain is binding enough that the latency tax may be justified. Repeat the §0.4.2 procedure against the 14B decode workload before Phase 3 locks in; if the ratios flip, switch to Alt A for WO at 14B only.
+
+### 0.4.3: Phase 1/2 design commitments
+
+Locked for Phase 1 implementation:
+
+1. **Split axes**: WQKV = col (K/V-biased), MLP1 = col, MLP2 = row, WO = not offloaded (fully GPU-resident in Phase 1/2). `CpuComputeDispatcher` implements col + row paths for the three offloaded sub-modules; WO has no CPU path, no prefetch path.
+2. **Uniform per-bucket dispatch**: Planner emits one `(f_cpu, f_prefetch)` pair per `num_tokens` bucket, applied uniformly to WQKV, MLP1, and MLP2. The MLP1↔MLP2 matched-index invariant is automatic under uniform dispatch (same scalars → same index set selected by construction). See `planner_design.md §4.2` and the §0.3.4 uniformity subsection for the empirical basis.
+3. **Layer-ahead prefetch (Phase 1b)**: single prefetch queue per layer boundary, one `cudaStreamWaitEvent` per layer. Tensor-ahead rejected — see `pcie_bandwidth_allocation_design.md`.
+4. **Assembly operations**: col → `torch.cat` along output dim; row → `.add_` on the partial sum. Both correctness-validated in §0.2 at every tested `(f, B)` for both models.
+
+---
+
+## 0.5: PCIe behavior — bandwidth, contention, UVA bypass
+
+Per-layer in Phase 1b, weight prefetch (**bg**) and CPU-compute activation returns (**fg**) both target the H2D direction on PCIe. This section answers:
+
+1. What single-direction PCIe bandwidth is available (the baseline)?
+2. How does same-direction H2D contention behave on RTX 4090?
+3. What mechanism keeps fg latency bounded under continuous bg prefetch?
+
+**Methodology — nsys-driven (CUPTI ground truth).** Contention timings come from CUPTI activity records in nsys SQLite exports, not from CUDA event API calls. Each iteration is wrapped in NVTX ranges; per-role NVTX sub-ranges (`submit_fg`, `submit_bg`) tag launches. The parser correlates GPU-side memcpy/kernel events to their submitting role via CUPTI runtime `correlationId`. Source: `bench_contention.py` (orchestrator + workload modes); data: `results/0.5_pcie/contention.json` (the orchestrator deletes the `.nsys-rep`/`.sqlite` after parsing — for visual inspection use the focused probes `probe_engines.py` / `probe_uva_bypass.py`, whose traces land in `results/0.5_pcie/probe_traces/`). Single-direction baseline timings (§0.5.0) are CUDA-event-driven via `bench_pcie_sweep.py`.
+
+**Key metric: `fg_s2c` (submission-to-complete latency).** Time from the host-side `submit_fg` NVTX range start to fg's last GPU activity end. This includes any wait fg incurs in the CE0 FIFO. CUDA-event-based `fg_active` time captures only the on-engine kernel duration and hides wait — the deprecated framing of this section confused the two.
+
+**Hardware context.** RTX 4090 reports `asyncEngineCount = 2`. NSys engine attribution (`probe_engines.py`) confirms: **CE0 = H2D, CE1 = D2H, neither services the other direction.** Two H2D operations on different streams must queue on CE0; H2D and D2H on different streams use CE0 + CE1 concurrently.
+
+**Three PCIe traffic paths from the GPU side.** This is the architectural detail that makes UVA bypass possible:
+
+| Path | Hardware | Used by |
+|---|---|---|
+| **CE0** (H2D copy engine) | Dedicated DMA engine, single FIFO | `cudaMemcpyAsync` host→device |
+| **CE1** (D2H copy engine) | Dedicated DMA engine, single FIFO | `cudaMemcpyAsync` device→host |
+| **SM-initiated PCIe** | SMs → L1 → L2 → GPU MMU → PCIe root complex | UVA reads/writes from kernels |
+
+Engine-level FIFOs serialize within an engine (two H2D ops both go to CE0 → queue). The PCIe link itself is shared at packet level across all three paths — multiple sources can have transactions in flight simultaneously, with bandwidth split by the link arbiter. The serialization in §0.5.1 is engine-level, not link-level. UVA bypasses CE0's FIFO by using a separate hardware path; it still shares link BW with CE0 traffic, but doesn't queue behind it.
+
+### 0.5.0: PCIe bandwidth reference card
+
+Measured by `bench_pcie_sweep.py` on RTX 4090 + i9-14900KF with pinned memory. Single-direction H2D and D2H size-vs-bandwidth curve for `cudaMemcpyAsync` over the PCIe 4.0 x16 link; used as the baseline for Planner cost models. Two-direction dynamics are in §0.5.1–§0.5.4 below.
+
+#### Size sweep
+
+| Size | H2D (GB/s) | D2H (GB/s) |
+|---:|---:|---:|
+| 0.25 MB | 11.30 | 15.29 |
+| 1 MB    | 20.18 | 22.20 |
+| 4 MB    | 22.80 | 25.16 |
+| 10 MB   | 23.51 | 25.89 |
+| 100 MB  | 23.80 | 26.31 |
+| 500 MB  | 23.92 | 26.38 |
+
+Asymptotic H2D ≈ 24 GB/s (~76% of PCIe 4.0 x16 theoretical 31.5 GB/s); D2H ≈ 26 GB/s. D2H is consistently slightly faster than H2D across all sizes.
+
+#### Key transfer sizes for the thesis
+
+| Purpose | Size | H2D BW |
+|---|---:|---:|
+| CPU K+V output per step (B=16, kv_dim=1024, bf16) | 33 KB | 3.57 GB/s |
+| Activation result (B=16, hidden=3584, bf16)        | 115 KB | 9.40 GB/s |
+| 9% MLP1 weight slice                              | 4 MB | 22.85 GB/s |
+| Full layer weight (7B)                            | 466 MB | 23.91 GB/s |
+
+#### Design implications
 
 1. **Small transfers pay a launch-overhead tax.** KB-scale H2D transfers achieve only 15–40% of peak bandwidth. The Planner's cost model for the CPU-compute activation round-trip must index into the correct size bin; assuming saturated 22 GB/s would overestimate by 3–5×.
 
 2. **MB-scale weight prefetch runs near peak.** A 4 MB weight slice saturates to ~96% of peak H2D. This validates the quantitative premise of `pcie_bandwidth_allocation_design.md` — bulk prefetch operates in the saturated regime.
 
-3. **D2H > H2D across all sizes.** The Phase 2 KV-spill-to-CPU path uses D2H, which is both faster in isolation and (as §0.9b shows) does not contend with weight prefetch H2D.
+### 0.5.1: Same-direction H2D serializes on CE0
 
-4. **PCIe BW is the bottleneck, not the transfer mechanism.** Both explicit copy and UVA-read achieve essentially the same effective BW across all sizes. The choice between them is determined by what happens *after* the data arrives — not by how efficiently the bytes traverse PCIe. See §0.9 for the consumption-pattern analysis that drives the final mechanism recommendation.
+Two equal-sized pure-H2D transfers on separate streams, `fg_first`. Each transfer's wall ≈ iso wall (full BW for its active period); aggregate wall ≈ 2× iso (sum-of-bytes / link-BW).
+
+| size | iso wall | fg active (co) | bg active (co) | iter wall | wall / iso |
+|---|---:|---:|---:|---:|---:|
+| 1 MB  |   45.0 μs |   45.0 μs |   45.0 μs |    91.4 μs | **2.03×** |
+| 4 MB  |  176.3 μs |  176.3 μs |  176.4 μs |   354.0 μs | **2.01×** |
+| 16 MB |  701.5 μs |  701.5 μs |  701.6 μs |  1404.4 μs | **2.00×** |
+| 64 MB | 2802.3 μs | 2802.0 μs | 2802.1 μs |  5605.4 μs | **2.00×** |
+
+**Verdict: pure serialization on CE0.** Aggregate H2D throughput cannot exceed link BW because only one engine carries H2D. NSys timeline (`probe_engines.py` phase A): two H2D ops on alternating streams run sequentially on CE0, no interleaving. Layer-level implication: **once bg chunks are queued on CE0, fg's `cudaMemcpyAsync` goes to the end of the queue** — its wait scales with total queued bg, not just the in-flight chunk's remainder.
+
+### 0.5.2: Bidirectional H2D + D2H
+
+H2D weight prefetch on CE0 and D2H KV spill on CE1 run concurrently. Measured: aggregate throughput exceeds either unidirectional baseline (CE0 + CE1 are physically separate engines), so the engines work in parallel. **H2D is undisturbed by concurrent D2H** (708 μs solo → 708 μs under D2H pressure). **D2H drops 36% under H2D pressure** (link-arbiter favors inbound writes), but at 100 KB-scale KV chunks (~10 μs each) the absolute cost is dwarfed by the 178 μs prefetch window. **KV spill on D2H does not block weight prefetch.** Watch-item: the comfort margin shrinks if per-step KV-spill volume grows.
+
+### 0.5.3: DMA vs UVA copy kernel — isolated and under contention
+
+The design-relevant comparison: in isolation and under continuous bg DMA, what is fg's submission-to-complete latency?
+
+| fg path | bg state | **fg_s2c** | fg active | bg active | iter wall |
+|---|---|---:|---:|---:|---:|
+| dma_copy        | none (no bg) |  **15.4 μs** |  5.3 μs | —      |  18.3 μs |
+| uva_copy_kernel | none (no bg) |  **24.0 μs** |  6.4 μs | —      |  26.2 μs |
+| dma_copy        | with 4MB bg  | **181.3 μs** |  5.4 μs | 176 μs | 196.3 μs |
+| uva_copy_kernel | with 4MB bg  |  **34.1 μs** | 12.9 μs | 180 μs | 194.7 μs |
+
+**Two regimes, opposite winners.**
+- **Isolated**: DMA wins by 8.6 μs (15.4 vs 24.0). UVA's launch overhead and slightly higher kernel cost.
+- **Under bg**: UVA wins by **147 μs** (34.1 vs 181.3). DMA fg waits behind bg in CE0's FIFO; UVA fg runs on SMs through the GPU MMU path concurrently with CE0.
+
+UVA's `fg_active` rises from 6.4 μs (isolated) to 12.9 μs (under bg) — link-arbiter sharing with CE0 cuts the kernel's effective BW roughly in half. But the kernel still finishes inside bg's 178 μs window, so `fg_s2c` is dominated by kernel duration plus launch overhead, not by bg's transfer time. This is the bypass: UVA goes on a separate engine path, sharing link BW packet-wise rather than queueing.
+
+### 0.5.4: Validation — 4 fg variants × bg chunk sizes
+
+Continuous bg DMA at 4 MB total volume, varying chunk size. `bg_first` ordering exposes the queue-blocking dynamic. Four fg variants test the bypass robustness and the access-pattern contract:
+
+- `dma_copy` — `cudaMemcpyAsync` of 98 KB (Option A baseline; tests whether chunked bg gives DMA fg enough relief)
+- `uva_copy_kernel` — Triton kernel reading UVA, writing to GPU buffer (Option B, the bypass)
+- `uva_matmul` — UVA tensor as matmul input (broken pattern, strawman for the access-pattern contract)
+- `dma_into_matmul` — DMA copy + matmul (full Phase 1b fg op shape including compute tail)
+
+| variant | chunk | **fg_s2c** | fg active | bg s2c | iter wall |
+|---|---:|---:|---:|---:|---:|
+| `dma_copy`         | 64 KB |  122 μs |  5.3 μs | 317 μs | 326 μs |
+| `dma_copy`         | 256 KB | 166 μs |  5.3 μs | 217 μs | 228 μs |
+| `dma_copy`         | 1 MB  |  178 μs |  5.4 μs | 194 μs | 203 μs |
+| `dma_copy`         | 4 MB  |  181 μs |  5.4 μs | 187 μs | 196 μs |
+| **`uva_copy_kernel`** | 64 KB | **29 μs** |  8.5 μs | 320 μs | 323 μs |
+| **`uva_copy_kernel`** | 256 KB | **32 μs** | 12.3 μs | 222 μs | 225 μs |
+| **`uva_copy_kernel`** | 1 MB  | **35 μs** | 13.0 μs | 198 μs | 202 μs |
+| **`uva_copy_kernel`** | 4 MB  | **34 μs** | 12.9 μs | 191 μs | 195 μs |
+| `uva_matmul`       | 64 KB | 578 μs | 560 μs | 836 μs | 840 μs |
+| `uva_matmul`       | 4 MB  | 710 μs | 694 μs | 594 μs | 725 μs |
+| `dma_into_matmul`  | 64 KB | 151 μs | 23 μs | 316 μs | 350 μs |
+| `dma_into_matmul`  | 4 MB  | 208 μs | 23 μs | 186 μs | 222 μs |
+
+**Three regimes confirmed by `fg_s2c`:**
+
+1. **`dma_copy` waits behind bg**: fg_s2c scales 122 → 181 μs as chunks grow. Small chunks (64 KB) leave driver-side gaps that fg sneaks into; large chunks (4 MB) make fg wait the full bg duration. **Chunking helps but doesn't eliminate the wait.**
+2. **`uva_copy_kernel` bypasses CE0**: fg_s2c stays 29–35 μs across all chunk sizes. **The bypass holds on RTX 4090.** The slight rise reflects link-BW sharing as bg becomes more sustained.
+3. **`uva_matmul` is broken**: fg_s2c 578–710 μs. The cuBLAS GEMM access pattern over UVA blows up PCIe traffic; fg is slow *and* it starves bg (bg_s2c also degraded). Mechanism not pinned down (would require Nsight Compute), but the empirical "don't use UVA as a re-read kernel input" contract is validated.
+
+`dma_into_matmul` is the realistic Phase 1b shape: DMA copy + matmul tail. fg_s2c at 4 MB chunk = 208 μs (181 μs of wait + ~23 μs of matmul) — what we'd actually pay if we picked Option A.
+
+NSys timeline confirms physical concurrency for `uva_copy_kernel`: the Triton kernel on the SM stream starts *inside* bg's CE0 window and overlaps for its full ~13 μs duration. SM and CE0 are different hardware paths to the same link.
+
+**Phase 1b production budget** (3 fg events per layer, 7B decode, ~500 μs/layer compute window):
+
+| approach | fg_s2c per event | total fg cost / layer |
+|---|---:|---:|
+| dma_copy + 4 MB single-shot bg | 181 μs (full wait) | **~543 μs** (kills the layer) |
+| dma_copy + 64 KB chunked bg    | 122 μs (partial wait, 30% bg BW penalty) | ~366 μs |
+| **uva_copy_kernel + any bg**   | **34 μs (no wait)** | **~102 μs** |
+
+UVA copy kernel wins decisively at production scale. The 8.6 μs isolated-case penalty is the price tag; the 147 μs saved per fg event when bg is in flight (which is most of the time in the pipelined design) pays for it 17×.
+
+### 0.5.5: Design recommendations
+
+1. **Weight prefetch (bg, all phases): explicit `cudaMemcpyAsync` on pinned memory.** Uses CE0 at peak BW. UVA for weights is eliminated a priori (PCIe ~23 GB/s vs GDDR6X ~1008 GB/s is 46× slower).
+
+2. **fg activation return (Phase 1b CPU-compute path): zero-copy via SM-issued Triton/CUDA copy kernel reading UVA-mapped pinned memory.** Bypasses CE0; runs concurrently with bg DMA. fg_s2c is bounded at ~30–35 μs regardless of bg state. **One-shot UVA copy is the right mechanism for fg.**
+
+3. **KV spill (Phase 2): explicit `cudaMemcpyAsync`, D2H.** Uses CE1 (different engine from bg's CE0). The 36% link-arbiter penalty under H2D pressure is well within margin for 100 KB-scale chunks.
+
+4. **Stream issue order: fg-first when possible.** Within a single fg+bg batch, fg-first puts the small cost on bg (~4 μs). When fg events arrive after bg has already been queued (the layer-level case), fg-first ordering at submission cannot prevent waiting — but with recommendation #2, fg doesn't queue on CE0 in the first place, making the ordering rule a micro-optimization rather than a correctness invariant.
+
+5. **No bg chunking required.** Once recommendation #2 is adopted, fg_s2c is independent of bg chunk size, so bg can use a single large H2D per layer at peak BW. The previously-considered "chunked bg" mitigation is unnecessary.
+
+6. **The "100% PCIe H2D to weight prefetch" invariant in `pcie_bandwidth_allocation_design.md` stands** — but the reason changes. fg uses the SM-PCIe path, not CE0. CE0's full bandwidth remains available for bg weight prefetch.
+
+7. **One-shot access pattern is a load-bearing contract for any UVA consumer.** Direct kernel inputs that re-read (matmul, attention, anything tiled with re-reads) are catastrophic on UVA-mapped memory. Always copy UVA → GPU buffer first via the one-shot kernel; downstream consumers read from the GPU buffer.
+
+These recommendations close the PCIe-allocation question for Phases 1b–3.
 
 ---
 
-## 0.4: Tensor Split Correctness
-
-Script: `David/Benchmarks/phase0/bench_split_correctness.py`.
-
-Verifies that the per-sub-module split mechanisms chosen in `weight_offload_design.md §Per-Sub-Module Split Axis` produce numerically equivalent results to unsplit computation. Four test families cover the full mechanism space used by Phase 1:
-
-| Family | Covers | Assembly op |
-|---|---|---|
-| A. Col-parallel contiguous   | WQKV, MLP1, WO (if Alt A)     | `concat` |
-| B. Col-parallel K/V-biased   | WQKV (design invariant)       | `index_copy_` into full shape |
-| C. Row-parallel contiguous   | MLP2                          | `add_` (partial-sum reduce) |
-| D. MLP1→MLP2 col→row pipeline | end-to-end MLP block         | `add_` on MLP2 partial sum |
-
-Sweep: `f_cpu ∈ {3%, 9%, 15%, 22%, 30%, 50%}` × `B ∈ {1, 8, 32}` for both models.
-
-**Tolerance**: 2% × output scale. BF16 has a 7-bit mantissa (~1.5% ulp at the top of its exponent range); large reductions (inner dim up to 18944) in different orders on GPU vs CPU amplify this to ~2%. `EXACT` means bitwise equal; `close` means within tolerance.
-
-**Result: ALL TESTS PASSED** for both Qwen2.5-7B-Instruct and Skywork-PRM-1.5B. Every `(f, B)` point across the four families falls within tolerance. The K/V-biased picker passes its structural invariants (head alignment, KV-group pairing below the boundary, full K+V + tail-Q above the boundary). Family D specifically validates the **matched-index invariant**: with CPU holding the same intermediate index set for MLP1's output and MLP2's input, each device applies SwiGLU on its local slice and MLP2 consumes the local slice directly, yielding output equal to the unsplit MLP block.
-
-This closes the correctness question for Phase 1's mixed col/row mechanism. The design-validation numbers (activation byte savings from col→row pipelining, and the Phase 2 WO offload decision) live in §0.10.
-
----
-
-## 0.5: CPU Attention Latency (reference)
+## 0.6: CPU attention latency (reference)
 
 Measured by `bench_cpu_attn.py` using PyTorch's `F.scaled_dot_product_attention` on CPU with `enable_gqa=True`. Feeds `cpu_attn_curve[batch_size, suffix_context_len]` in the Planner's schema (`profiler_design.md §1.4`).
 
@@ -408,7 +605,7 @@ Roughly 2.3× faster than 7B, matching the query-head ratio (28/12 ≈ 2.33) —
 
 1. **Linear in B×S.** Arithmetic intensity is essentially constant at ~3000 tokens/ms for 7B and ~7000 tokens/ms for PRM-1.5B across the (B, S) grid (ignoring the S=100 row where per-iteration overhead dominates). The Planner can linearly interpolate `cpu_attn_curve` in either axis.
 
-2. **CPU attention is expensive relative to GPU.** At B=16, S=1000 (realistic beam-search decode on 7B), suffix attention costs 5.32 ms per layer — **11× the GPU baseline layer time** of 0.47 ms (§0.2). Over 28 layers, pure CPU attention would add ~149 ms per decode step. Even with the expected 2–5× speedup from the real C++ kernel, the CPU attention path is the critical bottleneck of any Phase 2 attention-offload configuration.
+2. **CPU attention is expensive relative to GPU.** At B=16, S=1000 (realistic beam-search decode on 7B), suffix attention costs 5.32 ms per layer — **11× the GPU baseline layer time** of 0.47 ms (§0.3). Over 28 layers, pure CPU attention would add ~149 ms per decode step. Even with the expected 2–5× speedup from the real C++ kernel, the CPU attention path is the critical bottleneck of any Phase 2 attention-offload configuration.
 
 3. **Back-pressure is mandatory.** The Planner must cap batch × suffix_length such that CPU attention fits within the GPU forward-pass budget; otherwise attention offload *increases* latency. `KV_cpu_bytes` and `max_num_seqs` are the two knobs:
    - Reducing `KV_cpu_bytes` forces shorter effective suffix per beam (via suffix pruning or tighter admission).
@@ -421,7 +618,7 @@ Roughly 2.3× faster than 7B, matching the query-head ratio (28/12 ≈ 2.33) —
 
 ---
 
-## 0.6: CUDA Graph Impact
+## 0.7: CUDA graph impact
 
 Measured by `bench_cuda_graph.sh` — `vllm bench latency` with and without `--enforce-eager`, comparing CUDA-graph-captured execution to eager per-kernel launches. Purpose: decide whether Phase 4 (the `cudaLaunchHostFunc` retrofit that makes the Phase 2/3 CPU-dispatch and prefetch paths CUDA-graph-compatible) is urgent or can be safely deferred.
 
@@ -445,7 +642,7 @@ End-to-end generation latency (prefill + 128-token decode):
 
 ### Finding
 
-**CUDA Graph impact is 0.5–2.0% across all tested batch sizes.** The graph-vs-eager gap is small because 7B decode on an RTX 4090 is memory-bandwidth-bound per layer (§0.2: ~0.47 ms/layer, >90% of GDDR6X peak). The per-kernel launch overhead that CUDA graphs eliminate is a tiny fraction of each layer's memory-bound execution time. Graphs help most when many small kernels dispatch rapidly; our decode path has four relatively coarse-grained matmuls per layer, so eager launches are already efficient.
+**CUDA Graph impact is 0.5–2.0% across all tested batch sizes.** The graph-vs-eager gap is small because 7B decode on an RTX 4090 is memory-bandwidth-bound per layer (§0.3: ~0.47 ms/layer, >90% of GDDR6X peak). The per-kernel launch overhead that CUDA graphs eliminate is a tiny fraction of each layer's memory-bound execution time. Graphs help most when many small kernels dispatch rapidly; our decode path has four relatively coarse-grained matmuls per layer, so eager launches are already efficient.
 
 ### Implications for Phase 4 priority
 
@@ -461,7 +658,7 @@ Phase 1–3 prototypes run with `enforce_eager=True` by default. Phase 4 (graph 
 
 ### Framing Phase 4's purpose
 
-Phase 4's value is **upstream compatibility, not latency**. The §0.6 measurement shows graph capture gives only ~2% throughput on our thesis workload — too small to be a Phase 4 justification on its own. The real reason Phase 4 exists:
+Phase 4's value is **upstream compatibility, not latency**. The §0.7 measurement shows graph capture gives only ~2% throughput on our thesis workload — too small to be a Phase 4 justification on its own. The real reason Phase 4 exists:
 
 1. **vLLM integration.** Production vLLM defaults to `FULL_AND_PIECEWISE` graph capture. A Python-threaded `CpuComputeDispatcher` falls out of graph capture — any downstream user who enables graphs would silently lose the CPU-compute path. For the work to land upstream, the CPU-dispatch and prefetch paths must be `cudaLaunchHostFunc`-based.
 
@@ -473,15 +670,46 @@ For the thesis's research question ("does offloading work on consumer hardware?"
 
 ---
 
-## 0.7: vLLM V1 Built-in KV Offload — Impact
+## 0.8: vLLM V1 FastTTS baseline
 
-Measured by `bench_kv_offload.py` — FastTTS end-to-end runs with and without vLLM V1's built-in CPU KV offload (`vllm/v1/kv_offload/`).
+See §0.9 for the matched offload ablation. This section reports the `fasttts` (non-offload) arm of that sweep — the V1 reference throughput numbers the thesis measures improvements against.
+
+### Reference throughput (7B generator + PRM-1.5B verifier, RTX 4090)
+
+| Dataset | n | Latency (s) | Goodput (tok/s) | gen_gpu_hit | gen_max_kv_usage |
+|---|---:|---:|---:|---:|---:|
+| aime | 1 | 15.5 | 61.9 | 97.1% | 0.05 |
+| aime | 4 | 18.2 | 47.7 | 97.9% | 0.09 |
+| aime | 16 | 34.7 | 24.8 | 98.4% | 0.42 |
+| aime | 64 | 58.9 | 13.8 | 98.0% | **1.00** |
+| aime | 256 | 122.9 | 6.9 | 95.2% | **1.00** |
+| math500 | 1 | 9.5 | 61.5 | 96.0% | 0.07 |
+| math500 | 4 | 12.7 | 45.2 | 97.4% | 0.13 |
+| math500 | 16 | 18.3 | 30.6 | 97.7% | 0.42 |
+| math500 | 64 | 31.8 | 17.8 | 97.6% | **1.00** |
+| math500 | 256 | 65.3 | 8.7 | 96.1% | **1.00** |
+
+### Observations
+
+1. **KV cache saturates at n=64 on aime (longer completions, ~800 tok) and n=256 on math500 (shorter, ~520 tok).** This is the goalpost Phase 1 targets: freeing ~1.2 GB of GPU memory via weight offload (predicted from §0.1+0.3 overlap analysis) should raise the saturating n by ~25%, validated in Phase 4.
+
+2. **Baseline goodput declines sharply from n=1 to n=256** (62 → 7 tok/s on aime, 62 → 9 tok/s on math500). Most of the decline before saturation (n=1 → n=64) is inherent to beam parallelism producing correlated outputs; the decline past saturation (n=64 → n=256) is additional throughput loss from KV-pressure queueing (`gen_frac_steps_queued` jumps from 0.1% to 8.1% on aime).
+
+3. **Prefix caching is highly effective** across all n: `gen_gpu_hit` 95–98% means prefill costs are amortized across beams. This is the "shared prefix" property Phase 1's WQKV K/V-biased split is designed to preserve — our column-parallel weight split must not disrupt prefix caching, which is the FastTTS win.
+
+4. **These are V1 numbers on vLLM 0.19.0**, not V0 on 0.9.2 (the baseline in the original FastTTS paper). V1 has slightly higher per-process memory overhead (~0.9–1.4 GiB from CUDA graphs + torch.compile, see `vllm_v1_migration.md §12`), which slightly raises the GPU memory split for generator vs. verifier (0.74 / 0.16 recommended) and is the reason we can't directly compare to the published FastTTS numbers. Phase 4 will re-evaluate against these V1 numbers.
+
+---
+
+## 0.9: vLLM V1 built-in KV offload — impact
+
+See §0.8 for the baseline arm of this sweep. Measured by `bench_kv_offload.py` — FastTTS end-to-end runs with and without vLLM V1's built-in CPU KV offload (`vllm/v1/kv_offload/`).
 
 **What the V1 offload actually does (and why it's orthogonal to our Phase 2).** V1's KV offload is a **prefill-side optimization**: when cold prefix KV blocks are evicted from the GPU KV cache, instead of being dropped they're spilled to CPU. On a subsequent request that shares that prefix, the blocks are loaded back from CPU and prefill attention is skipped for those tokens. It's a prefix-reuse / prefill-avoidance mechanism that expands the effective prefix cache from VRAM-sized to RAM-sized.
 
 This is **orthogonal to our Phase 2 design**:
 
-| | V1 KV offload (§0.7) | Phase 2 attention offload |
+| | V1 KV offload (§0.9) | Phase 2 attention offload |
 |---|---|---|
 | What's avoided | Re-computing prefill for cached prefixes | Running decode-time suffix attention on GPU |
 | Where KV lives at attention time | **GPU** (reloaded from CPU before attention) | **CPU** (suffix stays on CPU) |
@@ -528,7 +756,7 @@ Fraction of prefix KV lookups served from CPU-resident cached blocks (as opposed
 
 3. **aime results are noisier (30 problems vs. math500's 500).** The +30% latency regression at aime n=4 and the −7% improvement at aime n=256 are plausible but workload-specific / small-sample signals. We treat math500 as the reliable reference and note aime only as a sanity check of direction.
 
-4. **V1 offload consumes PCIe H2D bandwidth that Phase 3 reserves for weight prefetch.** Every reloaded prefix block travels CPU→GPU over H2D. Phase 3's "100% PCIe H2D → weight prefetch" invariant (`pcie_bandwidth_allocation_design.md`, §0.9) assumes no other H2D traffic. Even if V1 offload's contribution is small at typical operating points (math500: ≤1% wall-clock impact), it is nonzero contention against the prefetch budget and adds scheduler-side variability.
+4. **V1 offload consumes PCIe H2D bandwidth that Phase 3 reserves for weight prefetch.** Every reloaded prefix block travels CPU→GPU over H2D. Phase 3's "100% PCIe H2D → weight prefetch" invariant (`pcie_bandwidth_allocation_design.md`, §0.5) assumes no other H2D traffic. Even if V1 offload's contribution is small at typical operating points (math500: ≤1% wall-clock impact), it is nonzero contention against the prefetch budget and adds scheduler-side variability.
 
 5. **Reusable as Phase 2 infrastructure.** The V1 offload codebase provides a working CPU block pool, pinned allocator, and GPU↔CPU block-copy primitives. Phase 2 extends this framework with "blocks that stay on CPU" semantics (for suffix attention) in addition to the existing "blocks that get reloaded before attention" (for prefix reuse). The two modes can cohabit in the same pool.
 
@@ -545,226 +773,3 @@ Fraction of prefix KV lookups served from CPU-resident cached blocks (as opposed
 4. **Mechanism orthogonality.** V1 offload is prefill-side prefix-reuse; Phase 2 is decode-time suffix attention. Complementary, not competing. Mixing them in the headline comparison obscures what each contributes.
 
 Both disabled is the apples-to-apples comparison. Re-enabling V1 offload for the full system is a separate ablation if it becomes interesting later.
-
----
-
-## 0.8: vLLM V1 FastTTS Baseline
-
-The `fasttts` (non-offload) arm of §0.7 is our V1 baseline — the reference throughput numbers the thesis measures improvements against.
-
-### Reference throughput (7B generator + PRM-1.5B verifier, RTX 4090)
-
-| Dataset | n | Latency (s) | Goodput (tok/s) | gen_gpu_hit | gen_max_kv_usage |
-|---|---:|---:|---:|---:|---:|
-| aime | 1 | 15.5 | 61.9 | 97.1% | 0.05 |
-| aime | 4 | 18.2 | 47.7 | 97.9% | 0.09 |
-| aime | 16 | 34.7 | 24.8 | 98.4% | 0.42 |
-| aime | 64 | 58.9 | 13.8 | 98.0% | **1.00** |
-| aime | 256 | 122.9 | 6.9 | 95.2% | **1.00** |
-| math500 | 1 | 9.5 | 61.5 | 96.0% | 0.07 |
-| math500 | 4 | 12.7 | 45.2 | 97.4% | 0.13 |
-| math500 | 16 | 18.3 | 30.6 | 97.7% | 0.42 |
-| math500 | 64 | 31.8 | 17.8 | 97.6% | **1.00** |
-| math500 | 256 | 65.3 | 8.7 | 96.1% | **1.00** |
-
-### Observations
-
-1. **KV cache saturates at n=64 on aime (longer completions, ~800 tok) and n=256 on math500 (shorter, ~520 tok).** This is the goalpost Phase 1 targets: freeing ~1.2 GB of GPU memory via weight offload (predicted from §0.1+0.2 overlap analysis) should raise the saturating n by ~25%, validated in Phase 4.
-
-2. **Baseline goodput declines sharply from n=1 to n=256** (62 → 7 tok/s on aime, 62 → 9 tok/s on math500). Most of the decline before saturation (n=1 → n=64) is inherent to beam parallelism producing correlated outputs; the decline past saturation (n=64 → n=256) is additional throughput loss from KV-pressure queueing (`gen_frac_steps_queued` jumps from 0.1% to 8.1% on aime).
-
-3. **Prefix caching is highly effective** across all n: `gen_gpu_hit` 95–98% means prefill costs are amortized across beams. This is the "shared prefix" property Phase 1's WQKV K/V-biased split is designed to preserve — our column-parallel weight split must not disrupt prefix caching, which is the FastTTS win.
-
-4. **These are V1 numbers on vLLM 0.19.0**, not V0 on 0.9.2 (the baseline in the original FastTTS paper). V1 has slightly higher per-process memory overhead (~0.9–1.4 GiB from CUDA graphs + torch.compile, see `vllm_v1_migration.md §12`), which slightly raises the GPU memory split for generator vs. verifier (0.74 / 0.16 recommended) and is the reason we can't directly compare to the published FastTTS numbers. Phase 4 will re-evaluate against these V1 numbers.
-
----
-
-## 0.9: PCIe Contention & Stream Concurrency
-
-Measured by `bench_contention.py`. Motivated by a Phase 3 design question: when a weight prefetch H2D is in flight on one CUDA stream, does it block activation transfer or compute on another stream? And given the choice of activation mechanism (explicit copy vs. UVA), which one survives concurrent prefetch?
-
-### 0.9a: Activation mechanism — explicit copy vs UVA
-
-Setup: one compute stream runs the activation path (copy + matmul on s_act); a second stream runs weight prefetch (s_weight). Submission order is `fg_first` — compute issued to the driver before the prefetch queue (the natural pipelined inference pattern). Two `path` variants compared:
-
-- `copy` — explicit `cudaMemcpyAsync` pinned → GDDR6X, then matmul on the GDDR6X-resident input.
-- `uva` — matmul reads pinned CPU memory directly via UVA (`get_cuda_view_from_cpu_tensor`) during kernel execution, no explicit copy.
-
-Workload per measurement: activation = 14 tokens × 3584 (98 KB BF16) + F.linear against a hidden-dim GPU weight; bg prefetch = 4 MB × queue_depth.
-
-Activation (fg) latency:
-
-| path | N=0 | N=1 | N=2 | N=4 |
-|---|---:|---:|---:|---:|
-| **copy** | 26 μs | 28 μs | 29 μs | 28 μs |
-| uva | 547 μs | 720 μs | 744 μs | 744 μs |
-| **ratio (uva/copy)** | **21×** | **26×** | **26×** | **27×** |
-
-Prefetch (bg) time under the same conditions:
-
-| path | N=1 bg | N=2 bg | N=4 bg |
-|---|---:|---:|---:|
-| copy | 178 μs | 355 μs | 708 μs |
-| uva | 670 μs | 875 μs | 1231 μs |
-
-#### Findings
-
-**1. UVA is catastrophically worse than explicit copy.** At the isolated baseline (N=0), `uva` takes 547 μs vs. `copy`'s 26 μs — **21× slower**. The reason: cuBLAS GEMM kernels re-read the input tensor in tiled patterns, and **PCIe BAR memory is not cached in L2**. Every tile re-read triggers another PCIe load, so what should be an L2-hit after the first pass becomes hundreds of redundant PCIe round trips. This is the same phenomenon as the TwinPilots-style zero-copy idea breaking down for compute-heavy consumption patterns.
-
-**2. UVA actively degrades prefetch bandwidth.** At N=1, bg takes 178 μs under `copy` but 670 μs under `uva` — a **3.8× slowdown of the prefetch**. UVA's lazy PCIe loads during matmul compete for H2D with the bg prefetch. Under `copy`, the explicit transfer finishes in a few μs and the matmul then runs from GDDR6X, so bg gets undisturbed full PCIe BW. Under `uva`, the matmul continuously drains PCIe for the full 547 μs of kernel execution, cutting bg's effective BW in half.
-
-The combined message: **UVA not only loses on its own cost, it actively degrades the very prefetch path the design is trying to protect.** This is the opposite of what the zero-copy argument from TwinPilots expected — that argument assumes the consumption pattern is compatible with UVA, which is not the case for tiled GEMM kernels.
-
-With `copy`, fg latency is flat at 27 μs regardless of bg queue depth. The Phase 1b layer-ahead prefetch premise — concurrent compute and weight prefetch — works as designed.
-
-### 0.9b: Submission order (anti-pattern note)
-
-The `fg_first` result above depends on issue order. Submitting bg before fg causes implicit driver serialization of the fg matmul behind the bg queue, even though the two streams have no explicit data dependency:
-
-| mode (path=copy) | N=0 | N=1 | N=2 | N=4 |
-|---|---:|---:|---:|---:|
-| fg_first | 26 μs | 28 μs | 29 μs | 28 μs |
-| bg_first | 25 μs | 195 μs | 367 μs | 718 μs |
-| explicit_event | 25 μs | 195 μs | 367 μs | 717 μs |
-
-Two takeaways:
-
-1. `bg_first` loses all overlap — fg serializes behind the pending bg queue. The realistic pipelined inference pattern is naturally `fg_first` (this-layer compute queued before next-layer prefetch), so this is easy to avoid, but it is a real failure mode to guard against in implementation.
-
-2. Events alone don't rescue bad ordering. The `explicit_event` variant records a `cudaEvent` after the bg prefetches but fg does not `wait_event` on it (fg has no real dependency on bg). Numerically identical to `bg_first` — the submission order, not the presence of events, is what triggers the serialization.
-
-### 0.9c: Bidirectional H2D + D2H
-
-PCIe 4.0 x16 is full-duplex. Run a weight-prefetch H2D loop concurrently with a KV-spill D2H loop.
-
-| scenario | H2D iters | D2H iters | H2D (GB/s) | D2H (GB/s) |
-|---|---:|---:|---:|---:|
-| h2d_only | 4 | 0 | 23.64 | — |
-| d2h_only | 0 | 4 | — | 20.81 |
-| both_4 | 4 | 4 | 23.73 | 13.21 |
-| both_4_16 | 4 | 16 | 23.66 | 14.69 |
-
-**H2D is not slowed by concurrent D2H** (23.64 → 23.73 GB/s). D2H drops from 20.81 → 13.2–14.7 GB/s under concurrent H2D, but still delivers plenty for KV spill purposes (a 100 KB chunk completes in ~8 μs, negligible vs. the 180 μs prefetch window it runs alongside). This validates the Phase 2 design invariant: **KV D2H does not contend with weight prefetch H2D.**
-
-### Design Recommendations
-
-Collecting the consequences for the Phase 3 mechanisms:
-
-1. **Weight prefetch: explicit `cudaMemcpyAsync` on pinned memory.** UVA for weights is eliminated a priori (reading weights over PCIe at 22 GB/s vs. GDDR6X at 1008 GB/s is 46× slower).
-
-2. **Activation transfer (CPU-compute return path): explicit `cudaMemcpyAsync` on pinned memory.** UVA is rejected for two reasons: its own cost is 21× higher, and it degrades bg prefetch BW by 3.8×. Both failures trace to the same root cause — cuBLAS kernels re-read inputs and PCIe BAR is non-cacheable in L2.
-
-3. **KV spill to CPU (Phase 2): explicit `cudaMemcpyAsync`, D2H direction.** Uses the otherwise-idle D2H channel. Does not contend with weight prefetch.
-
-4. **Stream issue order: fg-first.** The natural pipelined inference pattern (issue this-step's compute, then next-step's prefetch) achieves full overlap without any explicit event synchronization. Implementations should avoid queueing next-step prefetches before this-step's compute is submitted.
-
-5. **The "100% PCIe H2D to weight prefetch" invariant in `pcie_bandwidth_allocation_design.md` stands.** Explicit-copy activation transfers at 100 KB scale take ~27 μs per sub-module, with no meaningful impact on bulk prefetch BW. The concern that motivated this section (small activation transfers queuing behind large prefetches) was resolved by the correct issue order — not by a special mechanism.
-
-These recommendations resolve the original UVA-vs-copy question definitively and validate the Phase 2/3 PCIe-allocation design.
-
----
-
-## 0.10: Mixed Split-Axis Design Validation
-
-§0.4 closed the correctness question for the mixed col/row split mechanism. This section covers the two measured design claims that commit Phase 1 and Phase 2 to specific axis choices: the MLP1→MLP2 col→row pipelining saves activation PCIe, and the WO offload alternatives (Alt A weight-split vs. Alt B GPU-resident) diverge enough to pick one globally.
-
-### 0.10a: MLP1→MLP2 Pipelining — Empirical Wall-Clock & PCIe Comparison
-
-Script: `David/Benchmarks/phase0/bench_mlp_pipeline.py`.
-
-The col→row pairing eliminates the intermediate round-trip that uniform-col would require between MLP1 and MLP2. Under uniform col, CPU computes a slice of `gate_up` (MLP1 output), returns it to GPU, GPU concatenates and applies SwiGLU on the full intermediate, then GPU re-sends the full intermediate back to CPU as MLP2's input. With col→row, CPU keeps its `gate_up` slice locally, applies SwiGLU in place on its slice, and feeds the local slice into its row slice of `W_down` — zero intermediate transfer.
-
-To empirically validate the savings claim, we implemented both patterns end-to-end on the real CPU/GPU critical path and compared per-MLP-block wall-clock time and PCIe byte count. Each step is timed in its actual position in the serial CPU critical path, with GPU steps timed via CUDA events. CPU is the bottleneck in the decode regime (CPU GEMM ≫ GPU compute at small-batch decode), so the serial CPU-side sum approximates block wall-clock.
-
-**Qwen2.5-7B-Instruct:**
-
-|   N |    f | col total | col→row total | Δ (ms) | col PCIe | col→row PCIe | PCIe ratio |
-|----:|-----:|----------:|--------------:|-------:|---------:|-------------:|-----------:|
-|  16 |  10% |   2.25 ms |       2.30 ms |  -0.05 |  0.85 MB |      0.23 MB |    **3.72×** |
-|  16 |  30% |   6.81 ms |       6.81 ms |  +0.00 |  1.12 MB |      0.23 MB |    **4.88×** |
-|  64 |  10% |   8.99 ms |       9.14 ms |  -0.15 |  3.41 MB |      0.92 MB |    **3.72×** |
-|  64 |  30% |  27.24 ms |      27.12 ms |  +0.13 |  4.48 MB |      0.92 MB |    **4.88×** |
-| 128 |  10% |  18.28 ms |      18.48 ms |  -0.19 |  6.83 MB |      1.84 MB |    **3.72×** |
-| 128 |  30% |  54.48 ms |      57.71 ms |  -3.24 |  8.95 MB |      1.84 MB |    **4.88×** |
-
-**Skywork-PRM-1.5B:**
-
-|   N |    f | col total | col→row total | Δ (ms) | col PCIe | col→row PCIe | PCIe ratio |
-|----:|-----:|----------:|--------------:|-------:|---------:|-------------:|-----------:|
-|  16 |  10% |   0.55 ms |       0.52 ms |  +0.03 |  0.40 MB |      0.10 MB |    **4.05×** |
-|  16 |  30% |   1.46 ms |       1.44 ms |  +0.02 |  0.52 MB |      0.10 MB |    **5.32×** |
-|  64 |  10% |   2.03 ms |       2.02 ms |  +0.01 |  1.59 MB |      0.39 MB |    **4.05×** |
-|  64 |  30% |   5.79 ms |       5.70 ms |  +0.10 |  2.09 MB |      0.39 MB |    **5.32×** |
-| 128 |  10% |   4.01 ms |       4.00 ms |  +0.01 |  3.18 MB |      0.79 MB |    **4.05×** |
-| 128 |  30% |  11.63 ms |      11.46 ms |  +0.17 |  4.18 MB |      0.79 MB |    **5.32×** |
-
-Δ (ms) = col_total − col→row_total. Positive Δ means col→row is faster.
-
-**Observations.**
-
-1. **PCIe byte savings are real and large**: 3.72–5.32× less activation PCIe per MLP block, independent of `N` and `f`. This matches the analytical byte count: the dominant saving is eliminating the full-intermediate H2D that uniform col requires for MLP2's input.
-
-2. **Wall-clock is essentially flat between patterns** (Δ within ±0.5 ms in all but one point). CPU GEMM dominates the MLP block critical path, and the CPU GEMM FLOPs are identical between patterns (MLP1 is the same shape; MLP2's row-slice has the same FLOP count as col-slice, just a different matmul shape). Saving PCIe bytes does not shorten the MLP block wall-clock in this regime because PCIe is not the bottleneck of the MLP block.
-
-3. **The saved bytes are not wasted, though.** PCIe H2D is a contended resource with weight prefetch (§0.9). Col→row's 3.72–5.32× reduction means weight prefetch sees that much less activation-traffic contention — a Phase-3-critical property. At N=128 on 7B, uniform col injects ~9 MB of activation H2D per MLP block × 28 layers ≈ 250 MB/decode step (~11 ms at 22 GB/s), while col→row injects only ~51 MB/step (~2.3 ms). The difference is time the Phase 3 weight-prefetch pipeline recovers.
-
-4. **One wall-clock anomaly**: at 7B, N=128, f=30%, col→row is 3.24 ms slower. Traceable to the `cpu_mlp1` step: oneDNN picks a different microkernel for the contiguous `2·cpu_inter × hidden` weight shape in col→row vs. the larger same-axis col weight in uniform col. Noise from oneDNN heuristic crossing at that shape; not a design defect.
-
-**Conclusion.** The design claim "col→row eliminates the intermediate round-trip and saves ~3–5× activation PCIe" is empirically confirmed on both models. The saving is in PCIe bytes, not in MLP-block wall-clock — but the saved bytes translate directly into weight-prefetch bandwidth for Phase 3, where activation vs prefetch contention was called out in §0.9 as a real concern. Col→row pays no wall-clock tax and frees real PCIe budget. Adopted for Phase 1.
-
-### 0.10b: WO Offload — Alt A vs Alt B Decision
-
-Script: `David/Benchmarks/phase0/bench_wo_offload_tradeoff.py`.
-
-Two alternatives for WO after the Phase 2 attention merge, described in `weight_offload_design.md §WO Split Axis Decision`:
-
-- **Alt A (col-split WO with merge-before-WO)**: CPU holds `f · WO_bytes` of weight. GPU merges `attn_out`, sends CPU's input slice via H2D, CPU computes its partial, D2H back for concat on GPU. Saves `f · 686 MB` of GPU WO weight at 7B.
-- **Alt B (no WO offload)**: GPU does full WO after merge. No H2D/D2H of merged `attn_out`. CPU has no WO work. WO occupies 686 MB on GPU at 7B.
-
-**TL;DR — WO is the smallest matmul in the layer, and sits in the worst place for offload.** Per-layer BF16 weight sizes on Qwen2.5-7B: MLP1 272 MB, MLP2 136 MB, WQKV 37 MB, **WO 26 MB** (smallest). The per-MB CPU latency tax of offloading is roughly constant across sub-modules (CPU matmul throughput doesn't care which weight it's computing — just shape and FLOPs), so offloading WO pays the **same tax rate** as MLP1 but saves **~10× fewer bytes per unit of f**. MLP1 justifies the tax rate because its absolute memory gain is large enough to matter; WO does not.
-
-On top of the size disadvantage, Alt A has a structural communication cost the MLP offload does not: WO sits **after** the attention merge, so Alt A forces 3 PCIe hops per layer (CPU→GPU for attn merge → GPU→CPU to hand merged attn_out to CPU → CPU→GPU to return the partial), vs. the 2 natural hops of MLP's col→row pattern. Either the per-MB argument or the extra-hop argument alone would reject Alt A at 7B; together they make the decision robust.
-
----
-
-The attention / merge phases are identical in both alternatives, so the comparison reduces to a post-merge differential:
-
-```
-Δ_latency(f, N) = max(t_WO_reduced_gpu,  H2D_merged + t_WO_cpu + D2H_partial)
-                  − t_WO_full_gpu
-```
-
-Measured on RTX 4090 + i9-14900KF, BF16, pinned-memory PCIe, sweep `N ∈ {1, 16, 64, 128}` × `f ∈ {10%, 20%, 30%, 50%}`:
-
-**Qwen2.5-7B-Instruct (hidden=3584, WO total = 686 MB across 28 layers):**
-
-|   f | max Δ / layer | max Δ / decode step (28 layers) | GPU memory saved | % of 24 GB budget |
-|----:|----:|----:|----:|----:|
-| 10% | +1.14 ms | +32.1 ms | 72 MB | 0.3% |
-| 20% | +4.62 ms | +129.4 ms | 144 MB | 0.6% |
-| 30% | +8.33 ms | +233.2 ms | 216 MB | 0.9% |
-| 50% | +12.40 ms | +347.2 ms | 360 MB | 1.5% |
-
-**Skywork-PRM-1.5B (hidden=1536, WO total = 132 MB across 28 layers):**
-
-|   f | max Δ / layer | max Δ / decode step | GPU memory saved | % of 24 GB budget |
-|----:|----:|----:|----:|----:|
-| 10% | +4.28 ms | +119.7 ms | 13 MB | 0.05% |
-| 20% | +6.30 ms | +176.5 ms | 26 MB | 0.11% |
-| 30% | +11.95 ms | +334.5 ms | 40 MB | 0.17% |
-| 50% | +9.73 ms | +272.5 ms | 66 MB | 0.28% |
-
-**Reading the numbers.** The latency tax is expressed as a fraction of a typical decode step (~30 ms), the memory gain as a fraction of the 24 GB GPU budget. At 7B f=10%, Alt A roughly doubles decode step time to save 0.3% of the GPU budget — a bad trade by any reading. The ratio gets worse with `f` (latency scales super-linearly with CPU GEMM size once oneDNN tiling crosses microkernel boundaries, while memory scales linearly).
-
-**Decision: Alt B.** Phase 2 keeps WO fully GPU-resident. WO has no entry in `cpu_gemm_curve` at runtime (though the profile table keeps it under the "col" axis — §0.4 validated correctness for Alt A in case a future phase revisits the decision). This commits `weight_offload_design.md §WO Split Axis Decision` to the no-offload alternative.
-
-**When to revisit.** The argument reverses when GPU memory becomes the binding constraint. At 14B in Phase 3, the model weights alone (~28 GB BF16) exceed the 24 GB budget before any offload. Even with aggressive offload on the larger sub-modules, every MB of GPU memory matters — and WO at 14B is ~1.3 GB, so a 30% offload frees ~390 MB, which is 3–5% of the remaining budget rather than 1%. In that regime the memory fraction gain is binding enough that the latency tax may be justified. Repeat the §0.10b procedure against the 14B decode workload before Phase 3 locks in; if the ratios flip, switch to Alt A for WO at 14B only.
-
-### 0.10c: Phase 1/2 Design Commitments
-
-Locked for Phase 1 implementation:
-
-1. **Split axes**: WQKV = col (K/V-biased), MLP1 = col, MLP2 = row, WO = not offloaded (fully GPU-resident in Phase 1/2). `CpuComputeDispatcher` implements col + row paths for the three offloaded sub-modules; WO has no CPU path, no prefetch path.
-2. **Uniform per-bucket dispatch**: Planner emits one `(f_cpu, f_prefetch)` pair per `num_tokens` bucket, applied uniformly to WQKV, MLP1, and MLP2. The MLP1↔MLP2 matched-index invariant is automatic under uniform dispatch (same scalars → same index set selected by construction). See `planner_design.md §4.2` and the §0.2 uniformity subsection for the empirical basis.
-3. **Layer-ahead prefetch (Phase 1b)**: single prefetch queue per layer boundary, one `cudaStreamWaitEvent` per layer. Tensor-ahead rejected — see `pcie_bandwidth_allocation_design.md`.
-4. **Assembly operations**: col → `torch.cat` along output dim; row → `.add_` on the partial sum. Both correctness-validated in §0.4 at every tested `(f, B)` for both models.

@@ -29,7 +29,7 @@ KV_gpu_bytes : GPU KV pool
 KV_cpu_bytes : CPU KV pool (extension of the GPU pool)
 ```
 
-Two candidate partitioning axes are on the table — both produce a two-pool split, but they carve the KV cache differently. The final mechanism is not yet committed; §0.10 of `phase0_findings.md` measures both before Phase 2 locks it in.
+Two candidate partitioning axes are on the table — both produce a two-pool split, but they carve the KV cache differently. The final mechanism is not yet committed; §0.4 of `phase0_findings.md` measures both before Phase 2 locks it in.
 
 **Candidate A — Position-split (prefix/suffix-style).** KV positions `[0 : split_point]` live on GPU; positions `[split_point : ]` live on CPU. Attention runs on each device over its position range; results merge via online softmax (`merge_attn_states`). The special case "prefix on GPU, suffix on CPU" is the common shape but not invariant — `split_point` can extend past the prompt boundary when GPU has headroom, and can spill earlier when pressure grows.
 

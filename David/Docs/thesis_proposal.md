@@ -1,6 +1,6 @@
 # Thesis Proposal
 
-**Working title**: *Scaling Test-Time Compute on Consumer GPUs via Collaborative CPU-GPU Weight and KV Offloading*
+**Working title**: *COTS: Collaborative CPU-GPU Offloading for Test-Time Scaling on Consumer GPUs*
 
 ## 1. Problem Statement
 
@@ -211,7 +211,7 @@ Per-sub-module critical path: `t = max(t_gpu, t_prefetch, t_cpu_compute)`. Plus 
 **Two-stage optimization**:
 
 1. *Placement stage* — per model, minimize representative-bucket decode wall-clock subject to constraints. Representative bucket for generator is small `num_tokens` (≈ `n`); for verifier is medium (≈ `n × tokens_per_step`).
-2. *Dispatch stage* — for each captured bucket, closed-form single-scalar solve over `f_cpu` (with `f_prefetch = f_cpu_store − f_cpu`). Small `num_tokens` lean on CPU-compute (hides in GPU idle); medium/large shift toward prefetch (GPU compute-bound). The dispatch is uniform across WQKV/MLP1/MLP2, enabled empirically by uniform CPU μs/MB at decode (`phase0_findings.md §0.2`).
+2. *Dispatch stage* — for each captured bucket, closed-form single-scalar solve over `f_cpu` (with `f_prefetch = f_cpu_store − f_cpu`). Small `num_tokens` lean on CPU-compute (hides in GPU idle); medium/large shift toward prefetch (GPU compute-bound). The dispatch is uniform across WQKV/MLP1/MLP2, enabled empirically by uniform CPU μs/MB at decode (`phase0_findings.md §0.3.4`).
 
 Grid search over the 3–4 placement scalars is tractable (sub-second). See `planner_design.md` for the full formulation.
 

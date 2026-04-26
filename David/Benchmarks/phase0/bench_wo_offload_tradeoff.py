@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 0.10c — WO Offload Alt A vs Alt B Tradeoff
+"""Phase 0.4.2 — WO Offload Alt A vs Alt B Tradeoff
 
 Phase 2 exposes two clean alternatives for handling WO after the online-softmax
 merge. This benchmark measures the per-layer critical-path differential
@@ -267,7 +267,7 @@ def main():
     args = p.parse_args()
 
     cfg = MODEL_CONFIGS[args.model]
-    print(f"Phase 0.10c — WO Offload Alt A vs Alt B  ({cfg['display_name']})")
+    print(f"Phase 0.4.2 — WO Offload Alt A vs Alt B  ({cfg['display_name']})")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"num_tokens={args.num_tokens}  slice_fracs={args.slice_fracs}")
 

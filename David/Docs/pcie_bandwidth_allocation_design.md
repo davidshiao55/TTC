@@ -183,8 +183,8 @@ f_prefetch_{m+1} × W_{m+1} ≤ compute_time_m × PCIe_BW
 At decode with WO's short compute phase (~0.018 ms), the MLP1 prefetch budget starves to ~0.4 MB. The only way out is per-sub-module f tuning — force MLP1 to high `f_cpu` so its compute phase lengthens, bootstrapping MLP2's prefetch budget. A cascade the Planner would have to solve via a recurrence.
 
 **Why rejected:**
-1. `phase0_findings.md §0.2` shows CPU μs/MB is uniform across sub-modules at decode B ≥ 16. Per-sub-module f tuning (tensor-ahead's main purpose) buys effectively nothing.
-2. `phase0_findings.md §0.9` shows PCIe contention is already resolved under fg-first stream ordering — activation H2D at ~27 μs per sub-module does not measurably disturb weight prefetch throughput (~23.6 GB/s with concurrent activation). Tensor-ahead's fine-grained contention control has nothing to control.
+1. `phase0_findings.md §0.3.4` shows CPU μs/MB is uniform across sub-modules at decode B ≥ 16. Per-sub-module f tuning (tensor-ahead's main purpose) buys effectively nothing.
+2. fg-wait against bg prefetch is already bounded **at the layer grain** by routing fg activation returns through SM-issued UVA loads (`phase0_findings.md §0.5`). The UVA copy kernel uses a different PCIe path than CE0 (the H2D copy engine), so fg events don't queue behind bg DMA regardless of how bg is scheduled — fg_s2c stays at ~30–35 μs whether bg is a single 4 MB H2D or many 64 KB chunks. Tensor-ahead's per-sub-phase contention control adds no value when the layer-grain mechanism already eliminates the queue dependency.
 3. Buffer savings (~160 MB) are negligible on a 24 GB GPU.
 4. Per-sub-phase scheduling (~5 sync points per layer) adds Phase 4 CUDA-graph complexity for no measurable benefit.
 
@@ -203,4 +203,4 @@ Same as layer-ahead but starts K layers in advance. Budget grows to `K × layer_
 3. **KV prefetch has no regime where it's preferred**: at best equivalent (small models), at worst inferior (large models)
 4. **Batch size controls f_cpu_kv cost** — CPU attention bottleneck is a dial, not a wall
 5. **Design simplification**: all PCIe → weight prefetch. Suffix attention → CPU only. Merge via online softmax.
-6. **Prefetch distance committed to layer-ahead**: one prefetch queue per layer boundary, one sync per layer. Tensor-ahead rejected because its topological constraint would force per-sub-module f tuning — needless given uniform CPU μs/MB (`phase0_findings.md §0.2`) and resolved PCIe contention (`phase0_findings.md §0.9`). Buffer cost (~160 MB extra at 7B f=50%) is ~1% of GPU budget — negligible.
+6. **Prefetch distance committed to layer-ahead**: one prefetch queue per layer boundary, one sync per layer. Tensor-ahead rejected because its topological constraint would force per-sub-module f tuning — needless given uniform CPU μs/MB (`phase0_findings.md §0.3.4`) and the layer-grain fg-wait bypass via SM-issued UVA copy kernel (`phase0_findings.md §0.5`). Buffer cost (~160 MB extra at 7B f=50%) is ~1% of GPU budget — negligible.

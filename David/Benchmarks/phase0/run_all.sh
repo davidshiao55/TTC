@@ -10,14 +10,17 @@
 #   bash run_all.sh              # run all
 #   bash run_all.sh 0.1 0.3      # run specific benchmarks only
 #
-# Benchmarks:
-#   0.1  CPU/GPU overlap feasibility  (Python, BF16 F.linear, needs GPU)
-#   0.3  PCIe bandwidth sweep         (Python, needs GPU)
-#   0.4  Column-split correctness     (Python, needs GPU)
-#   0.5  CPU attention latency        (shell, needs vLLM CPU backend — SKIP for now)
-#   0.6  CUDA graph impact            (shell, needs vLLM + model)
-#   0.7  KV offload impact            (shell, needs vLLM + model)
-#   0.8  FastTTS baseline             (shell, needs FastTTS + models)
+# Benchmarks (numbering matches phase0_findings.md):
+#   0.1    num_tokens dispatch axis        (Python, GPU + CPU)
+#   0.2    Tensor split correctness        (Python, needs GPU)
+#   0.3    CPU/GPU compute characterization (Python, BF16 F.linear, needs GPU)
+#   0.4.1  MLP block col→row pipeline      (Python, needs GPU)
+#   0.4.2  WO offload Alt A vs Alt B       (Python, needs GPU)
+#   0.5.0  PCIe bandwidth sweep            (Python, needs GPU)
+#   0.5    PCIe contention (nsys-driven)   (Python, needs nsys)
+#   0.6    CPU attention latency           (Python, needs vLLM CPU backend — SKIP)
+#   0.7    CUDA graph impact               (shell, needs vLLM + model)
+#   0.8/9  V1 baseline + KV offload impact (Python, needs FastTTS + models)
 
 set -euo pipefail
 
@@ -69,36 +72,43 @@ echo "Results dir: $RESULTS_DIR"
 
 # --- Micro-benchmarks (no vLLM engine needed) ---
 
-run_benchmark "0.1" "CPU/GPU Overlap Feasibility (BF16 F.linear)" \
-    "python ${SCRIPT_DIR}/bench_cpu_gpu_overlap.py --output-json ${RESULTS_DIR}/cpu_gpu_overlap.json"
+run_benchmark "0.1" "num_tokens dispatch axis" \
+    "python ${SCRIPT_DIR}/bench_num_tokens_axis.py --model qwen7b  --output-json ${RESULTS_DIR}/0.1_num_tokens/qwen7b.json && \
+     python ${SCRIPT_DIR}/bench_num_tokens_axis.py --model prm1p5b --output-json ${RESULTS_DIR}/0.1_num_tokens/prm1p5b.json"
 
-run_benchmark "0.3" "PCIe Bandwidth Sweep" \
-    "python ${SCRIPT_DIR}/bench_pcie_sweep.py --output-json ${RESULTS_DIR}/pcie_sweep.json"
-
-run_benchmark "0.4" "Tensor Split Correctness (mixed col/row)" \
+run_benchmark "0.2" "Tensor Split Correctness (mixed col/row)" \
     "python ${SCRIPT_DIR}/bench_split_correctness.py"
 
-run_benchmark "0.10a" "MLP Block Pipeline: uniform col vs col→row" \
-    "python ${SCRIPT_DIR}/bench_mlp_pipeline.py --output-json ${RESULTS_DIR}/mlp_pipeline.json"
+run_benchmark "0.3" "CPU/GPU Compute Characterization (BF16 F.linear)" \
+    "python ${SCRIPT_DIR}/bench_cpu_gpu_overlap.py --model qwen7b  --output-json ${RESULTS_DIR}/0.3_cpu_gpu_overlap/qwen7b.json && \
+     python ${SCRIPT_DIR}/bench_cpu_gpu_overlap.py --model prm1p5b --output-json ${RESULTS_DIR}/0.3_cpu_gpu_overlap/prm1p5b.json"
 
-run_benchmark "0.10b" "WO Offload Alt A vs Alt B" \
-    "python ${SCRIPT_DIR}/bench_wo_offload_tradeoff.py --output-json ${RESULTS_DIR}/wo_offload_tradeoff.json"
+run_benchmark "0.4.1" "MLP Block Pipeline: uniform col vs col→row" \
+    "python ${SCRIPT_DIR}/bench_mlp_pipeline.py --model qwen7b  --output-json ${RESULTS_DIR}/0.4_split_axis/mlp_pipeline_qwen7b.json && \
+     python ${SCRIPT_DIR}/bench_mlp_pipeline.py --model prm1p5b --output-json ${RESULTS_DIR}/0.4_split_axis/mlp_pipeline_prm1p5b.json"
+
+run_benchmark "0.4.2" "WO Offload Alt A vs Alt B" \
+    "python ${SCRIPT_DIR}/bench_wo_offload_tradeoff.py --model qwen7b  --output-json ${RESULTS_DIR}/0.4_split_axis/wo_offload_qwen7b.json && \
+     python ${SCRIPT_DIR}/bench_wo_offload_tradeoff.py --model prm1p5b --output-json ${RESULTS_DIR}/0.4_split_axis/wo_offload_prm1p5b.json"
+
+run_benchmark "0.5.0" "PCIe Bandwidth Sweep" \
+    "python ${SCRIPT_DIR}/bench_pcie_sweep.py --output-json ${RESULTS_DIR}/0.5_pcie/pcie_bw.json"
+
+run_benchmark "0.5" "PCIe Contention (nsys-driven)" \
+    "python ${SCRIPT_DIR}/bench_contention.py --output-json ${RESULTS_DIR}/0.5_pcie/contention.json"
 
 # --- vLLM-level benchmarks (need model weights) ---
 
-# 0.5 SKIPPED — requires CPU attention kernel (not compiled in GPU build)
-# Will benchmark when we build CPU ops for Phase 1b+2
+# 0.6 SKIPPED — requires CPU attention kernel (not compiled in GPU build).
+# Will benchmark when we build CPU ops for Phase 1b+2.
 
-run_benchmark "0.6" "CUDA Graph Impact" \
+run_benchmark "0.7" "CUDA Graph Impact" \
     "bash ${SCRIPT_DIR}/bench_cuda_graph.sh"
 
-run_benchmark "0.7" "KV Offload Impact" \
+# --- Application-level benchmark (V1 baseline §0.8 + KV offload ablation §0.9) ---
+
+run_benchmark "0.8/0.9" "V1 baseline + KV offload Impact" \
     "python ${SCRIPT_DIR}/bench_kv_offload.py --exp --plot"
-
-# --- Application-level benchmark ---
-
-run_benchmark "0.8" "FastTTS V1 Baseline" \
-    "bash ${SCRIPT_DIR}/bench_fasttts_baseline.sh"
 
 echo ""
 echo "=========================================="

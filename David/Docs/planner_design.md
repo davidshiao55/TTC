@@ -164,7 +164,7 @@ Why this decouples correctly:
 
 1. **Dispatch choice depends on `num_tokens_lookup`, not `num_tokens_exec`.** The Planner's cost model `(t_gpu, t_cpu, t_prefetch)` is measured per-bucket; the dispatch entry for a bucket represents the optimal split for that bucket's workload. Looking up at the bucket position is the right decision in both regimes — the bucket represents a "size class" of arithmetic intensity.
 
-2. **Graph-disabled mode wastes less compute.** With graphs off, the forward pass runs at exact `num_tokens`, saving the 0–20% compute-padding overhead that graph-enabled mode pays. This is measured in §0.6 of `phase0_findings.md`.
+2. **Graph-disabled mode wastes less compute.** With graphs off, the forward pass runs at exact `num_tokens`, saving the 0–20% compute-padding overhead that graph-enabled mode pays. This is measured in §0.7 of `phase0_findings.md`.
 
 3. **Conservative dispatch under mismatch.** When `num_tokens < BUCKETS[bucket]` in graph-disabled mode (the common case — rounded up), the dispatch entry was computed for a larger workload, so `f_cpu_compute` is slightly too low relative to optimal. This underuses the CPU path by a small margin but never causes stall. Rounding down would pick an entry computed for a smaller workload, risking too-aggressive CPU dispatch and actual stall — which is why we round up.
 
@@ -272,7 +272,7 @@ f_cpu         = min(f_cpu_store, cpu_fit)
 f_prefetch    = f_cpu_store − f_cpu
 ```
 
-Because CPU μs/MB is uniform across WQKV/MLP1/MLP2 (`phase0_findings.md §0.2`), the CPU-fit computation uses a single throughput constant, not per-sub-module lookups.
+Because CPU μs/MB is uniform across WQKV/MLP1/MLP2 (`phase0_findings.md §0.3.4`), the CPU-fit computation uses a single throughput constant, not per-sub-module lookups.
 
 **Layer-ahead prefetch feasibility check**: the total prefetch per layer is `f_prefetch × Σ_m W_m` (sum over {WQKV, MLP1, MLP2}). Cap `f_prefetch` if it exceeds `layer_time × pcie_h2d_bw`; excess falls back to `f_cpu`.
 

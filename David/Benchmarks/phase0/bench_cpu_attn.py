@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 0.5 — CPU Attention Latency (PyTorch reference implementation)
+"""Phase 0.6 — CPU Attention Latency (PyTorch reference implementation)
 
 Measures decode-time suffix attention latency on CPU as a function of
 `(batch_size, suffix_context_len)` for the generator (Qwen2.5-7B) and verifier
@@ -115,7 +115,7 @@ def main():
     cfg = MODEL_CONFIGS[args.model]
     dtype = getattr(torch, args.dtype)
 
-    print(f"Phase 0.5 — CPU Attention Latency (reference, PyTorch SDPA)")
+    print(f"Phase 0.6 — CPU Attention Latency (reference, PyTorch SDPA)")
     print(f"Model: {cfg['display_name']}")
     print(f"  num_query_heads={cfg['num_query_heads']}  "
           f"num_kv_heads={cfg['num_kv_heads']}  head_dim={cfg['head_dim']}")
