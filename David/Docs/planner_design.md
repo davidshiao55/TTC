@@ -126,7 +126,7 @@ For `num_tokens > max_cudagraph_capture_size`, vLLM falls back to eager executio
 ### 4.4 Fixed constants (documented outputs, not tuned)
 
 - `|B_prefetch_m| = layer-ahead buffer` — sized to hold `Σ_m (f_prefetch × W_m)` across WQKV/MLP1/MLP2 within one layer (see `pcie_bandwidth_allocation_design.md §Prefetch Distance`).
-- **Prefetch distance = layer-ahead** — one prefetch queue per layer, one sync per layer boundary. Committed (not an option).
+- **Prefetch distance = layer-ahead** — one prefetch queue per layer, one sync per layer boundary. Committed (not an option). Empirically validated in `phase0_findings.md §0.10.2c`: K>1 buys ≤6% over K=1 on Qwen2.5-7B at decode B=64; K=4 OOMs because the buffer pool grows linearly with K.
 - KV placement policy — see `attention_offload_design.md §Two-Pool KV Model` for the two candidate mechanisms (position-split vs head-split); one is selected globally and baked in before Phase 2 locks.
 - Per-sub-module split axis — `{WQKV: col, MLP1: col, MLP2: row}` is hardcoded across all models and buckets (see `weight_offload_design.md §Per-Sub-Module Split Axis`). WO is not offloaded in Phase 1/2 (`f_gpu` only, no dispatch).
 - PCIe allocation — 100% weight prefetch (see `pcie_bandwidth_allocation_design.md`).

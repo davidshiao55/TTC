@@ -26,6 +26,12 @@ dist/
 *.log
 wandb/
 
+# Nsight Systems profiling artifacts (binary, large)
+*.nsys-rep
+*.sqlite
+*.qdrep
+*.qdstrm
+
 # Editor / OS
 .vscode/
 .idea/

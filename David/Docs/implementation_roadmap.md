@@ -29,12 +29,11 @@ And three offloading mechanisms the components orchestrate (`thesis_proposal.md`
 
 | Phase | Profiler | Planner | Scheduler | Mechanism scope |
 |---|---|---|---|---|
-| **0** — Benchmarks | First profile run (schema validation) | — | — | — |
-| **1** — Resident Hybrid Weight Split | + CPU GEMM curves (all sub-modules) | First Planner output: `f_cpu_store` only, single-entry dispatch | — | Weight storage; CPU-compute dispatch path (all sub-modules incl. WQKV) |
+| **0** — Benchmarks | First profile run (schema validation) + vLLM native offloader baselines (§0.10) | — | — | — |
+| **1** — Collaborative Weight Offload | + CPU GEMM curves + PCIe BW curve | Per-bucket `(f_cpu, f_prefetch)` dispatch (1a: `f_cpu` only; 1b: adds `f_prefetch`) | — | Weight storage; CPU-compute + layer-ahead prefetch dispatch paths (WQKV, MLP1, MLP2; WO not offloaded) |
 | **2** — Attention Offloading | + CPU attention curve | Planner gains `KV_gpu_bytes` / `KV_cpu_bytes` variables | Tier-aware KV admission | KV two-pool storage; CPU suffix attention |
-| **3** — Tensor Prefetch | + PCIe BW curve refinement | Dispatch table gains `f_prefetch_compute` axis per bucket | — | Prefetch dispatch path added |
-| **4** — E2E | — | — | — | All mechanisms active |
-| **5** — CUDA Graph | — | — | `cudaLaunchHostFunc` retrofit | Graph-compatible dispatch |
+| **3** — E2E | — | — | — | All mechanisms active |
+| **4** — CUDA Graph | — | — | `cudaLaunchHostFunc` retrofit | Graph-compatible dispatch |
 
 Phases deliver the system incrementally: each extends Profiler coverage, Planner variable set, or Scheduler capabilities while preserving the three-component architecture.
 
@@ -45,117 +44,92 @@ Phases deliver the system incrementally: each extends Profiler coverage, Planner
 Validate the quantitative assumptions before writing any offloading code. If any
 of these numbers are significantly off, the approach changes.
 
-### 0.1 CPU GEMM Throughput (CRITICAL — gates Phase 1)
+Section numbering aligns with `phase0_findings.md`. Each entry below is a forward-looking gate (what to measure, why it matters); detailed numbers and analysis live in the corresponding findings section.
 
-**What:** Measure CPU matmul throughput for representative column-slice sizes.
+### 0.1 Dispatch axis — num_tokens unification
 
-**Why:** The f_cpu=9% "free" argument assumes CPU finishes its portion within
-GPU layer time (~0.5 ms for 7B). If CPU BLAS achieves only 40 GB/s instead of
-80 GB/s, f_cpu must drop to ~4.5%, halving memory savings.
+**What:** Validate that GPU layer time is governed by `num_tokens` alone (collapses uniform-decode and mixed-prefill-decode onto one axis).
 
-**How:** Benchmark `torch.mm` on CPU pinned tensors for each sub-module's CPU
-slice at batch sizes B=1,4,8,16,32. Test both BF16 and FP32 — CPU BF16 BLAS may
-be slower than FP32 depending on hardware (AMX vs no-AMX).
+**Why:** The Planner's dispatch table is keyed on `BatchDescriptor` whose discriminating axis is `num_tokens`. If layer time depends meaningfully on the prefill/decode mix at fixed `num_tokens`, the dispatch design needs an extra axis.
 
-Representative shapes (7B, f_cpu=9% uniform column choice):
-| Sub-module | GPU shape | CPU shape |
-|---|---|---|
-| WQKV | [B, 3584] × [3584, 4194] | [B, 3584] × [3584, 414] |
-| WO | [B, 3584] × [3584, 3262] | [B, 3584] × [3584, 322] |
-| MLP1 | [B, 3584] × [3584, 34478] | [B, 3584] × [3584, 3410] |
-| MLP2 | [B, 18944] × [18944, 3262] | [B, 18944] × [18944, 322] |
+**How:** `bench_num_tokens_axis.py`. See `phase0_findings.md §0.1`.
 
-And for the WQKV K/V-biased slice at `f_cpu_store_WQKV = 22%` (strict Q | K | V boundary; see `weight_offload_design.md`):
-| Split | GPU (Q) | CPU (K+V) |
-|---|---|---|
-| WQKV | [B, 3584] × [3584, 3584] | [B, 3584] × [3584, 1024] |
+### 0.2 Split mechanism correctness (CRITICAL — gates Phase 1)
 
-### 0.2 GPU Layer Time Breakdown (CRITICAL — gates Phase 1)
+**What:** Split a real Qwen2.5-7B layer along col-parallel (WQKV, MLP1) or row-parallel (MLP2) axes, compute partial paths, assemble, compare to unsplit reference.
 
-**What:** Profile per-layer decode time for 7B on V1, broken down by sub-module
-(WQKV, attention, WO, MLP1, MLP2).
+**Why:** Sanity check that mixed col/row partitioning produces bit-identical results. Includes the K/V-biased WQKV picker.
 
-**Why:** Confirms the ~0.5 ms/layer assumption and gives the exact GPU idle time
-that CPU compute must fit within. Also validates the memory-BW-bound assumption.
+**How:** `bench_split_correctness.py`. See `phase0_findings.md §0.2`.
 
-**How:** `torch.cuda.Event` based timing around each sub-module, or vLLM's
-layerwise profiler. Run at B=1,4,8,16,32,64.
+### 0.3 CPU/GPU compute characterization (CRITICAL — gates Phase 1)
 
-### 0.3 PCIe Effective Bandwidth (validates Phase 1b prefetch estimates)
+**What:** Per-sub-module GPU layer-time, CPU GEMM curve, and reduced-GPU timing (when slice f_cpu of weights is on CPU). Validates that CPU finishes its portion within the GPU layer-time budget at the operating point f_cpu ≈ 9%, and quantifies the µs/MB curves the Planner uses.
 
-**What:** Extend `David/Benchmarks/pcie_bandwidth_test.py` to sweep over
-transfer sizes: 256 KB, 1 MB, 4 MB, 10 MB, 50 MB, 100 MB, 500 MB.
+**Why:** Phase 1's "free" argument assumes CPU finishes within GPU compute window. If CPU µs/MB is too slow, f_cpu drops and memory savings shrink. Also validates uniform CPU µs/MB across sub-modules at decode B≥16 — the empirical foundation for the Planner emitting a single uniform `(f_cpu, f_prefetch)` per bucket.
 
-**Why:** The analysis assumes 22 GB/s H2D. Effective bandwidth varies with
-transfer size — small transfers (activation results ~300 KB) may have much lower
-effective bandwidth due to launch overhead.
+**How:** `bench_cpu_gpu_overlap.py`. See `phase0_findings.md §0.3` (subsections 0.3.1 GPU baseline, 0.3.2 CPU compute path, 0.3.3 per-sub-module overlap, 0.3.4 CPU µs/MB uniformity).
 
-**How:** Measure both H2D and D2H with pinned memory at each size.
+### 0.4 Per-sub-module split-axis design
 
-### 0.4 Column-Split Correctness (quick validation)
+**What:** Empirical wall-clock comparison of MLP1→MLP2 pipelining under uniform col vs col→row splits, plus WO offload Alt A vs Alt B decision.
 
-**What:** Split a real Qwen2.5-7B layer's weight matrix, compute both halves,
-concat, compare to unsplit result.
+**Why:** Pins down (i) which axis each sub-module should split along, and (ii) whether WO is offloaded at all in Phase 1. Both decisions are inputs to the `CpuComputeDispatcher` design.
 
-**Why:** Sanity check that column-parallel split produces bit-identical results.
+**How:** `bench_mlp_pipeline.py`, `bench_wo_offload_tradeoff.py`. See `phase0_findings.md §0.4` (0.4.1 MLP pipelining, 0.4.2 WO Alt A vs Alt B, 0.4.3 Phase 1/2 commitments).
 
-**How:** Load a real layer, split WQKV/MLP columns, compute both paths, assert
-`torch.allclose(atol=0)`.
+### 0.5 PCIe behavior — bandwidth, contention, UVA bypass (validates Phase 1b prefetch)
 
-### 0.5 CPU Attention Latency (gates Phase 2)
+**What:** PCIe effective bandwidth across transfer sizes; same-direction H2D contention on CE0; bidirectional H2D + D2H; DMA vs SM-issued UVA copy under contention.
 
-**What:** Measure `cpu_attention_with_kv_cache` latency at various (B, S)
-combinations: B=4,8,16,32 × S=100,500,1000,2000.
+**Why:** Phase 1b's prefetch budget (`layer_time × PCIe_BW`) and Phase 2's spill writes (D2H) require knowing both link bandwidth and the engine-level scheduling behavior. The DMA vs UVA distinction lets fg activation returns bypass bg weight prefetch (different PCIe paths).
 
-**Why:** Determines the practical batch size ceiling for attention offloading.
+**How:** `bench_pcie_sweep.py`, `bench_contention.py`, `probe_uva_bypass.py`. See `phase0_findings.md §0.5`.
 
-**How:** Use `vllm/benchmarks/kernels/cpu/benchmark_cpu_attn.py` with target
-configurations.
+### 0.6 CPU attention latency (gates Phase 2)
 
-### 0.6 CUDA Graph Impact (informs Phase 4 priority)
+**What:** Measure `cpu_attention_with_kv_cache` latency at representative (B, S) combinations.
 
-**What:** Measure decode throughput and per-step latency with CUDA Graphs
-enabled vs. disabled (`enforce_eager=True`) on 7B at various batch sizes.
+**Why:** Determines the practical batch size ceiling for suffix attention offloading. CPU attention is an intrinsically B-bound operation; this measurement bounds the regime where Phase 2 keeps pace with GPU.
 
-**Why:** Quantifies the actual performance cost of disabling CUDA Graphs. If
-the gap is small (e.g., <10%), Phase 4 is low priority and we can prototype
-comfortably with `enforce_eager=True`. If the gap is large (>20%), Phase 4
-becomes more urgent and we should consider building CUDA Graph compatibility
-earlier.
+**How:** Use `vllm/benchmarks/kernels/cpu/benchmark_cpu_attn.py`. See `phase0_findings.md §0.6`.
 
-**How:** Run `vllm bench latency` (or `benchmark_latency.py`) on 7B with:
-- `--enforce-eager` vs. default (CUDA Graphs enabled)
-- Batch sizes: B=1,4,8,16,32,64,128
-- Measure: per-step decode latency (ms), throughput (tok/s)
-- Also measure graph capture time to understand startup cost
+### 0.7 CUDA graph impact (informs Phase 4 priority)
 
-### 0.7 KV Cache CPU Offload Impact (informs Phase 2)
+**What:** Decode throughput and per-step latency with CUDA Graphs enabled vs. `--enforce-eager` on 7B across batch sizes.
 
-**What:** Measure the performance impact of vLLM's existing KV cache offloading
-to CPU. This tests how well the system handles KV data on CPU and gives a
-baseline for attention offloading overhead.
+**Why:** Quantifies the cost of prototyping with eager mode. Small gap → Phase 4 is low priority. Large gap → must build graph compatibility earlier.
 
-**Why:** vLLM V1 has a KV offload subsystem (`vllm/v1/kv_offload/`). Testing
-it reveals: (1) how much batch capacity increases when KV spills to CPU,
-(2) the actual CPU↔GPU transfer overhead for KV data, and (3) whether the
-existing infrastructure is usable as a building block for our suffix-on-CPU
-design. If existing KV offload already gives significant batch capacity gains,
-our attention offloading (Phase 2) builds on proven infrastructure. If it
-causes severe slowdowns, we know the bottleneck to target.
+**How:** `vllm bench latency` with and without `--enforce-eager`. See `phase0_findings.md §0.7`.
 
-**How:** Run 7B decode with KV offloading enabled at various configurations:
-- Compare: KV offload disabled (baseline) vs. enabled
-- Vary `gpu_memory_utilization` to force different amounts of KV spill
-- Measure: throughput, decode latency, max concurrent sequences
-- Monitor: PCIe transfer volume, KV cache hit/miss rates if available
+### 0.8 vLLM V1 FastTTS baseline
 
-### 0.8 vLLM V1 Baseline with FastTTS
+**What:** End-to-end FastTTS-thesis run on 7B (beam search, MATH-500 subset). Record throughput, latency, accuracy.
 
-**What:** Run FastTTS-thesis end-to-end on 7B (beam search, MATH-500 subset).
-Record throughput, latency, accuracy.
+**Why:** The V1 migration may have changed performance vs. the V0 numbers in `vllm_benchmarking_findings.md`. Need a fresh reference for the headline COTS comparison.
 
-**Why:** The V1 migration may have changed performance vs. the V0 numbers in
-`vllm_benchmarking_findings.md`. Need a fresh baseline.
+**How:** `bench_kv_offload.py` (baseline arm). See `phase0_findings.md §0.8`.
+
+### 0.9 vLLM V1 KV offload — impact (informs Phase 2)
+
+**What:** A/B test of vLLM V1's built-in CPU KV offload on the FastTTS workload (`vllm/v1/kv_offload/`). Measures prefix-reuse hit rate and end-to-end latency/goodput delta.
+
+**Why:** V1 KV offload is a *prefill-side* prefix-reuse mechanism (orthogonal to Phase 2's *decode-time* suffix attention). Two questions: (i) does it help meaningfully on the FastTTS workload, (ii) is it reusable as Phase 2 infrastructure (CPU block pool, allocator).
+
+**How:** `bench_kv_offload.py`. See `phase0_findings.md §0.9`.
+
+### 0.10 vLLM native weight offloader baseline (Prefetch + UVA)
+
+**What:** Decode-step latency under vLLM's stock weight offloaders on 7B BF16. Three sub-experiments:
+- **Head-to-head**: Prefetch vs UVA at matched offloaded GiB across batch ∈ {1, 16, 64}.
+- **PrefetchOffloader knob sweep**: G ∈ {2, 4, 14, 28} (divisors of 28), N at fixed G=14, K ∈ {1, 2, 3, 4} at fixed (G=14, N=4).
+- **nsys overlap probe**: visual confirmation of H2D ↔ compute overlap.
+
+**Why:** The COTS thesis claims to outperform stock vLLM offloading. Without on-hardware baselines for both stock options, "COTS is faster" has no anchor point. Two empirical findings also feed back into the COTS design:
+1. **At fixed offload bytes, denser uniform spacing dominates clustering** — argues for tensor-granularity over Group-style partitioning.
+2. **K=1 (layer-ahead) within ≤6% of optimal K**, K=4 OOMs at B=64 — empirically validates the layer-ahead commitment in `pcie_bandwidth_allocation_design.md`.
+
+**How:** `bench_uva_vs_prefetch.py` + `bench_prefetch_knobs.py` + `probe_native_offload_overlap.py`. See `phase0_findings.md §0.10`.
 
 ---
 
@@ -261,7 +235,8 @@ Full FastTTS runs on RTX 4090 with all offloading features.
 
 | Config | Model | Offloading | Purpose |
 |---|---|---|---|
-| Baseline | 7B | None | Reference throughput |
+| Baseline (no offload) | 7B | None | Reference throughput |
+| **Native prefetch baseline** | 7B | Stock vLLM `PrefetchOffloader`, best config from `phase0_findings.md §0.10` knob sweep at matched offload depth | Headline native baseline COTS competes against |
 | Static offload | 7B | Phase 1a (CPU-compute only, no prefetch) | Validate split mechanism + CPU-compute path |
 | Full weight offload | 7B | Phase 1 (1a + 1b prefetch) | Exercise full weight-offload mechanism |
 | Full offload | 7B | Phase 1 + 2 (attention) | Max batch capacity with attention offload |
@@ -273,7 +248,8 @@ Full FastTTS runs on RTX 4090 with all offloading features.
 - Per-step decode latency
 - GPU memory utilization (weights vs KV cache)
 - Accuracy on MATH-500 (should be unchanged)
-- Comparison against baseline (FastTTS-AE + vLLM 0.9.2, V0)
+- Comparison against the FastTTS V0 reference (FastTTS-AE + vLLM 0.9.2)
+- **Comparison against vLLM native prefetch baseline** at each (model, batch, offload depth) point — speedup ratio at matched depth is the headline COTS metric. Use the best `prefetch_*` config from `phase0_findings.md §0.10`, not the default `prefetch_8x2`.
 
 ---
 

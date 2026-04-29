@@ -1,0 +1,322 @@
+{
+  "schema_version": 1,
+  "section": "0.10.1",
+  "hardware_id": "nvidiageforcertx4090_x86_64",
+  "model": {
+    "name": "Qwen/Qwen2.5-7B-Instruct",
+    "dtype": "bfloat16"
+  },
+  "env": {
+    "platform": "Linux-5.15.0-176-generic-x86_64-with-glibc2.35",
+    "python": "3.11.15",
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "gpu": "NVIDIA GeForce RTX 4090"
+  },
+  "config": {
+    "input_len": 256,
+    "output_len": 32,
+    "warmup_iters": 2,
+    "bench_iters": 3,
+    "batches": [
+      1,
+      16,
+      64
+    ],
+    "enforce_eager": true,
+    "per_layer_decoder_bytes": 466092032,
+    "num_layers": 28
+  },
+  "arms": {
+    "none": {
+      "flags": [],
+      "offloaded_gib": 0.0,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 0.5223,
+          "tokens_per_s": 61.3
+        },
+        "16": {
+          "avg_latency_s": 0.8933,
+          "tokens_per_s": 573.1
+        },
+        "64": {
+          "avg_latency_s": 2.0457,
+          "tokens_per_s": 1001.1
+        }
+      }
+    },
+    "prefetch_14x1": {
+      "flags": [
+        "--offload-group-size",
+        "14",
+        "--offload-num-in-group",
+        "1",
+        "--offload-prefetch-step",
+        "1"
+      ],
+      "offloaded_gib": 0.868,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 1.5058,
+          "tokens_per_s": 21.3
+        },
+        "16": {
+          "avg_latency_s": 1.8672,
+          "tokens_per_s": 274.2
+        },
+        "64": {
+          "avg_latency_s": 2.989,
+          "tokens_per_s": 685.2
+        }
+      }
+    },
+    "prefetch_14x2": {
+      "flags": [
+        "--offload-group-size",
+        "14",
+        "--offload-num-in-group",
+        "2",
+        "--offload-prefetch-step",
+        "1"
+      ],
+      "offloaded_gib": 1.736,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.7723,
+          "tokens_per_s": 11.5
+        },
+        "16": {
+          "avg_latency_s": 3.1693,
+          "tokens_per_s": 161.6
+        },
+        "64": {
+          "avg_latency_s": 4.3133,
+          "tokens_per_s": 474.8
+        }
+      }
+    },
+    "prefetch_14x4": {
+      "flags": [
+        "--offload-group-size",
+        "14",
+        "--offload-num-in-group",
+        "4",
+        "--offload-prefetch-step",
+        "1"
+      ],
+      "offloaded_gib": 3.473,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 5.297,
+          "tokens_per_s": 6.0
+        },
+        "16": {
+          "avg_latency_s": 5.767,
+          "tokens_per_s": 88.8
+        },
+        "64": {
+          "avg_latency_s": 6.9982,
+          "tokens_per_s": 292.6
+        }
+      }
+    },
+    "prefetch_14x7": {
+      "flags": [
+        "--offload-group-size",
+        "14",
+        "--offload-num-in-group",
+        "7",
+        "--offload-prefetch-step",
+        "1"
+      ],
+      "offloaded_gib": 6.077,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 9.0909,
+          "tokens_per_s": 3.5
+        },
+        "16": {
+          "avg_latency_s": 9.6795,
+          "tokens_per_s": 52.9
+        },
+        "64": {
+          "avg_latency_s": 11.0204,
+          "tokens_per_s": 185.8
+        }
+      }
+    },
+    "prefetch_14x10": {
+      "flags": [
+        "--offload-group-size",
+        "14",
+        "--offload-num-in-group",
+        "10",
+        "--offload-prefetch-step",
+        "1"
+      ],
+      "offloaded_gib": 8.682,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 12.883,
+          "tokens_per_s": 2.5
+        },
+        "16": {
+          "avg_latency_s": 13.5908,
+          "tokens_per_s": 37.7
+        },
+        "64": {
+          "avg_latency_s": 15.0481,
+          "tokens_per_s": 136.1
+        }
+      }
+    },
+    "uva_1": {
+      "flags": [
+        "--cpu-offload-gb",
+        "1"
+      ],
+      "offloaded_gib": 1.0,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.2744,
+          "tokens_per_s": 14.1
+        },
+        "16": {
+          "avg_latency_s": 5.3304,
+          "tokens_per_s": 96.1
+        },
+        "64": {
+          "avg_latency_s": 15.8709,
+          "tokens_per_s": 129.0
+        }
+      }
+    },
+    "uva_2": {
+      "flags": [
+        "--cpu-offload-gb",
+        "2"
+      ],
+      "offloaded_gib": 2.0,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 3.5633,
+          "tokens_per_s": 9.0
+        },
+        "16": {
+          "avg_latency_s": 8.7074,
+          "tokens_per_s": 58.8
+        },
+        "64": {
+          "avg_latency_s": 26.5094,
+          "tokens_per_s": 77.3
+        }
+      }
+    },
+    "uva_4": {
+      "flags": [
+        "--cpu-offload-gb",
+        "4"
+      ],
+      "offloaded_gib": 4.0,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 6.7913,
+          "tokens_per_s": 4.7
+        },
+        "16": {
+          "avg_latency_s": 17.1533,
+          "tokens_per_s": 29.8
+        },
+        "64": {
+          "avg_latency_s": 52.5405,
+          "tokens_per_s": 39.0
+        }
+      }
+    },
+    "uva_6": {
+      "flags": [
+        "--cpu-offload-gb",
+        "6"
+      ],
+      "offloaded_gib": 6.0,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 9.552,
+          "tokens_per_s": 3.4
+        },
+        "16": {
+          "avg_latency_s": 24.3775,
+          "tokens_per_s": 21.0
+        },
+        "64": {
+          "avg_latency_s": 74.6477,
+          "tokens_per_s": 27.4
+        }
+      }
+    },
+    "uva_8": {
+      "flags": [
+        "--cpu-offload-gb",
+        "8"
+      ],
+      "offloaded_gib": 8.0,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 12.6012,
+          "tokens_per_s": 2.5
+        },
+        "16": {
+          "avg_latency_s": 30.9133,
+          "tokens_per_s": 16.6
+        },
+        "64": {
+          "avg_latency_s": 99.3893,
+          "tokens_per_s": 20.6
+        }
+      }
+    },
+    "uva_10": {
+      "flags": [
+        "--cpu-offload-gb",
+        "10"
+      ],
+      "offloaded_gib": 10.0,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 15.415,
+          "tokens_per_s": 2.1
+        },
+        "16": {
+          "avg_latency_s": 39.2208,
+          "tokens_per_s": 13.1
+        },
+        "64": {
+          "avg_latency_s": 121.1285,
+          "tokens_per_s": 16.9
+        }
+      }
+    },
+    "uva_12": {
+      "flags": [
+        "--cpu-offload-gb",
+        "12"
+      ],
+      "offloaded_gib": 12.0,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 18.398,
+          "tokens_per_s": 1.7
+        },
+        "16": {
+          "avg_latency_s": 45.9995,
+          "tokens_per_s": 11.1
+        },
+        "64": {
+          "avg_latency_s": 145.3661,
+          "tokens_per_s": 14.1
+        }
+      }
+    }
+  }
+}

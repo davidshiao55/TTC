@@ -158,6 +158,16 @@ nsys-ui trace.nsys-rep   # if a GUI is available
 
 `.nsys-rep` files can be opened in the Nsight Systems GUI on the host (the repo is bind-mounted, so no copy needed). For dense traces, use small focused probes (e.g., `David/Benchmarks/phase0/probe_engines.py`) rather than the full bench trace — easier to visually inspect a single behavior.
 
+**Profiling vLLM with nsys**: vLLM's V1 engine spawns a worker subprocess, so naive `nsys profile python script.py` only captures the parent and misses all CUDA activity. Per [vLLM's profiling docs](https://docs.vllm.ai/en/stable/contributing/profiling/), set `VLLM_WORKER_MULTIPROC_METHOD=spawn` and pass `--trace-fork-before-exec=true --cuda-graph-trace=node` to nsys so it follows into the engine subprocess:
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn nsys profile \
+    -o trace --trace=cuda,nvtx,osrt \
+    --trace-fork-before-exec=true --cuda-graph-trace=node \
+    --force-overwrite=true \
+    python my_vllm_script.py
+```
+
 ## FastTTS Architecture
 
 **Two-model system**: A generator LLM produces candidate solutions step-by-step; a verifier (PRM) scores each step to guide search.

@@ -79,7 +79,7 @@ Layer 3 (off): wait + compute   │ PCIe: idle
 
 With the three-way split at group level: resident layers have f_gpu=1. Offloaded layers can mix f_prefetch and f_cpu — the prefetched portion runs on GPU after transfer, the f_cpu portion is computed on CPU in parallel. Higher f_cpu on offloaded layers extends their compute time but reduces the PCIe transfer requirement, relaxing the hiding constraint.
 
-**Key parameters**: `group_size` (G), `num_in_group` (M=1 preferred), `prefetch_step` (P=1 sufficient for M=1).
+**Key parameters**: `group_size` (G), `num_in_group` (M=1 preferred), `prefetch_step` (P=1 sufficient for M=1; empirically validated in `phase0_findings.md §0.10.2c` — K=2 buys only ~6% over K=1 at G=14 N=4 B=64, and K=4 OOMs because the buffer pool scales linearly with K).
 
 ---
 
@@ -253,7 +253,7 @@ Our committed design is **tensor partition + layer-ahead prefetch**, with buffer
 
 | Partition | Prefetch distance | Buffer size | Example (7B, 50% offload) |
 |---|---|---|---|
-| Group (vLLM) | Multi-layer-ahead | layer_weight (full offloaded layer) | 466 MB |
+| Group (vLLM) | K offloaded-modules ahead (default K=1; ≈ group-ahead when N=1) | K × layer_weight (offloaded layers held in buffer pool) | 466 MB at K=1 |
 | Layer (FlexGen) | Layer-ahead | f_prefetch × layer_weight | 233 MB |
 | **Tensor (ours)** | **Layer-ahead** | sum(f_prefetch_i × W_i) | **~233 MB** |
 | Tensor (rejected) | Tensor-ahead | max(f_prefetch_i × W_i) | 73 MB |
@@ -301,7 +301,7 @@ All three granularities can use f_cpu to compute on CPU in parallel. But finer g
 |---|---|---|---|
 | Placement unit | Layer | Whole tensor | Tensor columns (col-parallel) or input cols (row-parallel), per sub-module |
 | f_gpu/f_prefetch/f_cpu | Per-layer (uniform within layer) | Per-tensor (binary: 0 or 1) | Uniform across WQKV/MLP1/MLP2 per bucket; WO not offloaded |
-| Prefetch distance | Multi-layer-ahead (G−1) | Layer-ahead | **Layer-ahead** (committed) |
+| Prefetch distance | K offloaded-modules ahead (default K=1; ≈ (G−1) actual layers when N=1) | Layer-ahead | **Layer-ahead** (committed; empirically validated in `phase0_findings.md §0.10.2c`) |
 | Exploits sub-module non-uniformity | No | Partially (different tensors, different placement) | Yes — different split axes per sub-module; uniform dispatch over them |
 | Buffer size | layer_weight | f_prefetch × layer_weight | sum_m (f_prefetch × W_m) ≈ f_prefetch × layer_weight |
 | KV prefetch | None — PCIe fully occupied by weights | Same | Same — 100% PCIe H2D to weight prefetch |

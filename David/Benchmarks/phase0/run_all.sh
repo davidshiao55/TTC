@@ -21,6 +21,7 @@
 #   0.6    CPU attention latency           (Python, needs vLLM CPU backend — SKIP)
 #   0.7    CUDA graph impact               (shell, needs vLLM + model)
 #   0.8/9  V1 baseline + KV offload impact (Python, needs FastTTS + models)
+#   0.10   vLLM native weight offloader baseline (Python, needs vLLM CLI + models)
 
 set -euo pipefail
 
@@ -109,6 +110,15 @@ run_benchmark "0.7" "CUDA Graph Impact" \
 
 run_benchmark "0.8/0.9" "V1 baseline + KV offload Impact" \
     "python ${SCRIPT_DIR}/bench_kv_offload.py --exp --plot"
+
+run_benchmark "0.10.1" "UVA vs Prefetch (head-to-head)" \
+    "python ${SCRIPT_DIR}/bench_uva_vs_prefetch.py --exp --plot"
+
+run_benchmark "0.10.2" "PrefetchOffloader knob sweep (G, N, K)" \
+    "python ${SCRIPT_DIR}/bench_prefetch_knobs.py --exp --plot"
+
+run_benchmark "0.10.probe" "Native offloader overlap probe (nsys)" \
+    "python ${SCRIPT_DIR}/probe_native_offload_overlap.py --arm all"
 
 echo ""
 echo "=========================================="

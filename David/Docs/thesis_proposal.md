@@ -1,6 +1,6 @@
 # Thesis Proposal
 
-**Working title**: *COTS: Collaborative CPU-GPU Offloading for Test-Time Scaling on Consumer GPUs*
+**Working title**: *COTS: Collaborative CPU-GPU Offloading for Test-Time Scaling on a Consumer GPU*
 
 ## 1. Problem Statement
 
