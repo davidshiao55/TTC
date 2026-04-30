@@ -27,6 +27,12 @@ Three independent sub-sweeps:
         K ∈ {1, 2, 3, 4}      (memory permitting; K=4 may OOM)
         Question: does multi-layer-ahead help, or is layer-ahead enough?
 
+  (d) N=1, G varies (densest possible spread at each depth)
+        G ∈ {2, 4, 7, 14, 28} → 14/7/4/2/1 offloaded layers = 6.08/3.04/
+        1.74/0.87/0.43 GiB. Compared against (b) at matched bytes; tests
+        whether (a)'s "denser-is-better-at-fixed-bytes" finding holds at
+        depths other than 50% coverage.
+
 Outputs go to ``results/0.10_prefetch_knobs/``.
 
 Usage
@@ -101,9 +107,15 @@ def sweep_c() -> list[tuple[str, int, int, int]]:
     return out
 
 
+def sweep_d() -> list[tuple[str, int, int, int]]:
+    """N=1, G varies. One offloaded layer per group → maximally uniform
+    spread at each depth."""
+    return [(f"prefetch_{G}x1", G, 1, 1) for G in [2, 4, 7, 14, 28]]
+
+
 def all_arms() -> dict[str, dict]:
     arms: dict[str, dict] = {}
-    for name, G, N, K in sweep_a() + sweep_b() + sweep_c():
+    for name, G, N, K in sweep_a() + sweep_b() + sweep_c() + sweep_d():
         if name in arms:
             continue
         arms[name] = {
@@ -128,8 +140,12 @@ def run_cell(arm: str, flags: list[str], batch: int) -> Path:
         print(f"  [skip] {arm} b={batch} (cached)")
         return out_json
 
+    # Use the same Python interpreter the driver was launched with so the
+    # subprocess always finds the right vllm install (PATH may not include
+    # the conda env when called from non-interactive shells).
     cmd = [
-        "vllm", "bench", "latency",
+        sys.executable, "-m", "vllm.entrypoints.cli.main",
+        "bench", "latency",
         "--model", MODEL,
         "--dtype", DTYPE,
         "--input-len", str(INPUT_LEN),
@@ -193,11 +209,11 @@ def plot(summary: dict, batches: list[int], out_path: Path) -> None:
         print("[plot] matplotlib unavailable.")
         return
 
-    fig, axes = plt.subplots(3, len(batches),
-                             figsize=(5 * len(batches), 12),
+    fig, axes = plt.subplots(4, len(batches),
+                             figsize=(5 * len(batches), 16),
                              sharey=False)
     if len(batches) == 1:
-        axes = axes.reshape(3, 1)
+        axes = axes.reshape(4, 1)
 
     def y(arm: str, B: int) -> float | None:
         cell = summary[arm]["by_batch"][B]
@@ -241,6 +257,34 @@ def plot(summary: dict, batches: list[int], out_path: Path) -> None:
             ax.set_ylabel(f"avg latency @ B={B} (s)")
             ax.set_title(f"{title}  —  B={B}")
             ax.grid(alpha=0.3)
+
+    # Row (d): sweep_d (N=1, G varies) vs sweep_b (G=14, N varies) at matched
+    # offloaded-GiB axis. Tests whether the "denser-is-better-at-fixed-bytes"
+    # finding from (a) generalizes to all depths.
+    sweep_b_arms = sorted([a for a, *_ in sweep_b()],
+                          key=lambda a: summary[a]["offloaded_gib"])
+    sweep_d_arms = sorted([a for a, *_ in sweep_d()],
+                          key=lambda a: summary[a]["offloaded_gib"])
+    for col, B in enumerate(batches):
+        ax = axes[3, col]
+        xs_b = [summary[a]["offloaded_gib"] for a in sweep_b_arms]
+        ys_b = [y(a, B) for a in sweep_b_arms]
+        xs_d = [summary[a]["offloaded_gib"] for a in sweep_d_arms]
+        ys_d = [y(a, B) for a in sweep_d_arms]
+        ax.plot(xs_b, ys_b, "s--", color="tab:green",
+                label="(b) G=14, N varies (clustered)")
+        ax.plot(xs_d, ys_d, "D-", color="tab:purple", linewidth=2,
+                label="(d) N=1, G varies (max spread)")
+        for a, x_, y_ in zip(sweep_d_arms, xs_d, ys_d):
+            if y_ is not None:
+                ax.annotate(f"G={summary[a]['G']}", (x_, y_), fontsize=7,
+                            xytext=(4, -10), textcoords="offset points",
+                            color="tab:purple")
+        ax.set_xlabel("Offloaded weights (GiB)")
+        ax.set_ylabel(f"avg latency @ B={B} (s)")
+        ax.set_title(f"(d) Densest spread (N=1) vs (b) clustered (G=14)  —  B={B}")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
 
     fig.suptitle("PrefetchOffloader knob sweep (Qwen2.5-7B BF16, in=256 out=32, eager)",
                  y=1.005, fontsize=12)

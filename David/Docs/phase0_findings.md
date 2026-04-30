@@ -868,6 +868,34 @@ The earlier `bench_native_weight_offload.py` finding that "G=16 N=4 wins at 25% 
 
 **This empirically validates the COTS commitment to layer-ahead** in `pcie_bandwidth_allocation_design.md` (§Prefetch Distance). The marginal benefit of K>1 (≤6% at B=64) is small relative to the buffer cost (linear in K) and the OOM risk at large batch. Layer-ahead (effectively K=1 in our partition) gives ~95% of the achievable hiding without the buffer pressure.
 
+#### (d) N=1 with G varies — densest spread at each depth
+
+Sub-sweep (a) showed that at fixed 50% coverage, denser uniform spacing wins. (d) tests whether that finding generalizes to other depths by holding N=1 (single offloaded layer per group → max spread) and varying G. The arm at each depth has the **densest possible** spatial pattern at that byte count — so each arm is the strongest possible prefetch baseline at its offload depth, against which any later comparison should be measured.
+
+| Arm | G | N | Offloaded layers | GiB | B=1 (s) | B=16 (s) | B=64 (s) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `prefetch_28x1` | 28 | 1 | 1 | 0.43 | 1.105 | 1.486 | 2.630 |
+| `prefetch_14x1` | 14 | 1 | 2 | 0.87 | 1.505 | 1.862 | 2.973 |
+| `prefetch_7x1`  | 7  | 1 | 4 | 1.74 | 2.670 | 2.994 | 4.090 |
+| `prefetch_4x1`  | 4  | 1 | 7 | 3.04 | 4.546 | 4.888 | 5.959 |
+| `prefetch_2x1`  | 2  | 1 | 14 | 6.08 | 8.990 | 9.451 | 10.439 |
+
+Comparison against (b) (`prefetch_14xN`, clustered) at matched depths:
+
+| Depth | (b) clustered | (d) max spread | B=64 (b/d) | gap |
+|---|---|---|---|---:|
+| 0.87 GiB (2 layers) | `prefetch_14x1` | `prefetch_14x1` (same arm) | 2.973 / 2.973 | 0% |
+| 1.74 GiB (4 layers) | `prefetch_14x2` | `prefetch_7x1` | 4.310 / 4.090 | **5.1%** |
+| 6.08 GiB (14 layers) | `prefetch_14x7` | `prefetch_2x1` | 11.016 / 10.439 | **5.2%** |
+
+(The 3.04 GiB `prefetch_4x1` and 3.47 GiB `prefetch_14x4` are also close points — 5.959 vs 6.996 = 14.8% — but the byte counts differ by 12% so the apparent gap is dominated by bytes, not pattern.)
+
+**(a)'s finding generalizes: at every byte-equal depth tested, the densest-spread (N=1) arm beats the clustered (G=14) arm by 5±0% at B=64.** The gap is small but consistent, and grows with batch (B=1: ~1%, B=16: ~5%, B=64: ~5%).
+
+**Why the win shrinks at B=1.** At B=1 decode is bandwidth-bound and per-layer compute time is roughly fixed regardless of how many layers are clustered together — clustering vs spreading affects how much "drain time" each prefetched layer gets, but at B=1 the drain time is short either way. At larger batches, GPU compute per layer grows; clusters of consecutive offloaded layers can't fully hide their H2D behind that compute (the second-and-later cluster member gets only ~1 ms of compute hiding for ~20 ms H2D), while uniformly-spread offloads always have a fresh non-offloaded layer's compute window to hide behind. Hence (d)'s lead expands at higher batches.
+
+**Implication for cross-section comparison:** the right prefetch baseline at any offload depth `d` is the (G, N=1) arm whose `28/G` matches `d / per-layer-bytes`. The §0.10.1 sweep used `G=14` with N varying and was therefore representative within ~5% of optimal at every depth — useful as a quick-look baseline, but for the strongest-prefetch comparison the (d) numbers are what to use.
+
 ### 0.10.3: nsys overlap probe
 
 Three short nsys traces written by `probe_native_offload_overlap.py` to `results/0.10_overlap_probe/`. Probe uses 25% coverage with the cleanest spatial pattern (uniform single-layer offloads via G=4 N=1):
@@ -879,7 +907,7 @@ Three short nsys traces written by `probe_native_offload_overlap.py` to `results
 ### Implications for COTS
 
 1. **Headline native-baseline at B=64**: at ~25% coverage, the strongest native option is `prefetch_14x4` (G=14, N=4 → 8 layers, 3.47 GiB, K=2 best at 6.60 s) — about 3.2× of `none`. COTS targets closing this gap by routing the offloaded fraction through CPU compute (idle in PrefetchOffloader) plus overlapping with concurrent CPU suffix attention.
-2. **At fixed bytes, denser uniform spacing wins** (§0.10.2a). This argues for the COTS partition's tensor-granularity approach over Group-style clustering — COTS spreads the offloaded fraction *within every layer* (no clustering at all), the limit case of "smaller G" in this sweep.
+2. **At fixed bytes, denser uniform spacing wins** (§0.10.2a, generalized in §0.10.2d to all depths — the densest-spread N=1 arms beat the clustered G=14 arms by ~5% at B=64 across the depth range). This argues for the COTS partition's tensor-granularity approach over Group-style clustering — COTS spreads the offloaded fraction *within every layer* (no clustering at all), the limit case of "smaller G" in this sweep.
 3. **UVA is never the right baseline above B=1.** Even at low offload depth the per-token PCIe cost of UVA-mapped reads is prohibitive. When comparing COTS against "vLLM stock offloading", we use `prefetch_*` — `uva_*` is reported only as a sanity floor.
 4. **Layer-ahead (K=1) is empirically near-optimal.** K=2 buys ≤6% at B=64 and risks OOM at K≥4. COTS's commitment to one prefetch queue per layer boundary is supported by both the contention analysis (§0.5/§0.9) and now this direct latency comparison.
 
@@ -887,6 +915,6 @@ Three short nsys traces written by `probe_native_offload_overlap.py` to `results
 
 The §0.10 numbers form the headline native baselines COTS is compared against in Phase 3:
 
-- For each (model, batch, offload depth) point, the right native reference is **the best `prefetch_*` configuration at matched offloaded bytes** with tuning over (G, N, K). Default vLLM settings (G=8 N=1 K=1) are *not* the best; the comparison should use measured optima.
+- For each (model, batch, offload depth) point, the right native reference is **the best `prefetch_*` configuration at matched offloaded bytes** with tuning over (G, N, K). Default vLLM settings (G=8 N=1 K=1) are *not* the best; the comparison should use measured optima. Per §0.10.2d, the "densest-spread" arms are `prefetch_28x1` / `prefetch_14x1` / `prefetch_7x1` / `prefetch_4x1` / `prefetch_2x1` covering 0.43 / 0.87 / 1.74 / 3.04 / 6.08 GiB.
 - `uva_*` is reported as a sanity floor (worst-case stock option above B=1) but is not the primary comparison target.
 - `none` is a valid comparison only at zero offload — at non-trivial offload depths the baseline simply OOMs without an offloader.

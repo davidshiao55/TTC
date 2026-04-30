@@ -266,6 +266,66 @@
         },
         "64": null
       }
+    },
+    "prefetch_4x1": {
+      "G": 4,
+      "N": 1,
+      "K": 1,
+      "offloaded_gib": 3.039,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 4.5462,
+          "tokens_per_s": 7.0
+        },
+        "16": {
+          "avg_latency_s": 4.8883,
+          "tokens_per_s": 104.7
+        },
+        "64": {
+          "avg_latency_s": 5.9594,
+          "tokens_per_s": 343.7
+        }
+      }
+    },
+    "prefetch_7x1": {
+      "G": 7,
+      "N": 1,
+      "K": 1,
+      "offloaded_gib": 1.736,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.6701,
+          "tokens_per_s": 12.0
+        },
+        "16": {
+          "avg_latency_s": 2.9944,
+          "tokens_per_s": 171.0
+        },
+        "64": {
+          "avg_latency_s": 4.0905,
+          "tokens_per_s": 500.7
+        }
+      }
+    },
+    "prefetch_28x1": {
+      "G": 28,
+      "N": 1,
+      "K": 1,
+      "offloaded_gib": 0.434,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 1.1046,
+          "tokens_per_s": 29.0
+        },
+        "16": {
+          "avg_latency_s": 1.4859,
+          "tokens_per_s": 344.6
+        },
+        "64": {
+          "avg_latency_s": 2.6301,
+          "tokens_per_s": 778.7
+        }
+      }
     }
   }
 }
