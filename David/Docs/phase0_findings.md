@@ -20,7 +20,7 @@ PyTorch 2.10.0+cu128, MKL enabled, oneDNN enabled.
 
 **System reference**
 - §0.6 — CPU attention latency (Phase 2 reference)
-- §0.7 — CUDA graph impact (Phase 4 priority)
+- §0.7 — CUDA graph impact (Phase 1c scope)
 - §0.8 — vLLM V1 FastTTS baseline
 - §0.9 — vLLM V1 KV offload impact
 
@@ -171,17 +171,35 @@ The key difference from TP: TP splits to a fast GPU with NVLink/PCIe interconnec
 
 GPU is memory-bandwidth-bound during decode — layer time is nearly constant across batch sizes, determined by weight read time at ~1008 GB/s.
 
-| Sub-module | Weight (BF16) | GPU time (B=1) | GPU time (B=16) | GPU BW% |
-|---|---|---|---|---|
-| WQKV | 33.0 MB | 0.019 ms | 0.020 ms | ~83% |
-| WO | 25.7 MB | 0.017 ms | 0.019 ms | ~80% |
-| MLP1 | 271.6 MB | 0.287 ms | 0.295 ms | ~94% |
-| MLP2 | 135.8 MB | 0.148 ms | 0.153 ms | ~92% |
-| **Total** | **466.1 MB** | **0.470 ms** | **0.487 ms** | |
+**Methodology — cold-cache ring on both CPU and GPU.** `time_cpu` and `time_gpu` (`bench_cpu_gpu_overlap.py`) cycle through `ceil(working_set_mb / weight_mb)` distinct weight tensors (capped at 32) before each iteration repeats. Working-set targets: **192 MB on GPU** (≈2.7× the RTX 4090's 72 MiB L2), **1024 MB on CPU** (≈28× the i9-14900KF's 36 MiB L3). This reflects what the runtime sees during decode — each step touches a different layer's weights and evicts prior layers — and prevents the L2-resident bias that small slices (e.g. WQKV reduced ≈ 31 MB) carry under a single-weight tight loop. Sized by working set rather than a fixed layer count so larger models don't OOM the GPU's ring (28 copies of 14B's WQKV would cost ~3.4 GB).
 
-WQKV and WO achieve >100% of DRAM bandwidth at B≥4 due to L2 cache effects (33 MB and 26 MB weights vs RTX 4090's 72 MB L2).
+| Sub-module | Weight (BF16) | GPU time (B=1) | GPU time (B=16) |
+|---|---:|---:|---:|
+| WQKV | 33.0 MB | 38 µs | 39 µs |
+| WO | 25.7 MB | 32 µs | 32 µs |
+| MLP1 | 271.6 MB | 287 µs | 294 µs |
+| MLP2 | 135.8 MB | 148 µs | 154 µs |
+| **Total** | **466.1 MB** | **505 µs** | **519 µs** |
+
+Source: `results/0.3_cpu_gpu_overlap/qwen7b_t16_ring.json`. WQKV and WO are ~2× higher than the original single-weight measurement (19 → 38 µs WQKV; 17 → 32 µs WO) — that bias was the L2-cache effect. MLP1 and MLP2 are unchanged (full weight already exceeds L2).
 
 ### 0.3.2: CPU compute path
+
+#### Critical discovery — single-weight tight loops measure L3, not DRAM
+
+A naive CPU-GEMM microbench reuses one weight tensor in a tight loop. For Qwen2.5-7B's MLP slice at f≈0.09, that one tensor is ~35 MiB — fits the i9-14900KF's 36 MiB L3 — so every iteration after the first hits L3 and the timing is **compute-bound**.
+
+Real decode cycles through 28 different layers' weight slices on every forward (~0.96 GiB total), well past L3. Each call is **DRAM-streaming, memory-bound** at ~5× the L3-resident time at small B. The cache effect collapses by B≥8 (compute starts to dominate the per-call FLOPs and amortizes the DRAM read).
+
+| B | MLP1 9% slice — single-tensor loop | MLP1 9% slice — 28-layer ring (real) | Ratio |
+|---:|---:|---:|---:|
+| 1 | 0.087 ms | 0.442 ms | 5.1× |
+| 4 | 0.339 ms | 0.521 ms | 1.5× |
+| 8 | 0.674 ms | 0.721 ms | 1.07× |
+| 16 | 1.340 ms | 1.378 ms | 1.03× |
+| 32 | 2.688 ms | 2.710 ms | 1.01× |
+
+**Design decision: all subsequent CPU GEMM timing in §0.3 cycles through 28 distinct weight tensors** (`bench_cpu_gpu_overlap.py:time_cpu` with `CPU_CYCLE_LAYERS=28`). The Planner's `cpu_gemm_curve` is regenerated from this. All numbers below are the realistic deployment-streaming timings.
 
 #### Critical discovery — `F.linear` vs `torch.mm` for BF16 on CPU
 
@@ -197,90 +215,89 @@ does FP32 FMA accumulation.
 | Approach | MLP1 9% slice, B=1 | Path |
 |---|---|---|
 | `torch.mm` BF16 | 22.3 ms | `aten::mm` → naive scalar fallback |
-| `torch.mm` FP32 | 0.17 ms | `aten::mm` → MKL SGEMM |
-| **`F.linear` BF16** | **0.087 ms** | `torch._C._nn.linear` → oneDNN BF16 |
-| `F.linear` FP32 | 0.166 ms | `torch._C._nn.linear` → MKL SGEMM |
+| **`F.linear` BF16** | **0.442 ms** | `torch._C._nn.linear` → oneDNN BF16 |
 
-At B=1, BF16 `F.linear` is **2x faster than FP32** because the operation is
-memory-bandwidth-bound and BF16 reads half the bytes. FP16 `F.linear` shows
-similar performance (0.098 ms) but BF16 is slightly faster and is the native
-model weight format.
+`F.linear` BF16 is ~50× faster than `torch.mm` BF16 — the only viable CPU
+path for our use case. BF16 weights also halve memory bandwidth vs FP32,
+which matters at low B where the GEMM is DRAM-bound.
 
 **Design decision: use `F.linear` with BF16 weights on CPU.** No FP32 weight
 duplication needed. The `CpuComputeDispatcher` must use `F.linear`, not `torch.mm`.
 
 #### BF16 `F.linear` scaling with batch size
 
-BF16 `F.linear` loses its advantage at higher batch sizes as the operation
-transitions from memory-BW-bound to compute-bound. The BF16→FP32 software
-conversion overhead (no AMX) becomes significant.
+MLP1 9% slice (3584 × 3410), BF16 `F.linear`:
 
-MLP1 9% slice (3584 × 3410):
+| B | Time |
+|---|---|
+| 1 | 0.442 ms |
+| 4 | 0.521 ms |
+| 8 | 0.721 ms |
+| 16 | 1.378 ms |
+| 32 | 2.710 ms |
 
-| B | BF16 F.linear | FP32 F.linear | BF16/FP32 |
-|---|---|---|---|
-| 1 | 0.087 ms | 0.166 ms | 0.52x (BF16 wins) |
-| 4 | 0.339 ms | 0.260 ms | 1.3x |
-| 8 | 0.674 ms | 0.348 ms | 1.9x |
-| 16 | 1.340 ms | 0.482 ms | 2.8x |
-| 32 | 2.688 ms | 0.818 ms | 3.3x |
+BF16 stays the design choice: no memory doubling vs FP32 (critical for 14B+ where CPU RAM is constrained), and the absolute times still allow useful overlap with GPU at small `f_cpu` (§0.3.3).
 
-Despite the scaling penalty, BF16 is the correct choice because:
-1. No memory doubling (critical for 14B+ where CPU RAM is constrained)
-2. TTC decode batch sizes are moderate (4-32 beams)
-3. The absolute times still allow useful overlap with GPU at small f_cpu
+### 0.3.3: Per-op overlap
 
-### 0.3.3: Per-sub-module overlap
+The forward path of one decoder layer dispatches **two** offloaded ops sequentially: WQKV and the fused MLP block (MLP1 → SwiGLU → MLP2 — see `phase1a_findings.md §1.3` for why MLP is fused at block granularity, not per-Linear). For zero overhead at a given `f_cpu`:
 
-Each CPU sub-module runs in parallel with its GPU counterpart. The constraint
-is per-sub-module: CPU time ≤ GPU time for zero overhead.
+- `CPU_WQKV ≤ GPU_WQKV` — WQKV's CPU slice fits within its GPU counterpart.
+- `(CPU_MLP1 + CPU_MLP2) ≤ (GPU_MLP1 + GPU_MLP2)` — the MLP block's CPU pipeline fits within its GPU counterpart. SwiGLU runs locally on each device and is small.
+
+WO is **not** offloaded (per `weight_offload_design.md §WO Split Axis Decision` and the §0.4.2 Alt B commitment), so it doesn't enter the overhead check; its GPU time is just baseline. All numbers below are cold-cache (28-layer ring on CPU, working-set ring on GPU; see §0.3.1) at `torch.set_num_threads(16)`, matching the COTS runtime default (`phase1a_findings.md §1.13b`).
+
+#### Per-op GPU budgets (cold-cache)
+
+| B | WQKV op | MLP block (MLP1+MLP2) |
+|---:|---:|---:|
+| 1 | 38 µs | 287 + 148 = 435 µs |
+| 4 | 39 µs | 290 + 156 = 446 µs |
+| 8 | 39 µs | 292 + 153 = 445 µs |
 
 **B=1 (single token decode):**
 
-| f_cpu | WQKV | WO | MLP1 | MLP2 | Layer overhead | GPU freed (×28 layers) |
-|---|---|---|---|---|---|---|
-| 3% | ✓ | ✓ | ✓ | ✓ | **FREE** | 0.39 GB |
-| 5% | ✓ | ✓ | ✓ | ✓ | **FREE** | 0.65 GB |
-| 9% | ~ | ✓ | ✓ | ✓ | **FREE** | 1.17 GB |
-| 15% | ~ | ~ | ✓ | ✓ | +0.007 ms | 1.96 GB |
-| 30% | ✗ | ✗ | ✗ | ✗ | +0.776 ms | 3.91 GB |
+| f_cpu | WQKV CPU vs 38 µs | MLP block CPU vs 435 µs | Layer overhead | GPU freed (×28 layers) |
+|---:|---:|---:|---|---:|
+| 3% | 16 µs ✓ | 156 + 96 = 252 µs ✓ | **FREE** (0 µs over) | 0.39 GB |
+| 5% | 27 µs ✓ | 271 + 153 = 424 µs ✓ | **FREE** (0 µs over, 22 µs total headroom) | 0.65 GB |
+| 9% | 54 µs ✗ (+16) | 486 + 246 = 732 µs ✗ (+297) | +313 µs/layer | 1.17 GB |
+| 15% | 92 µs ✗ (+54) | 778 + 402 = 1180 µs ✗ (+745) | +799 µs/layer | 1.96 GB |
 
 **B=4 (minimum TTC batch):**
 
-| f_cpu | WQKV | WO | MLP1 | MLP2 | Layer overhead | GPU freed (×28 layers) |
-|---|---|---|---|---|---|---|
-| 3% | ✓ | ✓ | ✓ | ✓ | **FREE** | 0.39 GB |
-| 5% | ~ | ~ | ✓ | ✓ | +0.006 ms | 0.65 GB |
-| 9% | ✗ | ✗ | ~ | ~ | +0.131 ms | 1.17 GB |
-| 15% | ✗ | ✗ | ✗ | ~ | +0.412 ms | 1.96 GB |
+| f_cpu | WQKV CPU vs 39 µs | MLP block CPU vs 446 µs | Layer overhead | GPU freed (×28) |
+|---:|---:|---:|---|---:|
+| 3% | 28 µs ✓ | 218 + 122 = 340 µs ✓ | **FREE** (0 µs over, 117 µs headroom) | 0.39 GB |
+| 5% | 46 µs ✗ (+7) | 367 + 190 = 557 µs ✗ (+111) | +118 µs/layer | 0.65 GB |
+| 9% | 78 µs ✗ (+39) | 646 + 328 = 974 µs ✗ (+528) | +567 µs/layer | 1.17 GB |
+| 15% | 132 µs ✗ (+93) | 1072 + 544 = 1616 µs ✗ (+1170) | +1263 µs/layer | 1.96 GB |
 
 **B=8:**
 
-| f_cpu | WQKV | WO | MLP1 | MLP2 | Layer overhead |
-|---|---|---|---|---|---|
-| 3% | ✗ | ✓ | ✓ | ✓ | +0.007 ms |
-| 5% | ✗ | ✓ | ✗ | ✓ | +0.119 ms |
-| 9% | ✗ | ✗ | ✗ | ✗ | +0.674 ms |
+| f_cpu | WQKV CPU vs 39 µs | MLP block CPU vs 445 µs | Layer overhead |
+|---:|---:|---:|---|
+| 3% | 48 µs ✗ (+9) | 343 + 218 = 561 µs ✗ (+116) | +125 µs/layer |
+| 5% | 76 µs ✗ (+37) | 568 + 327 = 895 µs ✗ (+450) | +487 µs/layer |
+| 9% | 128 µs ✗ (+89) | 1013 + 537 = 1550 µs ✗ (+1105) | +1194 µs/layer |
 
 Key observations:
-- **WQKV and WO are the first to overflow** because their GPU times are tiny
-  (0.02 ms). Even small CPU work exceeds this at B≥4.
-- **MLP1 and MLP2 have large GPU times** (0.29 ms, 0.15 ms) providing generous
-  overlap budgets. MLP1 tolerates f_cpu=9% up to B=4.
-- **MLP1 dominates offloaded-layer cost.** At f_cpu=30%, MLP1 accounts for ~78%
-  of the layer overhead.
+- **WQKV has a tight budget** (~38–39 µs, almost flat in B because GPU is memory-bandwidth-bound). Overflows at B=4 even at f=5%.
+- **MLP block has a generous budget** (~435–446 µs). Fits f=5% at B=1 and f=3% at B=4 with margin.
+- **MLP1 dominates the offloaded layer cost.** At f=15% B=1, MLP1 accounts for ~66% of the offloaded sum.
 
-**Visual evidence — `probe_overlap.py`.** A 1-second nsys probe at WQKV, f_cpu=9%, B=1 timeline-confirms CPU+GPU concurrency. Phase A (`A_gpu_only`) and B (`B_cpu_only`) ground-truth the per-side durations; Phase C (`C_concurrent`) shows the GPU bar and CPU `F.linear` bar overlapping in time. Run `nsys profile -o probe_overlap.nsys-rep --trace=cuda,nvtx,osrt --force-overwrite=true python probe_overlap.py` and inspect in Nsight Systems GUI.
+**Visual evidence — `probe_overlap.py`.** A 1-second nsys probe at WQKV, f_cpu=5%, B=1 timeline-confirms CPU+GPU concurrency. Phase A (`A_gpu_only`) and B (`B_cpu_only`) ground-truth the per-side durations; Phase C (`C_concurrent`) shows the GPU bar and CPU `F.linear` bar overlapping in time. Run `nsys profile -o probe_overlap.nsys-rep --trace=cuda,nvtx,osrt --force-overwrite=true python probe_overlap.py` and inspect in Nsight Systems GUI.
 
 #### Throughput tradeoff framing
 
-The claim that "f_cpu≈9% is free" holds **only at B=1 decode** on this hardware:
-- At B=1, all sub-modules fit within GPU time → genuinely free.
-- At TTC batch sizes (B≥4), it becomes a **throughput tradeoff**: small per-step
-  latency increase in exchange for more KV cache → more beams per scheduling
-  round → fewer rounds → potentially faster wall-clock TTC.
+In the microbench with cold-cache numbers, the free regime is:
+- **B=1: f_cpu ≤ 5%** — both WQKV and MLP block fit (22 µs total headroom across the layer at f=5%).
+- **B=4: f_cpu ≤ 3%** — both fit with 117 µs headroom; f=5% spills WQKV by 7 µs and MLP by 111 µs.
+- **B≥8: no free regime** even at f=3% — WQKV overflows by 9 µs and MLP by 116 µs. The regime becomes a **throughput tradeoff**: per-step latency increase in exchange for more KV cache → more beams per scheduling round → fewer rounds → potentially faster wall-clock TTC.
 
-The specific number `9%` is a property of this (HW, model, dtype) combination at B=1, not a universal constant. The Planner (see `planner_design.md`) derives bucket-specific values from the profile, so the number used in practice varies per `BatchDescriptor`.
+**Important caveat — microbench-free ≠ e2e-free.** §1.14 of `phase1a_findings.md` measures the e2e gap at f=0.05 B=1 t=16 (decode-heavy) directly: COTS is +2.49 s slower than baseline despite the microbench predicting free. The decomposition (`--cots-dry-run` mode) attributes ~18% to pure host orchestration and ~82% to the *active CPU-work penalty* — extra wall clock from enabling real CPU GEMM, dominated by oneDNN-on-many-threads contending with the main thread's CUDA dispatch path. Neither is visible in this microbench because it measures CPU and GPU in isolation, with no main-thread CUDA dispatch happening on the same cores. The true free regime under Phase 1a runtime is below f=0.05; under Phase 1c (native runner + bucket-aware thread policy, `implementation_roadmap.md`) the floor recovers to roughly the microbench prediction.
+
+The specific numbers (`5%` at B=1, `3%` at B=4) are properties of this (HW, model, dtype, thread-count) combination, not universal constants. The Planner (see `planner_design.md`) derives bucket-specific values from the profile, so the number used in practice varies per `BatchDescriptor`.
 
 ### 0.3.4: CPU μs/MB uniformity across sub-modules
 
@@ -620,7 +637,7 @@ Roughly 2.3× faster than 7B, matching the query-head ratio (28/12 ≈ 2.33) —
 
 ## 0.7: CUDA graph impact
 
-Measured by `bench_cuda_graph.sh` — `vllm bench latency` with and without `--enforce-eager`, comparing CUDA-graph-captured execution to eager per-kernel launches. Purpose: decide whether Phase 4 (the `cudaLaunchHostFunc` retrofit that makes the Phase 2/3 CPU-dispatch and prefetch paths CUDA-graph-compatible) is urgent or can be safely deferred.
+Measured by `bench_cuda_graph.sh` — `vllm bench latency` with and without `--enforce-eager`, comparing CUDA-graph-captured execution to eager per-kernel launches. Purpose: scope the CUDA-graph-compatibility work that Phase 1c (the `cudaLaunchHostFunc` retrofit that makes the CPU-dispatch and prefetch paths CUDA-graph-compatible) ships.
 
 ### Setup
 
@@ -644,29 +661,27 @@ End-to-end generation latency (prefill + 128-token decode):
 
 **CUDA Graph impact is 0.5–2.0% across all tested batch sizes.** The graph-vs-eager gap is small because 7B decode on an RTX 4090 is memory-bandwidth-bound per layer (§0.3: ~0.47 ms/layer, >90% of GDDR6X peak). The per-kernel launch overhead that CUDA graphs eliminate is a tiny fraction of each layer's memory-bound execution time. Graphs help most when many small kernels dispatch rapidly; our decode path has four relatively coarse-grained matmuls per layer, so eager launches are already efficient.
 
-### Implications for Phase 4 priority
+### Implications for Phase 1c scope
 
-1. **Prototyping with `enforce_eager=True` costs at most ~2% throughput** for the main thesis workload. This is well within the noise of FastTTS beam-search measurements. The `CpuComputeDispatcher` abstraction (Phase 1 day-1 choice; `implementation_roadmap.md §1.3`) is viable against eager-mode forward passes for all of Phase 1–3.
+1. **Prototyping Phase 1a/1b with `enforce_eager=True` costs at most ~2% throughput** for the main thesis workload. This is well within the noise of FastTTS beam-search measurements. The `CpuComputeDispatcher` abstraction (Phase 1 day-1 choice; `implementation_roadmap.md §1.3`) is viable against eager-mode forward passes through Phase 1b.
 
-2. **Phase 4 remains correctly prioritized at the tail of the roadmap.** The `cudaLaunchHostFunc` + `CPUInfer` retrofit is ~400 lines of engineering (per the roadmap). Trading that effort for a 2% throughput gain would be a poor allocation of thesis time unless the final system is production-bound.
+2. **Graph capture alone wouldn't justify Phase 1c — but the native runner does.** §0.7 in isolation shows ~2% throughput from graphs, which would normally argue for deferral. But `phase1a_findings.md §1.14` showed the Python `CpuTaskRunner` substrate is the dominant Phase 1a overhead and the native-runner port is the precondition for any graph capture of the COTS path; graph capture falls out for free once the native dispatcher lands. So Phase 1c is gated by the substrate fix, not by §0.7's 2%, and happens before Phase 2.
 
-3. **V1's per-process memory overhead (0.9–1.4 GiB from CUDA graphs + torch.compile, see `vllm_v1_migration.md §12`) is the real cost of enabling graphs.** For our two-process generator+verifier setup, disabling graphs via `enforce_eager=True` recovers ~2 GiB of GPU memory — which then becomes additional KV budget. This is a *net-positive* trade for the thesis: eager mode gives back more KV capacity than it costs in per-step latency.
+3. **V1's per-process memory overhead (0.9–1.4 GiB from CUDA graphs + torch.compile, see `vllm_v1_migration.md §12`) is the real cost of enabling graphs.** For our two-process generator+verifier setup, disabling graphs via `enforce_eager=True` recovers ~2 GiB of GPU memory — which then becomes additional KV budget. Phase 1a/1b keep `enforce_eager=True` to harvest that KV; Phase 1c re-evaluates the trade once the dispatcher is graph-compatible.
 
 ### Recommendation
 
-Phase 1–3 prototypes run with `enforce_eager=True` by default. Phase 4 (graph retrofit) is deferred as originally planned.
+Phase 1a/1b prototypes run with `enforce_eager=True` by default. Phase 1c (native runner + graph capture) lands before Phase 2 per `implementation_roadmap.md` and `phase1a_findings.md §1.14`.
 
-### Framing Phase 4's purpose
+### Framing the graph-capture requirement
 
-Phase 4's value is **upstream compatibility, not latency**. The §0.7 measurement shows graph capture gives only ~2% throughput on our thesis workload — too small to be a Phase 4 justification on its own. The real reason Phase 4 exists:
+Graph capture's value is **upstream compatibility, not standalone latency**. The §0.7 measurement shows graph capture gives only ~2% throughput on our thesis workload — too small to be the deciding factor. Phase 1c bundles graph compatibility with the substrate fix because:
 
-1. **vLLM integration.** Production vLLM defaults to `FULL_AND_PIECEWISE` graph capture. A Python-threaded `CpuComputeDispatcher` falls out of graph capture — any downstream user who enables graphs would silently lose the CPU-compute path. For the work to land upstream, the CPU-dispatch and prefetch paths must be `cudaLaunchHostFunc`-based.
+1. **vLLM integration.** Production vLLM defaults to `FULL_AND_PIECEWISE` graph capture. A Python-threaded `CpuComputeDispatcher` falls out of graph capture — any downstream user who enables graphs would silently lose the CPU-compute path. For the work to land upstream, the CPU-dispatch and prefetch paths must be `cudaLaunchHostFunc`-based, which the native runner already requires for performance reasons.
 
-2. **Graph benefit grows with system scale.** On 8-GPU TP deployments each layer has many more kernels (all-reduces, MoE routing, etc.), so launch overhead fraction grows. The 2% we measured on a single 4090 becomes 10%+ on production setups.
+2. **Graph benefit grows with system scale.** On 8-GPU TP deployments each layer has many more kernels (all-reduces, MoE routing, etc.), so launch-overhead fraction grows. The 2% we measured on a single 4090 becomes 10%+ on production setups.
 
 3. **Compiler pipelines assume graph capture.** `torch.compile` + piecewise graph capture is becoming the vLLM default; opting out increasingly looks like pre-modern infrastructure.
-
-For the thesis's research question ("does offloading work on consumer hardware?"), Phase 4 contributes nothing. For the engineering deliverable ("is this merge-compatible with modern LLM serving?"), Phase 4 is mandatory. That distinction is what makes Phase 4 correctly placed at the tail of the roadmap — do it only if time allows after the research claim is validated.
 
 ---
 
@@ -691,13 +706,13 @@ See §0.9 for the matched offload ablation. This section reports the `fasttts` (
 
 ### Observations
 
-1. **KV cache saturates at n=64 on aime (longer completions, ~800 tok) and n=256 on math500 (shorter, ~520 tok).** This is the goalpost Phase 1 targets: freeing ~1.2 GB of GPU memory via weight offload (predicted from §0.1+0.3 overlap analysis) should raise the saturating n by ~25%, validated in Phase 4.
+1. **KV cache saturates at n=64 on aime (longer completions, ~800 tok) and n=256 on math500 (shorter, ~520 tok).** This is the goalpost Phase 1 targets: freeing ~1.2 GB of GPU memory via weight offload (predicted from §0.1+0.3 overlap analysis) should raise the saturating n by ~25%, validated in Phase 3 (e2e benchmarking).
 
 2. **Baseline goodput declines sharply from n=1 to n=256** (62 → 7 tok/s on aime, 62 → 9 tok/s on math500). Most of the decline before saturation (n=1 → n=64) is inherent to beam parallelism producing correlated outputs; the decline past saturation (n=64 → n=256) is additional throughput loss from KV-pressure queueing (`gen_frac_steps_queued` jumps from 0.1% to 8.1% on aime).
 
 3. **Prefix caching is highly effective** across all n: `gen_gpu_hit` 95–98% means prefill costs are amortized across beams. This is the "shared prefix" property Phase 1's WQKV K/V-biased split is designed to preserve — our column-parallel weight split must not disrupt prefix caching, which is the FastTTS win.
 
-4. **These are V1 numbers on vLLM 0.19.0**, not V0 on 0.9.2 (the baseline in the original FastTTS paper). V1 has slightly higher per-process memory overhead (~0.9–1.4 GiB from CUDA graphs + torch.compile, see `vllm_v1_migration.md §12`), which slightly raises the GPU memory split for generator vs. verifier (0.74 / 0.16 recommended) and is the reason we can't directly compare to the published FastTTS numbers. Phase 4 will re-evaluate against these V1 numbers.
+4. **These are V1 numbers on vLLM 0.19.0**, not V0 on 0.9.2 (the baseline in the original FastTTS paper). V1 has slightly higher per-process memory overhead (~0.9–1.4 GiB from CUDA graphs + torch.compile, see `vllm_v1_migration.md §12`), which slightly raises the GPU memory split for generator vs. verifier (0.74 / 0.16 recommended) and is the reason we can't directly compare to the published FastTTS numbers. Phase 3 e2e benchmarking re-evaluates against these V1 numbers.
 
 ---
 
@@ -760,7 +775,7 @@ Fraction of prefix KV lookups served from CPU-resident cached blocks (as opposed
 
 5. **Reusable as Phase 2 infrastructure.** The V1 offload codebase provides a working CPU block pool, pinned allocator, and GPU↔CPU block-copy primitives. Phase 2 extends this framework with "blocks that stay on CPU" semantics (for suffix attention) in addition to the existing "blocks that get reloaded before attention" (for prefix reuse). The two modes can cohabit in the same pool.
 
-### Recommendation for Phase 4 evaluation
+### Recommendation for Phase 3 e2e evaluation
 
 **Disable V1 KV offload in both the thesis configuration and the baseline comparison.** Four reasons, in order of importance:
 

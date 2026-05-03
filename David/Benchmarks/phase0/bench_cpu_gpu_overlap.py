@@ -154,43 +154,79 @@ ITERS = 100
 CURVE_WARMUP = 10
 CURVE_ITERS = 50
 
+# Cache hierarchy targets — both CPU and GPU primitives cycle through enough
+# distinct weights to overflow the relevant cache, so timing reflects DRAM-
+# streaming reality (what the runtime actually sees during decode, where
+# each step touches a different layer's weights and evicts prior layers).
+#
+#   RTX 4090:    72 MiB L2  → ~2.7× target = 192 MB GPU working set
+#   i9-14900KF:  36 MiB L3  → ~30× target  = 1024 MB CPU working set
+#
+# Sized by working set (rather than a fixed layer count) so larger models
+# don't OOM the GPU: at 14B, 28 copies of WQKV (~120 MB) would consume
+# ~3.4 GB just for the ring. `MAX_RING_LAYERS` caps degenerate cases where
+# the slice is tiny (e.g. f=0.99 reduced).
+GPU_WORKING_SET_MB = 192
+CPU_WORKING_SET_MB = 1024
+MAX_RING_LAYERS = 32
+
 
 # ---------------------------------------------------------------------------
 # Timing primitives
 # ---------------------------------------------------------------------------
+def _ring_size(in_dim: int, out_dim: int, working_set_mb: float) -> int:
+    """Smallest ring length whose working set hits `working_set_mb` MB."""
+    weight_mb = in_dim * out_dim * 2 / (1024 * 1024)  # BF16
+    n = (working_set_mb + weight_mb - 1) // weight_mb
+    return max(1, min(MAX_RING_LAYERS, int(n)))
+
+
 def time_gpu(B, in_dim, out_dim, warmup=CURVE_WARMUP, iters=CURVE_ITERS):
-    """F.linear on CUDA, BF16. Returns mean ms."""
-    W = torch.randn(out_dim, in_dim, dtype=torch.bfloat16, device="cuda")
+    """F.linear on CUDA, BF16, with a cold-L2 ring. Returns mean ms.
+
+    The ring is sized so its total bytes exceed RTX 4090's 72 MiB L2; for
+    small slices (e.g. WQKV reduced ~31 MB) reusing one weight would yield
+    L2-resident timing. See `phase0_findings.md §0.3`.
+    """
+    n = _ring_size(in_dim, out_dim, GPU_WORKING_SET_MB)
+    Ws = [
+        torch.randn(out_dim, in_dim, dtype=torch.bfloat16, device="cuda")
+        for _ in range(n)
+    ]
     x = torch.randn(B, in_dim, dtype=torch.bfloat16, device="cuda")
 
-    for _ in range(warmup):
-        F.linear(x, W)
+    for i in range(warmup):
+        F.linear(x, Ws[i % n])
     torch.cuda.synchronize()
 
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     for i in range(iters):
         starts[i].record()
-        F.linear(x, W)
+        F.linear(x, Ws[i % n])
         ends[i].record()
     torch.cuda.synchronize()
     return sum(s.elapsed_time(e) for s, e in zip(starts, ends)) / iters
 
 
 def time_cpu(B, in_dim, out_dim, warmup=CURVE_WARMUP, iters=CURVE_ITERS):
-    """F.linear on CPU, BF16 (oneDNN path). Returns mean ms.
+    """F.linear on CPU, BF16 (oneDNN), with a cold-L3 ring. Returns mean ms.
 
-    `F.linear` is REQUIRED — `torch.mm` with BF16 on non-AMX CPUs falls back to
-    a scalar loop (100-250× slower). See `phase0_findings.md` §"Critical Discovery".
+    Same DRAM-streaming methodology as `time_gpu`; sized for i9-14900KF's
+    36 MiB L3. See `phase0_findings.md §0.3`.
     """
-    W = torch.randn(out_dim, in_dim, dtype=torch.bfloat16, device="cpu")
+    n = _ring_size(in_dim, out_dim, CPU_WORKING_SET_MB)
+    Ws = [
+        torch.randn(out_dim, in_dim, dtype=torch.bfloat16, device="cpu")
+        for _ in range(n)
+    ]
     x = torch.randn(B, in_dim, dtype=torch.bfloat16, device="cpu")
 
-    for _ in range(warmup):
-        F.linear(x, W)
+    for i in range(warmup):
+        F.linear(x, Ws[i % n])
     start = time.perf_counter()
-    for _ in range(iters):
-        F.linear(x, W)
+    for i in range(iters):
+        F.linear(x, Ws[i % n])
     return (time.perf_counter() - start) / iters * 1000
 
 
@@ -388,8 +424,12 @@ def main():
                    help="Also print the legacy TP-overlap and QKV-split tables")
     p.add_argument("--skip-reduced-timing", action="store_true",
                    help="Skip gpu_reduced_timing (saves ~half the runtime)")
+    p.add_argument("--cpu-threads", type=int, default=16,
+                   help="torch.set_num_threads value (matches COTS runtime "
+                        "default; see phase1a_findings.md §1.13b)")
     args = p.parse_args()
 
+    torch.set_num_threads(args.cpu_threads)
     cfg = MODEL_CONFIGS[args.model]
 
     print(f"Phase 0.3 Profiler — {cfg['display_name']}")
