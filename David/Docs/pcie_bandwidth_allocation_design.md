@@ -168,7 +168,7 @@ Layer N+1: GPU+CPU compute (uses prefetched) │ PCIe: prefetch layer N+2's f_pr
 
 - **Global budget per layer**: `Σ_m (f_prefetch × W_m) ≤ layer_time × PCIe_BW` over the offloaded sub-modules {WQKV, MLP1, MLP2}.
 - **Buffer**: `Σ_m (f_prefetch × W_m)` — all prefetched weights resident when the layer begins. At 7B f=50%, ~233 MB (~1% of 24 GB budget — negligible).
-- **Scheduling**: single prefetch queue populated at the layer boundary; one `cudaStreamWaitEvent` to gate compute on prefetch completion. Clean Phase 4 CUDA-graph integration (one sync per layer instead of per sub-phase).
+- **Scheduling**: single prefetch queue populated at the layer boundary; one `cudaStreamWaitEvent` to gate compute on prefetch completion. Clean Phase 1c CUDA-graph integration (one sync per layer instead of per sub-phase).
 
 ### Alternatives Considered and Rejected
 
@@ -186,7 +186,7 @@ At decode with WO's short compute phase (~0.018 ms), the MLP1 prefetch budget st
 1. `phase0_findings.md §0.3.4` shows CPU μs/MB is uniform across sub-modules at decode B ≥ 16. Per-sub-module f tuning (tensor-ahead's main purpose) buys effectively nothing.
 2. fg-wait against bg prefetch is already bounded **at the layer grain** by routing fg activation returns through SM-issued UVA loads (`phase0_findings.md §0.5`). The UVA copy kernel uses a different PCIe path than CE0 (the H2D copy engine), so fg events don't queue behind bg DMA regardless of how bg is scheduled — fg_s2c stays at ~30–35 μs whether bg is a single 4 MB H2D or many 64 KB chunks. Tensor-ahead's per-sub-phase contention control adds no value when the layer-grain mechanism already eliminates the queue dependency.
 3. Buffer savings (~160 MB) are negligible on a 24 GB GPU.
-4. Per-sub-phase scheduling (~5 sync points per layer) adds Phase 4 CUDA-graph complexity for no measurable benefit.
+4. Per-sub-phase scheduling (~5 sync points per layer) adds Phase 1c CUDA-graph complexity for no measurable benefit.
 
 #### Multi-layer-ahead (K > 1)
 

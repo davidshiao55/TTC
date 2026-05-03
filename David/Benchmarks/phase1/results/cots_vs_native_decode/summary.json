@@ -1,0 +1,269 @@
+{
+  "env": {
+    "platform": "Linux-5.15.0-176-generic-x86_64-with-glibc2.35",
+    "python": "3.11.15",
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "gpu": "NVIDIA GeForce RTX 4090"
+  },
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "input_len": 8,
+  "output_len": 128,
+  "summary": {
+    "none": {
+      "flags": [],
+      "family": "none",
+      "offloaded_gib": 0.0,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.033,
+          "tokens_per_s": 63.0
+        },
+        "4": {
+          "avg_latency_s": 2.1049,
+          "tokens_per_s": 243.2
+        },
+        "16": {
+          "avg_latency_s": 2.1468,
+          "tokens_per_s": 954.0
+        }
+      }
+    },
+    "cots_005": {
+      "flags": [
+        "--offload-backend",
+        "cots",
+        "--cots-f-cpu-store",
+        "0.05"
+      ],
+      "family": "cots",
+      "offloaded_gib": 0.574,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 4.5279,
+          "tokens_per_s": 28.3
+        },
+        "4": {
+          "avg_latency_s": 5.4336,
+          "tokens_per_s": 94.2
+        },
+        "16": {
+          "avg_latency_s": 11.3435,
+          "tokens_per_s": 180.5
+        }
+      }
+    },
+    "cots_009": {
+      "flags": [
+        "--offload-backend",
+        "cots",
+        "--cots-f-cpu-store",
+        "0.09"
+      ],
+      "family": "cots",
+      "offloaded_gib": 1.034,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 5.8874,
+          "tokens_per_s": 21.7
+        },
+        "4": {
+          "avg_latency_s": 7.4123,
+          "tokens_per_s": 69.1
+        },
+        "16": {
+          "avg_latency_s": 18.0879,
+          "tokens_per_s": 113.2
+        }
+      }
+    },
+    "cots_022": {
+      "flags": [
+        "--offload-backend",
+        "cots",
+        "--cots-f-cpu-store",
+        "0.22"
+      ],
+      "family": "cots",
+      "offloaded_gib": 2.527,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 10.8534,
+          "tokens_per_s": 11.8
+        },
+        "4": {
+          "avg_latency_s": 14.7223,
+          "tokens_per_s": 34.8
+        },
+        "16": {
+          "avg_latency_s": 38.2035,
+          "tokens_per_s": 53.6
+        }
+      }
+    },
+    "cots_050": {
+      "flags": [
+        "--offload-backend",
+        "cots",
+        "--cots-f-cpu-store",
+        "0.5"
+      ],
+      "family": "cots",
+      "offloaded_gib": 5.742,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 22.4337,
+          "tokens_per_s": 5.7
+        },
+        "4": {
+          "avg_latency_s": 29.1155,
+          "tokens_per_s": 17.6
+        },
+        "16": {
+          "avg_latency_s": 79.9225,
+          "tokens_per_s": 25.6
+        }
+      }
+    },
+    "prefetch_2x1": {
+      "flags": [
+        "--offload-backend",
+        "prefetch",
+        "--offload-group-size",
+        "2",
+        "--offload-num-in-group",
+        "1",
+        "--offload-prefetch-step",
+        "1"
+      ],
+      "family": "prefetch",
+      "offloaded_gib": 6.077,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 35.9609,
+          "tokens_per_s": 3.6
+        },
+        "4": {
+          "avg_latency_s": 36.03,
+          "tokens_per_s": 14.2
+        },
+        "16": {
+          "avg_latency_s": 36.2823,
+          "tokens_per_s": 56.4
+        }
+      }
+    },
+    "prefetch_4x1": {
+      "flags": [
+        "--offload-backend",
+        "prefetch",
+        "--offload-group-size",
+        "4",
+        "--offload-num-in-group",
+        "1",
+        "--offload-prefetch-step",
+        "1"
+      ],
+      "family": "prefetch",
+      "offloaded_gib": 3.039,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 18.1323,
+          "tokens_per_s": 7.1
+        },
+        "4": {
+          "avg_latency_s": 18.2111,
+          "tokens_per_s": 28.1
+        },
+        "16": {
+          "avg_latency_s": 18.3119,
+          "tokens_per_s": 111.8
+        }
+      }
+    },
+    "prefetch_7x1": {
+      "flags": [
+        "--offload-backend",
+        "prefetch",
+        "--offload-group-size",
+        "7",
+        "--offload-num-in-group",
+        "1",
+        "--offload-prefetch-step",
+        "1"
+      ],
+      "family": "prefetch",
+      "offloaded_gib": 1.736,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 10.6508,
+          "tokens_per_s": 12.0
+        },
+        "4": {
+          "avg_latency_s": 10.7165,
+          "tokens_per_s": 47.8
+        },
+        "16": {
+          "avg_latency_s": 10.7768,
+          "tokens_per_s": 190.0
+        }
+      }
+    },
+    "prefetch_14x1": {
+      "flags": [
+        "--offload-backend",
+        "prefetch",
+        "--offload-group-size",
+        "14",
+        "--offload-num-in-group",
+        "1",
+        "--offload-prefetch-step",
+        "1"
+      ],
+      "family": "prefetch",
+      "offloaded_gib": 0.868,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 5.9968,
+          "tokens_per_s": 21.3
+        },
+        "4": {
+          "avg_latency_s": 6.055,
+          "tokens_per_s": 84.6
+        },
+        "16": {
+          "avg_latency_s": 6.0913,
+          "tokens_per_s": 336.2
+        }
+      }
+    },
+    "prefetch_28x1": {
+      "flags": [
+        "--offload-backend",
+        "prefetch",
+        "--offload-group-size",
+        "28",
+        "--offload-num-in-group",
+        "1",
+        "--offload-prefetch-step",
+        "1"
+      ],
+      "family": "prefetch",
+      "offloaded_gib": 0.434,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 4.3692,
+          "tokens_per_s": 29.3
+        },
+        "4": {
+          "avg_latency_s": 4.4596,
+          "tokens_per_s": 114.8
+        },
+        "16": {
+          "avg_latency_s": 4.4921,
+          "tokens_per_s": 455.9
+        }
+      }
+    }
+  }
+}

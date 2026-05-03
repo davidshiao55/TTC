@@ -34,17 +34,19 @@ Rather than relying on ever-larger pretraining budgets, test-time methods use dy
 - Beam search
 - Diverse verifier tree search (DVTS)
 
-However, maintaining two models (generator + verifier) and KV cache from multiple search paths is challenging for edge deployment.
+However, the new computing paradigm also introduce new challenge for edge deployment.
+
 
 ### Edge Deployment for TTC
 
 Existing work has attempted to improve test-time scaling at the edge through:
 
-- Speculative beam extension
-- Dynamic Prefix-Aware Scheduling
-- Asymmetric Multi-Model Memory Allocation
+- speculative execution
+- request scheduling
+- kv cache offloading
+- memory partitioning
 
-But these methods assume model weights and KV cache of current computing batch stay GPU-resident throughout inference.
+But they assume model weights and active KV cache (i.e. the KV cache of the current computing batch) stay GPU-resident throughout inference.
 
 #### Model Size Limitation
 
@@ -60,28 +62,33 @@ wall_time ≈ ⌈total_beams / batch_capacity⌉ × time_per_step
 
 ### Challenges
 
-The common methods for enabling larger models and higher throughput — **weight offloading** and **attention offloading** — are not directly applicable to TTC.
+The standard mechanisms for enabling larger models and higher throughput on a single device — **weight offloading** and **attention offloading** — do not transfer directly to TTC.
 
-#### Weight Offloading
+#### Existing Weight Offloading Methods
 
-Existing offloading methods are typically optimized for one of two regimes:
+Existing edge weight offloading methods typically target online interactive serving — small batches, low-frequency requests, with per-token latency as the binding constraint — and do not exploit the multi-path parallelism that TTC produces.
 
-- **Hybrid offloading** (online edge inference, low-batch): prioritizes latency but neglects throughput and KV cache memory implications of batching.
-- **GPU-centric offloading** (offline inference, large-batch): prioritizes throughput but neglects latency and underutilizes CPU computation.
+While there are also methods aimed at offline batch inference that exploit large batches at the cost of latency, they fit TTC no better: TTC is still a single-request workload — its batch comes from multi-path exploration, not independent requests — so end-to-end latency remains the user-facing metric.
 
-Neither regime applies to TTC because:
-1. TTC requires efficient handling of multi-path generation while maintaining low latency — neither regime's strategy addresses both.
-2. Existing methods do not consider that even when a model fully fits on GPU, weight offloading can be beneficial to enlarge batch size and therefore throughput. <!-- TODO: still considering whether to include this point — need to verify with experiments -->
-3. Existing methods assume prefill and decode occur as separate forward calls with static shapes. TTC's wide reasoning-path exploration (beam search, best-of-N, DVTS) typically spawns more concurrent requests than a single forward call can serve on a 24 GB GPU, forcing vLLM v1's continuous batching as the steady state — a single forward call then mixes chunked prefill from newly admitted paths with decode tokens from ongoing paths. Prior offloading systems (FlexGen, DeepSpeed-Inference, PowerInfer, TwinPilots, Doppeladler) do not handle this mixed-shape forward-call regime.
-4. TTC pipelines run two models with fundamentally different computation patterns (generator: autoregressive decode, small `num_tokens` per call; verifier: step scoring, medium `num_tokens` per call). Prior systems either serve a single model or — in TwinPilots' case — partition layers across devices within one model family. None applies distinct per-model offloading strategies matched to each model's forward-pass characteristics.
+#### Existing Attention Offloading Methods
 
-#### Attention Offloading
+Existing attention offloading methods assume the model fits in GPU memory and overlap CPU/GPU compute by splitting the batch in two. This does not transfer to TTC:
 
-Existing attention offloading methods assume the model fits in GPU memory. To overlap CPU/GPU computation, they split the batch in two and overlap their respective computations.
+1. Batch splitting conflicts with our goal of maximizing batch size.
+2. Once weights are partitioned across CPU and GPU, every sub-module already engages both devices concurrently — a batch-split scheme on top is strictly inferior.
 
-These methods don't apply to TTC because:
-1. Splitting the batch conflicts with our goal of maximizing batch size.
-2. With weight offloading in the pipeline, there are better opportunities for CPU-GPU overlap than batch splitting.
+#### The TTC Workload
+
+TTC compounds the offloading problem in two ways:
+
+1. **Two models, not one.** A TTC pipeline requires a generator and a verifier to be resident simultaneously, doubling the resources — model weights and KV pools — that must be partitioned across CPU, GPU, and PCIe.
+2. **Complex computing pattern.** 
+Computing pattern are already diverse in standard inference; TTC amplifies this further. Three concurrent axes contribute:
+   - **Intra-request** — prefill vs. decode within a single request.
+   - **Inter-request** — continuous batching mixes prefill and decode tokens across requests.
+   - **Inter-model** — generator runs autoregressive decode (one token per beam); verifier runs step scoring (many tokens per step).
+
+   Each axis produces forward calls with different arithmetic intensity, and therefore different optimal CPU/GPU/PCIe splits. A single static configuration cannot cover them.
 
 ---
 
@@ -273,7 +280,7 @@ The ~40× ratio is the fundamental constraint: **pure prefetch cannot hide laten
 
 1. Mixed col/row weight split at tensor granularity: col-parallel for WQKV/MLP1 (partial-result concat), row-parallel for MLP2 (add-reduce), CPU matmul on both axes, with MLP1↔MLP2 index-set matching for the col→row pipelining save
 2. CPU attention kernel returning per-head LSE (for online softmax merge)
-3. `cudaLaunchHostFunc` glue for CUDA Graph + CPU task co-scheduling (Phase 4)
+3. `cudaLaunchHostFunc` glue for CUDA Graph + CPU task co-scheduling (Phase 1c)
 4. Per-model, per-bucket `(f_cpu_compute, f_prefetch_compute)` configuration and dispatch
 5. Profiler implementation (schema → cached tables)
 6. Planner implementation (two-stage optimization)
@@ -285,7 +292,7 @@ vLLM's default `FULL_AND_PIECEWISE` mode captures per-bucket graphs. Our mechani
 - Non-attention regions (MLP, QKV/O projections) — CPU-compute and prefetch paths captured inline.
 - Attention regions — same technique for CPU suffix attention; `merge_attn_states` on GPU joins prefix + suffix.
 
-Prototype with `enforce_eager=True`; `cudaLaunchHostFunc` retrofit is a localized swap in `CpuComputeDispatcher` (Phase 4).
+Prototype Phase 1a/1b with `enforce_eager=True`; `cudaLaunchHostFunc` retrofit is a localized swap in `CpuComputeDispatcher` (Phase 1c, gating Phase 2 per `phase1a_findings.md §1.14`).
 
 ### 8.4 Roadmap
 
@@ -330,7 +337,7 @@ MATH-500 accuracy across all configurations. Expected: unchanged (mathematical e
 | CPU GEMM below theoretical bandwidth | Profile measures directly; Planner adapts. |
 | CPU attention bottleneck at long contexts | Batch size clamping via Scheduler; Planner can reduce `KV_cpu_bytes` to force shorter effective suffix. |
 | Column-parallel numerical differences | Mathematically exact; unit tests assert bit-identical. |
-| CUDA Graph incompatibility with CPU compute | `cudaLaunchHostFunc` (KTransformers pattern) is graph-capturable. Prototype with `enforce_eager=True`, retrofit in Phase 4. |
+| CUDA Graph incompatibility with CPU compute | `cudaLaunchHostFunc` (KTransformers pattern) is graph-capturable. Prototype Phase 1a/1b with `enforce_eager=True`, retrofit in Phase 1c. |
 | Planner solver runtime dominates launch | Closed-form dispatch + small grid outer loop; measured runtime reported. |
 
 ---

@@ -1,0 +1,40 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "dtype": "bfloat16",
+  "offload_backend": "cots",
+  "cots_f_cpu_store": 0.09,
+  "input_len": 256,
+  "output_len": 8,
+  "threads": [
+    4,
+    8,
+    16,
+    24
+  ],
+  "batches": [
+    16
+  ],
+  "summary": {
+    "16": {
+      "best_avg_latency_s": 20.0393,
+      "by_thread": {
+        "4": {
+          "avg_latency_s": 44.7598,
+          "slowdown_vs_best": 2.234
+        },
+        "8": {
+          "avg_latency_s": 29.5367,
+          "slowdown_vs_best": 1.474
+        },
+        "16": {
+          "avg_latency_s": 24.1866,
+          "slowdown_vs_best": 1.207
+        },
+        "24": {
+          "avg_latency_s": 20.0393,
+          "slowdown_vs_best": 1.0
+        }
+      }
+    }
+  }
+}

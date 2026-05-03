@@ -31,9 +31,9 @@ And three offloading mechanisms the components orchestrate (`thesis_proposal.md`
 |---|---|---|---|---|
 | **0** — Benchmarks | First profile run (schema validation) + vLLM native offloader baselines (§0.10) | — | — | — |
 | **1** — Collaborative Weight Offload | + CPU GEMM curves + PCIe BW curve | Per-bucket `(f_cpu, f_prefetch)` dispatch (1a: `f_cpu` only; 1b: adds `f_prefetch`) | — | Weight storage; CPU-compute + layer-ahead prefetch dispatch paths (WQKV, MLP1, MLP2; WO not offloaded) |
+| **1c** — Native CPU Runner | — | — | `cudaLaunchHostFunc` + native CPU worker; bucket-aware thread policy | Graph-compatible dispatch; eliminates Python `executor.submit` / `future.result` host critical path (`phase1a_findings.md §1.14`) |
 | **2** — Attention Offloading | + CPU attention curve | Planner gains `KV_gpu_bytes` / `KV_cpu_bytes` variables | Tier-aware KV admission | KV two-pool storage; CPU suffix attention |
 | **3** — E2E | — | — | — | All mechanisms active |
-| **4** — CUDA Graph | — | — | `cudaLaunchHostFunc` retrofit | Graph-compatible dispatch |
 
 Phases deliver the system incrementally: each extends Profiler coverage, Planner variable set, or Scheduler capabilities while preserving the three-component architecture.
 
@@ -64,7 +64,7 @@ Section numbering aligns with `phase0_findings.md`. Each entry below is a forwar
 
 ### 0.3 CPU/GPU compute characterization (CRITICAL — gates Phase 1)
 
-**What:** Per-sub-module GPU layer-time, CPU GEMM curve, and reduced-GPU timing (when slice f_cpu of weights is on CPU). Validates that CPU finishes its portion within the GPU layer-time budget at the operating point f_cpu ≈ 9%, and quantifies the µs/MB curves the Planner uses.
+**What:** Per-sub-module GPU layer-time, CPU GEMM curve, and reduced-GPU timing (when slice f_cpu of weights is on CPU). Quantifies the µs/MB curves the Planner uses and the bucket-specific microbench-free `f_cpu` (cold-cache numbers in `phase0_findings.md §0.3.3` show f_cpu ≈ 5% B=1, ≈ 3% B=4, no free regime at B≥8 on this hardware). Note that microbench-free is not e2e-free under the Phase 1a runtime — see `phase1a_findings.md §1.14`.
 
 **Why:** Phase 1's "free" argument assumes CPU finishes within GPU compute window. If CPU µs/MB is too slow, f_cpu drops and memory savings shrink. Also validates uniform CPU µs/MB across sub-modules at decode B≥16 — the empirical foundation for the Planner emitting a single uniform `(f_cpu, f_prefetch)` per bucket.
 
@@ -94,11 +94,11 @@ Section numbering aligns with `phase0_findings.md`. Each entry below is a forwar
 
 **How:** Use `vllm/benchmarks/kernels/cpu/benchmark_cpu_attn.py`. See `phase0_findings.md §0.6`.
 
-### 0.7 CUDA graph impact (informs Phase 4 priority)
+### 0.7 CUDA graph impact (informs Phase 1c scope)
 
 **What:** Decode throughput and per-step latency with CUDA Graphs enabled vs. `--enforce-eager` on 7B across batch sizes.
 
-**Why:** Quantifies the cost of prototyping with eager mode. Small gap → Phase 4 is low priority. Large gap → must build graph compatibility earlier.
+**Why:** Quantifies the cost of prototyping Phase 1a/1b with eager mode. The §0.7 measurement found the eager-vs-graph gap is small for the thesis workload (~2%), so the original plan deferred CUDA Graph work to a tail phase. After §1.14 of `phase1a_findings.md` showed the Python `CpuTaskRunner` substrate is the dominant Phase 1a overhead (and that the native runner port is the precondition for graph capture anyway), the work moved into Phase 1c — graph compatibility falls out for free once the native dispatcher lands.
 
 **How:** `vllm bench latency` with and without `--enforce-eager`. See `phase0_findings.md §0.7`.
 
@@ -186,7 +186,7 @@ K + V = 22% of WQKV; WQKV is 8.8% of the layer → at most ~2% of total layer we
 
 ### CpuComputeDispatcher Abstraction
 
-Design this from day 1 to make CUDA Graph retrofit (Phase 4) a localized change:
+Design this from day 1 to make CUDA Graph retrofit (Phase 1c) a localized change:
 
 ```python
 class CpuComputeDispatcher:
@@ -199,9 +199,97 @@ Prototype uses `ThreadPoolExecutor` + `enforce_eager=True`. Production swaps int
 
 ### What to Measure
 
-**At 1a:** per-layer decode time (should be ≤ baseline); GPU memory freed; KV cache capacity increase; per-sub-module CPU-slice latency vs. GPU-slice budget (validates Planner's dispatch-table entries).
+**At 1a:** Phase 1a is structural and partial throughput, not "free overlap". Gates are: (i) split-mechanism correctness (token-level parity with baseline at the smoke prompt, see `phase1a_findings.md §1.8`), (ii) GPU memory freed and KV-cache capacity increase (§1.7), (iii) head-to-head against vLLM's PrefetchOffloader at matched offload depth (§1.13), (iv) attribution of any e2e gap vs `none` into orchestration vs active CPU-work penalty (§1.14). The "≤ baseline" gate is deferred to Phase 1c — `phase1a_findings.md §1.14` shows the Python `CpuTaskRunner` substrate makes that gate unattainable at any non-trivial f_cpu in Phase 1a; it becomes the right gate once the native runner lands.
 
 **At 1b:** layer-ahead prefetch critical-path behavior; buffer size vs. layer-time budget; per-bucket `(f_cpu, f_prefetch)` entries emitted by the Planner; throughput change on FastTTS workload.
+
+---
+
+## Phase 1c — Native CPU Runner
+
+Replace the Python `CpuTaskRunner` (Python `ThreadPoolExecutor` + `future.result`)
+with a `cudaLaunchHostFunc`-based handoff backed by a native CPU worker. Phase
+1c is what was previously called Phase 4: the work is the same, but the
+sequencing is moved up before Phase 2 because Phase 1a's postmortem
+(`phase1a_findings.md §1.14`) showed the host critical path — not CPU GEMM
+throughput — is the dominant overhead at the f=0.05 B=1 free-regime cell. Any
+Phase 2 (attention offload) measurement built on the Python prototype would
+mix the runtime gap into the attention numbers.
+
+### Why Phase 1c precedes Phase 2
+
+`phase1a_findings.md §1.14` measured the COTS-vs-none gap at f=0.05 B=1
+(decode-heavy, input=8, output=128) by inserting a `--cots-dry-run` mode
+that installs all wrappers but skips the worker GEMM. The decomposition (see
+§1.14 for the full t × B table):
+
+- **Pure host orchestration** (`dryrun − none`) — what `cudaLaunchHostFunc` +
+  CUDA Graph capture eliminate at runtime. Roughly flat in `t` and `B`.
+- **Active CPU-work penalty** (`real − dryrun`) — extra wall-clock from
+  enabling real CPU GEMM. Includes the GEMM time itself, oneDNN-vs-main-
+  thread interference, reduced CUDA launch runahead, and any cache/BW
+  contention. Upper bound on the post-1c floor; strongly `t`-dependent
+  because oneDNN-on-many-threads contends with the main thread's CUDA
+  dispatch path. Bucket-aware thread policy is what shrinks this.
+
+Both contributions are addressed by Phase 1c (one in the dispatcher port,
+the other in the thread policy). Building Phase 2 on the Python prototype
+would conflate the runtime gap with the attention numbers.
+
+### What to Port from KTransformers
+
+| Component | Source | Lines | Notes |
+|---|---|---|---|
+| `CPUInfer` class | `kt-kernel/cpu_backend/cpuinfer.h` | ~80 | `submit_with_cuda_stream`, `sync_with_cuda_stream` |
+| `TaskQueue` | `kt-kernel/cpu_backend/task_queue.{h,cpp}` | ~85 | Lock-free SPSC queue, direct port |
+| Python bindings | `kt-kernel/ext_bindings.cpp` | ~30 | pybind11 wrapper |
+
+### What We Skip
+
+| Component | Why |
+|---|---|
+| `WorkerPool` (~500 lines) | MKL manages its own threads for BLAS |
+| NUMA awareness (~200 lines) | Single-socket consumer system |
+| MoE task wrappers (~300 lines) | Replace with single `cblas_gemm_bf16bf16f32` call |
+
+### What We Write
+
+| Component | Lines | Notes |
+|---|---|---|
+| CPU matmul task (C++) | ~50 | Wrapper calling MKL `cblas_gemm_bf16bf16f32` |
+| Pre-allocated buffer manager | ~80 | Pinned I/O buffers indexed by `cuda_graph_idx` |
+| Build integration | ~30 | CMake for the C++ extension |
+| Bucket-aware thread policy | ~40 | Per-`BatchDescriptor` `cpu_num_threads` lookup; replaces fixed `cpu_num_threads=16` (`phase1a_findings.md §1.13b`) |
+
+### CUDA Graph Compatible Forward Pass
+
+```
+CUDA stream:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+│ D2H copy x │ submit │ x @ W_gpu (91%) │ sync │ H2D │ concat │
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                  ↓                         ↑
+           TaskQueue ══ x @ W_cpu (9%) ═════╝
+```
+
+`submit` is a `cudaLaunchHostFunc` callback that enqueues to TaskQueue and
+returns immediately. GPU proceeds to its matmul. `sync` is another callback
+that blocks the stream until the CPU task completes. Between submit and sync,
+GPU and CPU run in parallel — giving `max(GPU, CPU)` timing naturally.
+
+CUDA Graph compatibility is a free side effect: replacing the Python dispatcher
+with `cudaLaunchHostFunc` callbacks is the precondition for capturing the
+forward pass into a graph. `enforce_eager=True` (Phase 1a/1b prototype mode) is
+no longer required.
+
+### What to Measure
+
+Re-run on the new substrate and compare to the Phase 1a numbers:
+- `phase1a_findings.md §1.12` (cots-vs-prefetch decode + prefill grids)
+- `phase1a_findings.md §1.13b` thread × f × batch sweep
+- `phase1a_findings.md §1.14` per-layer gap (target: shrink to ≲ 2× pure CPU GEMM time, removing the ~30 µs/op Python tax)
+
+**Total new/ported code:** ~400 lines for full CUDA Graph compatibility + ~40 for thread policy.
 
 ---
 
@@ -253,73 +341,28 @@ Full FastTTS runs on RTX 4090 with all offloading features.
 
 ---
 
-## Phase 4 — CUDA Graph Integration (If Time Permits)
-
-Replace the Python `CpuComputeDispatcher` prototype with C++ `CPUInfer` +
-`cudaLaunchHostFunc`, enabling CUDA Graph compatibility.
-
-### What to Port from KTransformers
-
-| Component | Source | Lines | Notes |
-|---|---|---|---|
-| `CPUInfer` class | `kt-kernel/cpu_backend/cpuinfer.h` | ~80 | `submit_with_cuda_stream`, `sync_with_cuda_stream` |
-| `TaskQueue` | `kt-kernel/cpu_backend/task_queue.{h,cpp}` | ~85 | Lock-free SPSC queue, direct port |
-| Python bindings | `kt-kernel/ext_bindings.cpp` | ~30 | pybind11 wrapper |
-
-### What We Skip
-
-| Component | Why |
-|---|---|
-| `WorkerPool` (~500 lines) | MKL manages its own threads for BLAS |
-| NUMA awareness (~200 lines) | Single-socket consumer system |
-| MoE task wrappers (~300 lines) | Replace with single `cblas_gemm_bf16bf16f32` call |
-
-### What We Write
-
-| Component | Lines | Notes |
-|---|---|---|
-| CPU matmul task (C++) | ~50 | Wrapper calling MKL `cblas_gemm_bf16bf16f32` |
-| Pre-allocated buffer manager | ~80 | Pinned I/O buffers indexed by `cuda_graph_idx` |
-| Build integration | ~30 | CMake for the C++ extension |
-
-### CUDA Graph Compatible Forward Pass
-
-```
-CUDA stream:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-│ D2H copy x │ submit │ x @ W_gpu (91%) │ sync │ H2D │ concat │
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                  ↓                         ↑
-           TaskQueue ══ x @ W_cpu (9%) ═════╝
-```
-
-`submit` is a `cudaLaunchHostFunc` callback that enqueues to TaskQueue and
-returns immediately. GPU proceeds to its matmul. `sync` is another callback
-that blocks the stream until the CPU task completes. Between submit and sync,
-GPU and CPU run in parallel — giving `max(GPU, CPU)` timing naturally.
-
-**Total new/ported code:** ~400 lines for full CUDA Graph compatibility.
-
----
-
 ## Dependencies and Critical Path
 
 ```
 Phase 0 (benchmarks)
   └─→ Phase 1 — Collaborative Weight Offload
-        ├── 1a: Static col/row split (no prefetch)   ← Python-only, earliest checkpoint
-        └── 1b: Layer-ahead prefetch                 ← adds f_prefetch on top of 1a
+        ├── 1a: Static col/row split (no prefetch)   ← Python prototype, [DONE]
+        ├── 1b: Layer-ahead prefetch                 ← adds f_prefetch on top of 1a
+        └── 1c: Native CPU runner (was Phase 4)       ← removes Python dispatcher tax
+              │                                          + bucket-aware thread policy
+              │                                          + CUDA Graph compatibility
               │
-              └─→ Phase 2: Attention Offload         ← requires C++ kernel (LSE)
+              └─→ Phase 2: Attention Offload         ← requires C++ kernel (LSE);
+                    │                                    runs on the 1c substrate
                     │
                     └─→ Phase 3: End-to-End Benchmarking
-                          │
-                          └─→ Phase 4: CUDA Graphs (if time)
 ```
 
-**Critical path:** Phase 0 → Phase 1a → Phase 1b → Phase 2 → Phase 3.
+**Critical path:** Phase 0 → Phase 1a → Phase 1b → Phase 1c → Phase 2 → Phase 3.
 
-Phase 1a and 1b are sequential sub-milestones of the same mechanism (1b extends 1a's dispatch with `f_prefetch`). Phase 2 work lives in the attention backend + CPU attention kernel and is orthogonal to Phase 1's linear-layer code; if the CPU-attention LSE kernel is ready, Phase 2 can be developed in parallel with Phase 1b.
+Phase 1a / 1b / 1c are sequential sub-milestones of the same mechanism: 1a ships the Python prototype, 1b extends the dispatch with `f_prefetch`, and 1c replaces the Python `CpuTaskRunner` with a native runner so the substrate is performance-faithful before attention offload depends on it. The reorder (vs the original Phase 4-after-Phase 3 plan) is driven by `phase1a_findings.md §1.14`: the Python dispatcher and oneDNN-vs-main-thread interference together account for the bulk of the COTS-vs-none gap at the supposed free regime, and Phase 2 measurements built on that substrate would confound runtime overhead with attention-offload regression.
+
+Phase 2 work lives in the attention backend + CPU attention kernel and is orthogonal to Phase 1's linear-layer code; the C++ kernel work for CPU attention with per-head LSE can be developed in parallel with Phase 1b/1c.
 
 ---
 
@@ -358,8 +401,14 @@ Phase 1a and 1b are sequential sub-milestones of the same mechanism (1b extends 
 6. **All PCIe to weight prefetch.** No KV prefetch. Suffix attention → CPU
    only. Batch size is the control variable for CPU attention bottleneck.
 
-7. **Prototype with `enforce_eager=True`.** Defer CUDA Graph compatibility to
-   Phase 4. Correctness and performance validation come first.
+7. **Prototype with `enforce_eager=True` through Phase 1b; CUDA Graph
+   compatibility lands in Phase 1c.** Phase 1a/1b ship the Python
+   `CpuTaskRunner` prototype with `enforce_eager=True`; Phase 1c (was
+   Phase 4) replaces the Python dispatcher with `cudaLaunchHostFunc` +
+   native worker, which both removes the Python dispatcher tax and is the
+   precondition for capturing the forward pass into a CUDA Graph.
+   Correctness and decomposition come first; performance-faithful measurement
+   comes with Phase 1c.
 
 8. **Prefill: transfer K/V to GPU prefix cache once.** Prefill overhead is
    negligible (compute-bound, amortized over many tokens); decode keeps K/V

@@ -135,12 +135,12 @@ These appear in the output for completeness so the Scheduler has one place to re
 
 ### 4.5 Runtime dispatch lookup — graph-enabled vs graph-disabled
 
-The dispatch table is keyed on `cudagraph_capture_sizes`, independent of whether CUDA graphs are actually enabled at runtime. This keeps the Planner output identical across Phase 1–3 (graph-disabled prototypes) and Phase 4 (graph-enabled retrofit). The difference is only in how `num_tokens` maps to a bucket at runtime:
+The dispatch table is keyed on `cudagraph_capture_sizes`, independent of whether CUDA graphs are actually enabled at runtime. This keeps the Planner output identical across Phase 1a/1b (graph-disabled prototypes) and Phase 1c (graph-enabled native runner; was Phase 4). The difference is only in how `num_tokens` maps to a bucket at runtime:
 
 | Regime | Forward-pass `num_tokens` | Dispatch-lookup `num_tokens` |
 |---|---|---|
-| **Graph enabled (Phase 4)** | Padded up to the nearest bucket by vLLM's `CudagraphDispatcher._bs_to_padded_graph_size` | Same padded value — the lookup is exact. |
-| **Graph disabled (Phase 1–3, `enforce_eager=True`)** | Exact runtime value (no padding) | **Rounded up** to the nearest bucket for the lookup only. Rounding up (rather than nearest or down) matches what graph-enabled mode would pad to, so Phase 1–3 measurements predict Phase 4 dispatch exactly. |
+| **Graph enabled (Phase 1c)** | Padded up to the nearest bucket by vLLM's `CudagraphDispatcher._bs_to_padded_graph_size` | Same padded value — the lookup is exact. |
+| **Graph disabled (Phase 1a/1b, `enforce_eager=True`)** | Exact runtime value (no padding) | **Rounded up** to the nearest bucket for the lookup only. Rounding up (rather than nearest or down) matches what graph-enabled mode would pad to, so Phase 1a/1b measurements predict Phase 1c dispatch exactly. |
 
 Runtime pseudocode:
 
