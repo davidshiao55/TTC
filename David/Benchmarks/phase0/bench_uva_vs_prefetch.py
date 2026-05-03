@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
-"""Phase 0.10.1 — UVA vs Prefetch (head-to-head)
+"""Phase 0.10.2 — UVA vs Prefetch (head-to-head, post-§0.10 restructure)
 
 At varying offload depth, which native vLLM weight offloader is faster on
 RTX 4090 + Qwen2.5-7B BF16?
 
 Sweep
 -----
-Prefetch (G=14, K=1):  N ∈ {1, 2, 4, 7, 10}   (G chosen so num_layers=28 divides
-                                              evenly → exact coverage at every N)
+Prefetch (N=1, K=1):   G ∈ {1, 2, 4, 7, 14, 28}   (divisors of num_layers=28 →
+                                                   exact uniform coverage = 1/G)
 UVA:                   cpu_offload_gb ∈ {1, 2, 4, 6, 8, 10, 12}
 Reference:             `none` (no offload).
+
+The N=1 / G-varying choice is the empirically best prefetch knob configuration
+per `phase0_findings.md §0.10.1` (PrefetchOffloader knob sweep): "denser
+uniform spacing dominates clustering" — sweeping the prior G=14 / N-varying
+config measured a suboptimal prefetch baseline. The pre-restructure
+G=14 / N-varying head-to-head data was deleted after the §0.10.1 knob sweep
+empirically confirmed uniform beats clustered by ~5% at B=64 at every
+matched-bytes point.
 
 Both curves on a shared x-axis (offloaded GiB), computed exactly from the
 model structure. PrefetchOffloader's offloaded bytes = (#offloaded layers)
@@ -75,13 +83,15 @@ def gib(b: float) -> float:
 
 def build_arms() -> dict[str, dict]:
     arms: dict[str, dict] = {"none": {"flags": [], "offloaded_gib": 0.0}}
-    # G=14 divides 28 evenly into 2 groups, so coverage = N/G is exact.
-    for N in [1, 2, 4, 7, 10]:
-        n_layers = offloaded_layer_count(G=14, N=N)
-        arms[f"prefetch_14x{N}"] = {
+    # N=1 with G ∈ divisors of 28 → exact uniform coverage = 1/G.
+    # Per §0.10.1's knob-sweep finding, this dominates the prior
+    # G=14 / N-varying configuration at matched coverage.
+    for G in [1, 2, 4, 7, 14, 28]:
+        n_layers = offloaded_layer_count(G=G, N=1)
+        arms[f"prefetch_{G}x1"] = {
             "flags": [
-                "--offload-group-size", "14",
-                "--offload-num-in-group", str(N),
+                "--offload-group-size", str(G),
+                "--offload-num-in-group", "1",
                 "--offload-prefetch-step", "1",
             ],
             "offloaded_gib": round(gib(n_layers * PER_LAYER_BYTES), 3),
@@ -202,7 +212,7 @@ def plot(summary: dict, batches: list[int], out_path: Path) -> None:
             return c["avg_latency_s"] if c else None
 
         ax.plot([summary[a]["offloaded_gib"] for a in pf], [y(a) for a in pf],
-                "o-", color="tab:blue", label="Prefetch (G=14, K=1)")
+                "o-", color="tab:blue", label="Prefetch (N=1, K=1)")
         ax.plot([summary[a]["offloaded_gib"] for a in uv], [y(a) for a in uv],
                 "s-", color="tab:orange", label="UVA")
         if none_lat is not None:
@@ -240,7 +250,7 @@ def main() -> None:
         ap.error(f"unknown arms: {sorted(unknown)}. choices: {list(arms)}")
     batches = args.only_batches or DEFAULT_BATCHES
 
-    print("§0.10.1 — UVA vs Prefetch")
+    print("§0.10.2 — UVA vs Prefetch")
     print(f"  per-layer decoder bytes: {gib(PER_LAYER_BYTES):.3f} GiB")
     print(f"  arms: {len(run_arms)}, batches: {batches}\n")
 
@@ -252,7 +262,7 @@ def main() -> None:
     summary = summarize(arms, batches)
     profile = {
         "schema_version": 1,
-        "section": "0.10.1",
+        "section": "0.10.2",
         "hardware_id": hardware_id(),
         "model": {"name": MODEL, "dtype": DTYPE},
         "env": env_info(),

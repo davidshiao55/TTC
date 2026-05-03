@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 0.10.2 — PrefetchOffloader knob sweep
+"""Phase 0.10.1 — PrefetchOffloader knob sweep
 
 Explores each of PrefetchOffloader's three numerical knobs on Qwen2.5-7B BF16
 across batch ∈ {1, 16, 64}:
@@ -11,27 +11,34 @@ across batch ∈ {1, 16, 64}:
 All G choices are divisors of 28 (Qwen2.5-7B's decoder layer count) so coverage
 is exact and the same for every G in the sweep — no partial-group artifacts.
 
-Three independent sub-sweeps:
+Four sub-sweeps, ordered to follow the goal-oriented narrative
+"establish best knob → measure best config" rather than alphabetical knob order:
 
   (a) G at fixed 50% coverage, K=1
         G ∈ {2, 4, 14, 28} with N = G // 2
         All four offload exactly 14 layers (50% of 28). Question: at byte-equal
         coverage, does spacing between offloaded layers matter? Larger G ⇒ more
         compute time between offloaded layers ⇒ more H2D-hiding budget.
+        Result: smaller G (denser uniform spacing) wins.
 
-  (b) N at fixed G=14, K=1
-        N ∈ {1, 2, 4, 7, 10}  (coverage = 7%, 14%, 29%, 50%, 71%)
-        Question: how does latency scale with offloaded coverage?
-
-  (c) K at fixed G=14, N=4
-        K ∈ {1, 2, 3, 4}      (memory permitting; K=4 may OOM)
-        Question: does multi-layer-ahead help, or is layer-ahead enough?
-
-  (d) N=1, G varies (densest possible spread at each depth)
+  (b) N=1, G varies (canonical coverage sweep — densest possible spread at each depth)
         G ∈ {2, 4, 7, 14, 28} → 14/7/4/2/1 offloaded layers = 6.08/3.04/
-        1.74/0.87/0.43 GiB. Compared against (b) at matched bytes; tests
-        whether (a)'s "denser-is-better-at-fixed-bytes" finding holds at
-        depths other than 50% coverage.
+        1.74/0.87/0.43 GiB. Generalizes (a)'s "denser-is-better" finding to
+        all depths. Treat this as the empirically best prefetch baseline at
+        any offload depth.
+
+  (c) N at fixed G=14, K=1 (legacy clustered baseline, kept for matched-bytes
+        comparison vs (b))
+        N ∈ {1, 2, 4, 7, 10}  (coverage = 7%, 14%, 29%, 50%, 71%)
+        Pre-restructure, this was the canonical coverage sweep. Now used only
+        as the matched-bytes anchor in (b)'s "uniform vs clustered" comparison.
+
+  (d) K at fixed G=4, N=1 (uniform-spread K sweep at the empirically best config)
+        K ∈ {1, 2, 3, 4}      (memory permitting; K=4 may OOM)
+        Question: does multi-layer-ahead help under the empirically best
+        spacing config? K>1's potential upside is structurally smaller under
+        uniform spread (each prefetch already gets G−1 = 3 layers of compute
+        hiding from K=1 alone), so this is a K=1-conservative test.
 
 Outputs go to ``results/0.10_prefetch_knobs/``.
 
@@ -94,23 +101,40 @@ def sweep_a() -> list[tuple[str, int, int, int]]:
 
 
 def sweep_b() -> list[tuple[str, int, int, int]]:
-    """N at fixed G=14, K=1. G=14 divides 28 → exact coverage at every N."""
-    return [(f"prefetch_14x{N}", 14, N, 1) for N in [1, 2, 4, 7, 10]]
+    """N=1, G varies. One offloaded layer per group → maximally uniform
+    spread at each depth. Canonical coverage sweep (post-restructure)."""
+    return [(f"prefetch_{G}x1", G, 1, 1) for G in [2, 4, 7, 14, 28]]
 
 
 def sweep_c() -> list[tuple[str, int, int, int]]:
-    """K at fixed G=14, N=4. K=4 may OOM — attempt and record."""
-    out: list[tuple[str, int, int, int]] = []
-    for K in [1, 2, 3, 4]:
-        suffix = "" if K == 1 else f"_k{K}"
-        out.append((f"prefetch_14x4{suffix}", 14, 4, K))
-    return out
+    """N at fixed G=14, K=1 — legacy clustered baseline. Kept for matched-
+    bytes comparison vs sweep_b's uniform-spread arms (the comparison that
+    establishes "uniform > clustered at all depths"). G=14 divides 28
+    → exact coverage at every N."""
+    return [(f"prefetch_14x{N}", 14, N, 1) for N in [1, 2, 4, 7, 10]]
 
 
 def sweep_d() -> list[tuple[str, int, int, int]]:
-    """N=1, G varies. One offloaded layer per group → maximally uniform
-    spread at each depth."""
-    return [(f"prefetch_{G}x1", G, 1, 1) for G in [2, 4, 7, 14, 28]]
+    """K at fixed G=4, N=1 — uniform-spread at ~25% coverage (7 layers).
+
+    Picks G=4 N=1 instead of the prior G=14 N=4 because §0.10.1's "uniform
+    spacing dominates clustering" finding makes uniform N=1 the empirically
+    best knob configuration; the K sweep should be measured at that
+    configuration rather than the suboptimal clustered one. K>1's potential
+    upside is structurally smaller under uniform spread (each prefetch
+    already gets G−1 = 3 layers of compute hiding from K=1 alone), so this
+    K=1-conservative test is a stronger statement that K=1 suffices.
+
+    K=4 with G=4 N=1 (7 offloaded layers × K=4 buffer slots) may OOM —
+    attempt and record. Compared with the legacy K-sweep at (G=14, N=4),
+    this config has ~13% less per-buffer GiB but K-multiplied buffer count
+    is in the same range; the OOM behavior is empirically open.
+    """
+    out: list[tuple[str, int, int, int]] = []
+    for K in [1, 2, 3, 4]:
+        suffix = "" if K == 1 else f"_k{K}"
+        out.append((f"prefetch_4x1{suffix}", 4, 1, K))
+    return out
 
 
 def all_arms() -> dict[str, dict]:
@@ -209,28 +233,35 @@ def plot(summary: dict, batches: list[int], out_path: Path) -> None:
         print("[plot] matplotlib unavailable.")
         return
 
-    fig, axes = plt.subplots(4, len(batches),
-                             figsize=(5 * len(batches), 16),
+    fig, axes = plt.subplots(5, len(batches),
+                             figsize=(5 * len(batches), 20),
                              sharey=False)
     if len(batches) == 1:
-        axes = axes.reshape(4, 1)
+        axes = axes.reshape(5, 1)
 
     def y(arm: str, B: int) -> float | None:
         cell = summary[arm]["by_batch"][B]
         return cell["avg_latency_s"] if cell else None
 
+    # Plot ordering follows the post-restructure sub-sweep labels:
+    #   row 0 = (a) G at 50%, row 1 = (b) N=1 G varies, row 2 = (c) clustered
+    #   legacy, row 3 = (d) K sweep at (G=4, N=1).
     sweeps = [
         ("(a) G at fixed 50% coverage (14 layers)",
          "group_size G  (with N = G/2, K=1)",
          [a for a, *_ in sweep_a()],
          lambda a: summary[a]["G"], "o-", "tab:blue"),
-        ("(b) N at fixed G=14",
-         "num_in_group N  (G=14, K=1)",
+        ("(b) N=1, G varies (canonical coverage sweep)",
+         "group_size G  (N=1, K=1)",
          [a for a, *_ in sweep_b()],
-         lambda a: summary[a]["N"], "s-", "tab:green"),
-        ("(c) K at fixed G=14, N=4",
-         "prefetch_step K  (G=14, N=4)",
+         lambda a: summary[a]["G"], "D-", "tab:purple"),
+        ("(c) N at fixed G=14 (legacy clustered baseline)",
+         "num_in_group N  (G=14, K=1)",
          [a for a, *_ in sweep_c()],
+         lambda a: summary[a]["N"], "s--", "tab:green"),
+        ("(d) K at fixed G=4, N=1",
+         "prefetch_step K  (G=4, N=1)",
+         [a for a, *_ in sweep_d()],
          lambda a: summary[a]["K"], "^-", "tab:red"),
     ]
 
@@ -245,7 +276,7 @@ def plot(summary: dict, batches: list[int], out_path: Path) -> None:
                     ax.annotate(f"{summary[a]['offloaded_gib']:.1f} GiB",
                                 (x_, y_), fontsize=7,
                                 xytext=(4, 4), textcoords="offset points")
-            if row == 2:  # K sub-sweep — show all four ticks; OOM cells become gaps
+            if row == 3:  # K sub-sweep (now (d)) — show all four ticks; OOM cells become gaps
                 ax.set_xticks([1, 2, 3, 4])
                 if any(v is None for v in ys):
                     valid_ys = [v for v in ys if v is not None]
@@ -258,31 +289,35 @@ def plot(summary: dict, batches: list[int], out_path: Path) -> None:
             ax.set_title(f"{title}  —  B={B}")
             ax.grid(alpha=0.3)
 
-    # Row (d): sweep_d (N=1, G varies) vs sweep_b (G=14, N varies) at matched
-    # offloaded-GiB axis. Tests whether the "denser-is-better-at-fixed-bytes"
-    # finding from (a) generalizes to all depths.
+    # Row 4: matched-bytes comparison between (b) uniform N=1 G-varying and (c)
+    # legacy clustered G=14 N-varying. Empirical demonstration that (b)'s
+    # densest-spread arms beat (c)'s clustered arms at every matched depth —
+    # generalizes (a)'s "denser-is-better-at-fixed-bytes" finding from the
+    # single 50% point to all depths.
     sweep_b_arms = sorted([a for a, *_ in sweep_b()],
                           key=lambda a: summary[a]["offloaded_gib"])
-    sweep_d_arms = sorted([a for a, *_ in sweep_d()],
+    sweep_c_arms = sorted([a for a, *_ in sweep_c()],
                           key=lambda a: summary[a]["offloaded_gib"])
     for col, B in enumerate(batches):
-        ax = axes[3, col]
+        ax = axes[4, col]
+        xs_c = [summary[a]["offloaded_gib"] for a in sweep_c_arms]
+        ys_c = [y(a, B) for a in sweep_c_arms]
         xs_b = [summary[a]["offloaded_gib"] for a in sweep_b_arms]
         ys_b = [y(a, B) for a in sweep_b_arms]
-        xs_d = [summary[a]["offloaded_gib"] for a in sweep_d_arms]
-        ys_d = [y(a, B) for a in sweep_d_arms]
-        ax.plot(xs_b, ys_b, "s--", color="tab:green",
-                label="(b) G=14, N varies (clustered)")
-        ax.plot(xs_d, ys_d, "D-", color="tab:purple", linewidth=2,
-                label="(d) N=1, G varies (max spread)")
-        for a, x_, y_ in zip(sweep_d_arms, xs_d, ys_d):
+        ax.plot(xs_c, ys_c, "s--", color="tab:green",
+                label="(c) G=14, N varies (clustered, legacy)")
+        ax.plot(xs_b, ys_b, "D-", color="tab:purple", linewidth=2,
+                label="(b) N=1, G varies (canonical)")
+        for a, x_, y_ in zip(sweep_b_arms, xs_b, ys_b):
             if y_ is not None:
                 ax.annotate(f"G={summary[a]['G']}", (x_, y_), fontsize=7,
                             xytext=(4, -10), textcoords="offset points",
                             color="tab:purple")
         ax.set_xlabel("Offloaded weights (GiB)")
         ax.set_ylabel(f"avg latency @ B={B} (s)")
-        ax.set_title(f"(d) Densest spread (N=1) vs (b) clustered (G=14)  —  B={B}")
+        ax.set_title(f"(b) uniform vs (c) clustered at matched bytes  —  B={B}")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8, loc="best")
         ax.grid(alpha=0.3)
         ax.legend(fontsize=8)
 
@@ -350,7 +385,7 @@ def main() -> None:
     summary = summarize(arms, batches)
     profile = {
         "schema_version": 1,
-        "section": "0.10.2",
+        "section": "0.10.1",
         "hardware_id": hardware_id(),
         "model": {"name": MODEL, "dtype": DTYPE},
         "env": env_info(),
@@ -365,9 +400,10 @@ def main() -> None:
             "num_layers": NUM_LAYERS,
         },
         "sweeps": {
-            "a_group_size_at_25pct": [a for a, *_ in sweep_a()],
-            "b_coverage_at_G8":       [a for a, *_ in sweep_b()],
-            "c_distance_at_G8_N2":    [a for a, *_ in sweep_c()],
+            "a_G_at_50pct":           [a for a, *_ in sweep_a()],
+            "b_coverage_uniform_N1":  [a for a, *_ in sweep_b()],
+            "c_coverage_clustered_G14_legacy": [a for a, *_ in sweep_c()],
+            "d_K_at_G4_N1":           [a for a, *_ in sweep_d()],
         },
         "buffer_note": "Buffer pool grows linearly with K — large K may OOM at this model size on a 24 GiB GPU.",
         "arms": summary,

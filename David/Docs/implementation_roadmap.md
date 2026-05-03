@@ -120,16 +120,18 @@ Section numbering aligns with `phase0_findings.md`. Each entry below is a forwar
 
 ### 0.10 vLLM native weight offloader baseline (Prefetch + UVA)
 
-**What:** Decode-step latency under vLLM's stock weight offloaders on 7B BF16. Three sub-experiments:
-- **Head-to-head**: Prefetch vs UVA at matched offloaded GiB across batch ∈ {1, 16, 64}.
-- **PrefetchOffloader knob sweep**: G ∈ {2, 4, 14, 28} (divisors of 28), N at fixed G=14, K ∈ {1, 2, 3, 4} at fixed (G=14, N=4).
-- **nsys overlap probe**: visual confirmation of H2D ↔ compute overlap.
+**What:** Decode-step latency under vLLM's stock weight offloaders on 7B BF16. Four sub-experiments:
+- **PrefetchOffloader knob sweep** (§0.10.1): G ∈ {2, 4, 14, 28} (divisors of 28) at fixed 50% coverage, N at fixed G=14, K ∈ {1, 2, 3, 4} at fixed (G=14, N=4), and a densest-spread sub-sweep (N=1, varying G). Establishes the empirically best prefetch config.
+- **Head-to-head** (§0.10.2): Prefetch vs UVA at matched offloaded GiB across batch ∈ {1, 16, 64}, using prefetch's best config (N=1, G ∈ divisors of 28) from §0.10.1.
+- **Prefetch vs none — free regime** (§0.10.3): 3-arm `none / dryrun / real` sweep at fixed (N=1, K=1), varying G ∈ {1, 2, 4, 7, 14, 28}, on both decode-heavy and §0.10-matched workloads. Mirrors `phase1a_findings.md §1.14`'s COTS decomposition methodology, splitting the prefetch-vs-none gap into host orchestration vs unhidden PCIe transfer. Anchors the cots-vs-prefetch claim against `none` for both arms.
+- **nsys overlap probe** (§0.10.4): visual confirmation of H2D ↔ compute overlap on the best prefetch config.
 
-**Why:** The COTS thesis claims to outperform stock vLLM offloading. Without on-hardware baselines for both stock options, "COTS is faster" has no anchor point. Two empirical findings also feed back into the COTS design:
+**Why:** The COTS thesis claims to outperform stock vLLM offloading. Without on-hardware baselines for both stock options, "COTS is faster" has no anchor point. Three empirical findings also feed back into the COTS design:
 1. **At fixed offload bytes, denser uniform spacing dominates clustering** — argues for tensor-granularity over Group-style partitioning.
 2. **K=1 (layer-ahead) within ≤6% of optimal K**, K=4 OOMs at B=64 — empirically validates the layer-ahead commitment in `pcie_bandwidth_allocation_design.md`.
+3. **Prefetch's free regime narrows quickly with coverage at small B** (§0.10.3) — anchors the cots-vs-prefetch competition against `none` for both arms, replacing "COTS regression vs none > prefetch regression vs none" as a structural assumption with measured numbers.
 
-**How:** `bench_uva_vs_prefetch.py` + `bench_prefetch_knobs.py` + `probe_native_offload_overlap.py`. See `phase0_findings.md §0.10`.
+**How:** `bench_prefetch_knobs.py` + `bench_uva_vs_prefetch.py` + `bench_prefetch_vs_none.py` + `probe_native_offload_overlap.py`. See `phase0_findings.md §0.10`.
 
 ---
 
@@ -324,7 +326,7 @@ Full FastTTS runs on RTX 4090 with all offloading features.
 | Config | Model | Offloading | Purpose |
 |---|---|---|---|
 | Baseline (no offload) | 7B | None | Reference throughput |
-| **Native prefetch baseline** | 7B | Stock vLLM `PrefetchOffloader`, best config from `phase0_findings.md §0.10` knob sweep at matched offload depth | Headline native baseline COTS competes against |
+| **Native prefetch baseline** | 7B | Stock vLLM `PrefetchOffloader`, best config from `phase0_findings.md §0.10.1` (knob sweep) anchored against `none` via `phase0_findings.md §0.10.3` (free-regime decomposition) | Headline native baseline COTS competes against |
 | Static offload | 7B | Phase 1a (CPU-compute only, no prefetch) | Validate split mechanism + CPU-compute path |
 | Full weight offload | 7B | Phase 1 (1a + 1b prefetch) | Exercise full weight-offload mechanism |
 | Full offload | 7B | Phase 1 + 2 (attention) | Max batch capacity with attention offload |
@@ -337,7 +339,7 @@ Full FastTTS runs on RTX 4090 with all offloading features.
 - GPU memory utilization (weights vs KV cache)
 - Accuracy on MATH-500 (should be unchanged)
 - Comparison against the FastTTS V0 reference (FastTTS-AE + vLLM 0.9.2)
-- **Comparison against vLLM native prefetch baseline** at each (model, batch, offload depth) point — speedup ratio at matched depth is the headline COTS metric. Use the best `prefetch_*` config from `phase0_findings.md §0.10`, not the default `prefetch_8x2`.
+- **Comparison against vLLM native prefetch baseline** at each (model, batch, offload depth) point — speedup ratio at matched depth is the headline COTS metric. Use the best `prefetch_*` config from `phase0_findings.md §0.10.1` (knob sweep, post-restructure), not the default `prefetch_8x2`. Anchor every (cots, prefetch) pair against `none` using `phase0_findings.md §0.10.3` so regressions are attributed to the right column.
 
 ---
 

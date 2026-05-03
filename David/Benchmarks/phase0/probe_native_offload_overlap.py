@@ -1,50 +1,39 @@
 #!/usr/bin/env python3
-"""Phase 0.10.3 — vLLM native offloader overlap probe (nsys-driven).
+"""Phase 0.10 — vLLM native offloader overlap probe (nsys-driven).
 
-Captures an nsys timeline of `vllm bench latency` under each native offloader
-so we can visually confirm whether the offloader's H2D actually overlaps
-with compute, or serializes behind it.
+Captures one nsys timeline of `vllm bench latency` per invocation. All
+offloader knobs and workload parameters are CLI flags so the same script
+serves any (offloader, knob, workload) point we want to inspect — for
+either the §0.10.4 head-to-head visualization or the §0.10.3 prefetch
+hiding-cap mechanism.
 
-Three probe arms (each one ~30 s of timeline). G=4, N=1 for prefetch is
-1/4 coverage with uniform single-layer offloads spaced every 4 layers
-across Qwen2.5-7B's 28 decoder layers — the cleanest pattern for visualizing
-H2D overlap with compute:
-
-    none           : vanilla vLLM, no offload                  (reference)
-    prefetch_4x1   : PrefetchOffloader G=4 N=1 step=1          (overlap expected;
-                                                                 7 layers offloaded
-                                                                 at 25% coverage)
-    uva_4          : UVAOffloader 4 GB, UVA enabled            (no explicit H2D —
-                                                                 PCIe reads via UVA)
-
-For each arm we shell out to::
-
-    nsys profile -o <arm>.nsys-rep --trace=cuda,nvtx,osrt --force-overwrite=true \\
-        vllm bench latency --model Qwen/Qwen2.5-7B-Instruct --dtype bfloat16 \\
-            --input-len 256 --output-len 16 --batch-size 16 \\
-            --num-iters-warmup 1 --num-iters 2 --enforce-eager \\
-            [arm-specific offloader flags]
-
-What to look for in the GUI (`nsys-ui <arm>.nsys-rep`):
-
-    none           : compute kernels on the default CUDA stream; no async H2D
-                     inside the decode region.
-    prefetch_4x1   : PrefetchOffloader's `copy_stream` (separate from default)
-                     shows pinned→device memcpy events occurring *during* the
-                     layer compute kernels of preceding layers — 7 evenly-spaced
-                     H2D events per decode step.
-    uva_4          : no explicit H2D events, but the cuBLAS/SDPA kernels reading
-                     UVA-mapped weights take longer (PCIe-bound) — visible as
-                     inflated kernel durations.
+Trace inspection (sync stats, H2D timeline, kernel idle gaps, etc.) is
+not part of this script — use `nsys stats`, `nsys-ui`, or direct
+`sqlite3` queries on the exported `<arm>.sqlite`.
 
 Usage::
 
     conda activate thesis
     cd /TTC/FastTTS-thesis
-    python /TTC/David/Benchmarks/phase0/probe_native_offload_overlap.py
-    python /TTC/David/Benchmarks/phase0/probe_native_offload_overlap.py --arm prefetch_4x1
 
-Outputs go to ``results/0.10_overlap_probe/<arm>.nsys-rep``.
+    # Head-to-head overlap visualization (the original §0.10.4 set):
+    python probe_native_offload_overlap.py --offloader none -o none
+    python probe_native_offload_overlap.py --offloader prefetch -G 4 -o prefetch_4x1
+    python probe_native_offload_overlap.py --offloader uva --cpu-offload-gb 4 -o uva_4
+
+    # Prefetch hiding-cap probe at G=28 (§0.10.3 hypothesis verification):
+    python probe_native_offload_overlap.py --offloader prefetch -G 28 \\
+        --input-len 8 --output-len 32 --batch-size 1 --num-iters-warmup 0 \\
+        -o prefetch_g28_decode
+
+    # Sweep G ∈ {1,2,4,7,14,28} at decode_heavy:
+    for G in 1 2 4 7 14 28; do
+        python probe_native_offload_overlap.py --offloader prefetch -G $G \\
+            --input-len 8 --output-len 32 --batch-size 1 --num-iters-warmup 0 \\
+            -o prefetch_g${G}_decode
+    done
+
+Outputs go to ``results/0.10_overlap_probe/<output-name>.nsys-rep``.
 """
 
 from __future__ import annotations
@@ -62,47 +51,72 @@ OUT_DIR = PHASE0_DIR / "results" / "0.10_overlap_probe"
 
 MODEL = "Qwen/Qwen2.5-7B-Instruct"
 DTYPE = "bfloat16"
-INPUT_LEN = 256
-OUTPUT_LEN = 16
-BATCH = 16
-WARMUP = 1
-ITERS = 2
-
-ARMS = {
-    "none": {
-        "flags": [],
-        "env": {},
-    },
-    "prefetch_4x1": {
-        "flags": [
-            "--offload-group-size", "4",
-            "--offload-num-in-group", "1",
-            "--offload-prefetch-step", "1",
-        ],
-        "env": {},
-    },
-    "uva_4": {
-        "flags": ["--cpu-offload-gb", "4"],
-        "env": {},
-    },
-}
 
 
-def run_arm(arm: str, force: bool = False) -> Path:
-    if arm not in ARMS:
-        raise SystemExit(f"unknown arm {arm!r}; choices: {list(ARMS)}")
-    spec = ARMS[arm]
-    out = OUT_DIR / f"{arm}.nsys-rep"
-    if out.exists() and not force:
-        print(f"[skip] {out.name} already exists (use --force to overwrite)")
-        return out
+def offloader_flags(args: argparse.Namespace) -> list[str]:
+    if args.offloader == "none":
+        return []
+    if args.offloader == "prefetch":
+        return [
+            "--offload-group-size", str(args.group_size),
+            "--offload-num-in-group", str(args.num_in_group),
+            "--offload-prefetch-step", str(args.prefetch_step),
+        ]
+    if args.offloader == "uva":
+        return ["--cpu-offload-gb", str(args.cpu_offload_gb)]
+    raise SystemExit(f"unknown offloader {args.offloader!r}")
+
+
+def default_output_name(args: argparse.Namespace) -> str:
+    if args.offloader == "none":
+        return "none"
+    if args.offloader == "prefetch":
+        return f"prefetch_g{args.group_size}_n{args.num_in_group}_k{args.prefetch_step}"
+    if args.offloader == "uva":
+        return f"uva_{args.cpu_offload_gb}"
+    raise SystemExit(f"unknown offloader {args.offloader!r}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # Offloader selection + knobs
+    ap.add_argument("--offloader", choices=["none", "prefetch", "uva"],
+                    default="none", help="Which native offloader to probe")
+    ap.add_argument("-G", "--group-size", type=int, default=4,
+                    help="PrefetchOffloader group_size (divides num_layers)")
+    ap.add_argument("-N", "--num-in-group", type=int, default=1,
+                    help="PrefetchOffloader num_in_group")
+    ap.add_argument("-K", "--prefetch-step", type=int, default=1,
+                    help="PrefetchOffloader prefetch_step (layers ahead)")
+    ap.add_argument("--cpu-offload-gb", type=float, default=4.0,
+                    help="UVAOffloader cpu_offload_gb")
+    # Workload
+    ap.add_argument("--input-len", type=int, default=256)
+    ap.add_argument("--output-len", type=int, default=16)
+    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--num-iters-warmup", type=int, default=1)
+    ap.add_argument("--num-iters", type=int, default=2)
+    # Output
+    ap.add_argument("-o", "--output-name", default=None,
+                    help="Output filename stem (default: derived from offloader+knobs)")
+    ap.add_argument("--force", action="store_true",
+                    help="Overwrite existing nsys-rep file")
+    args = ap.parse_args()
 
     if not shutil.which("nsys"):
-        raise SystemExit("nsys is not on PATH; install Nsight Systems first")
+        sys.exit("nsys is not on PATH; install Nsight Systems first")
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    name = args.output_name or default_output_name(args)
+    out = OUT_DIR / f"{name}.nsys-rep"
+    if out.exists() and not args.force:
+        print(f"[skip] {out.name} already exists (use --force to overwrite)")
+        return
+
+    flags = offloader_flags(args)
 
     # vLLM's V1 engine spawns a worker subprocess; without --trace-fork-before-exec
-    # nsys misses CUDA activity in the child, and without --wait=primary nsys hangs
-    # waiting for the child to terminate. See vllm profiling docs (CLAUDE.md).
+    # nsys misses CUDA activity in the child.
     cmd = [
         "nsys", "profile",
         "-o", str(out.with_suffix("")),  # nsys appends .nsys-rep
@@ -112,57 +126,27 @@ def run_arm(arm: str, force: bool = False) -> Path:
         "vllm", "bench", "latency",
         "--model", MODEL,
         "--dtype", DTYPE,
-        "--input-len", str(INPUT_LEN),
-        "--output-len", str(OUTPUT_LEN),
-        "--batch-size", str(BATCH),
-        "--num-iters-warmup", str(WARMUP),
-        "--num-iters", str(ITERS),
+        "--input-len", str(args.input_len),
+        "--output-len", str(args.output_len),
+        "--batch-size", str(args.batch_size),
+        "--num-iters-warmup", str(args.num_iters_warmup),
+        "--num-iters", str(args.num_iters),
         "--enforce-eager",
-        *spec["flags"],
+        *flags,
     ]
-    env = {**os.environ, "VLLM_WORKER_MULTIPROC_METHOD": "spawn", **spec["env"]}
+    env = {**os.environ, "VLLM_WORKER_MULTIPROC_METHOD": "spawn"}
 
-    print(f"\n[probe] arm={arm}")
-    print(f"        env: {spec['env']}")
-    print(f"        flags: {' '.join(spec['flags']) or '(none)'}")
+    print(f"[probe] {name}")
+    print(f"        workload: input={args.input_len} output={args.output_len} "
+          f"B={args.batch_size} warmup={args.num_iters_warmup} iters={args.num_iters}")
+    print(f"        flags: {' '.join(flags) or '(none)'}")
     print(f"        out: {out}")
     t0 = time.perf_counter()
     proc = subprocess.run(cmd, env=env, check=False)
     dur = time.perf_counter() - t0
     if proc.returncode != 0:
-        print(f"[FAIL] arm={arm} rc={proc.returncode} ({dur:.1f}s)")
-    else:
-        print(f"[ok]  arm={arm} ({dur:.1f}s) → {out.name}")
-        # Dump short stats for cross-reference
-        try:
-            stats = subprocess.run(
-                ["nsys", "stats", "--report", "cuda_gpu_mem_time_sum", str(out)],
-                capture_output=True, text=True, timeout=60,
-            )
-            if stats.returncode == 0:
-                print("        memcpy summary:")
-                for line in stats.stdout.splitlines()[:15]:
-                    print("        " + line)
-        except Exception:
-            pass
-    return out
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--arm", choices=[*ARMS, "all"], default="all")
-    ap.add_argument("--force", action="store_true",
-                    help="Overwrite existing nsys-rep files")
-    args = ap.parse_args()
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    arms = list(ARMS) if args.arm == "all" else [args.arm]
-    for a in arms:
-        run_arm(a, force=args.force)
-
-    print(f"\nDone. Reports in {OUT_DIR}")
-    print("Open in GUI:  nsys-ui <arm>.nsys-rep")
+        sys.exit(f"[FAIL] rc={proc.returncode} ({dur:.1f}s)")
+    print(f"[ok]  ({dur:.1f}s) → {out}")
 
 
 if __name__ == "__main__":

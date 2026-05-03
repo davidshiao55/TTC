@@ -133,7 +133,7 @@ Partition granularity (see `weight_offload_design.md`) determines **how** weight
 |---|---|---|
 | **Tensor-ahead** | Preceding tensor's compute | Prefetch next tensor during current tensor's compute |
 | **Layer-ahead** | 1 full layer's compute | Prefetch next layer during current layer's compute |
-| **Multi-layer-ahead (K)** | K *offloaded modules* of compute | Prefetch K offloaded modules ahead (vLLM's `prefetch_step`, default K=1; configurable). With one layer offloaded per group (N=1) this collapses to "(G−1)-actual-layer-ahead"; with N>1, hiding is non-uniform across the group (see `phase0_findings.md §0.10.2`). |
+| **Multi-layer-ahead (K)** | K *offloaded modules* of compute | Prefetch K offloaded modules ahead (vLLM's `prefetch_step`, default K=1; configurable). With one layer offloaded per group (N=1) this collapses to "(G−1)-actual-layer-ahead"; with N>1, hiding is non-uniform across the group (see `phase0_findings.md §0.10.1`). |
 
 Longer prefetch distance = more hiding time = can prefetch more data. But also = larger buffer (must hold prefetched data until consumed).
 
@@ -192,7 +192,7 @@ At decode with WO's short compute phase (~0.018 ms), the MLP1 prefetch budget st
 
 Same as layer-ahead but starts K layers in advance. Budget grows to `K × layer_time × PCIe_BW`, buffer to `K × Σ_m (f_prefetch × W_m)`.
 
-**Why not adopted**: 1-layer-ahead already provides enough budget (`layer_time × 22 GB/s` ≈ 10–30 MB at decode, scales with batch). Going deeper just inflates buffer without adding a benefit we need. **Empirically confirmed in `phase0_findings.md §0.10.2c`**: at G=14 N=4 on Qwen2.5-7B, K=1 → 7.00 s @ B=64; K=2 → 6.60 s (5.6% improvement); K=3 → 6.60 s (no further); **K=4 OOMs at B=64** because the prefetch buffer pool grows linearly with K (~1.86 GiB extra GPU residency at K=4).
+**Why not adopted**: 1-layer-ahead already provides enough budget (`layer_time × 22 GB/s` ≈ 10–30 MB at decode, scales with batch). Going deeper just inflates buffer without adding a benefit we need. **Empirically confirmed in `phase0_findings.md §0.10.1d`**: at G=4 N=1 on Qwen2.5-7B (uniform spread, the empirically best spacing), K=1 → 5.96 s @ B=64; K=2 → 5.78 s (2.9% improvement); K=3 → 5.81 s (no further); **K=4 OOMs at B=64** because the prefetch buffer pool grows linearly with K (~1.7 GiB extra GPU residency at K=4).
 
 ---
 

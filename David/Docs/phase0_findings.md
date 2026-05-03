@@ -809,37 +809,9 @@ Decoder-layer arithmetic (used to express prefetch coverage in GiB so it shares 
 | **per layer total** | | **444.5 MiB** |
 | 28 layers | | **12.15 GiB** |
 
-All prefetch arms below use `G ∈ {2, 4, 7, 14, 28}` (divisors of 28), so coverage = N/G is exact and offloaded layer counts are clean. Earlier sweeps with G=8 or G=16 produced inhomogeneous byte counts because 28 doesn't divide cleanly into those Gs (partial last group).
+All prefetch arms below use `G ∈ {1, 2, 4, 7, 14, 28}` (divisors of 28, including the full-coverage G=1 / 100% case used as the OOM-ceiling probe in §0.10.3), so coverage = N/G is exact and offloaded layer counts are clean. Earlier sweeps with G=8 or G=16 produced inhomogeneous byte counts because 28 doesn't divide cleanly into those Gs (partial last group).
 
-### 0.10.1: UVA vs Prefetch — head-to-head
-
-Measured by `bench_uva_vs_prefetch.py`. Prefetch arm: G=14, K=1, varying N ∈ {1, 2, 4, 7, 10}. UVA arm: varying `cpu_offload_gb` ∈ {1, 2, 4, 6, 8, 10, 12}. Both curves on the same offloaded-GiB x-axis.
-
-| Arm | Offloaded GiB | B=1 (s) | B=16 (s) | B=64 (s) | tok/s @ B=64 |
-|---|---:|---:|---:|---:|---:|
-| `none` | 0.00 | 0.522 | 0.893 | 2.046 | 1001 |
-| `prefetch_14x1` | 0.87 | 1.506 | 1.867 | 2.989 | 685 |
-| `prefetch_14x2` | 1.74 | 2.772 | 3.169 | 4.313 | 475 |
-| `prefetch_14x4` | 3.47 | 5.297 | 5.767 | 6.998 | 293 |
-| `prefetch_14x7` | 6.08 | 9.091 | 9.680 | 11.020 | 186 |
-| `prefetch_14x10` | 8.68 | 12.883 | 13.591 | 15.048 | 136 |
-| `uva_1` | 1.00 | 2.274 | 5.330 | 15.871 | 129 |
-| `uva_2` | 2.00 | 3.563 | 8.707 | 26.509 | 77 |
-| `uva_4` | 4.00 | 6.791 | 17.153 | 52.541 | 39 |
-| `uva_6` | 6.00 | 9.552 | 24.378 | 74.648 | 27 |
-| `uva_8` | 8.00 | 12.601 | 30.913 | 99.389 | 21 |
-| `uva_10` | 10.00 | 15.415 | 39.221 | 121.129 | 17 |
-| `uva_12` | 12.00 | 18.398 | 45.999 | 145.366 | 14 |
-
-#### Findings
-
-1. **Prefetch dominates UVA at B ≥ 16 across the entire offload-depth range.** At B=64, comparing approximately matched offloaded bytes: `prefetch_14x2` (1.74 GiB) at 4.31 s vs `uva_2` (2.00 GiB) at 26.51 s → Prefetch is **6.1×** faster. At deeper offload the gap stays similar: `prefetch_14x4` (3.47 GiB) at 7.00 s vs `uva_4` (4.00 GiB) at 52.54 s ≈ 7.5×; `prefetch_14x7` (6.08 GiB) at 11.02 s vs `uva_6` (6.00 GiB) at 74.65 s ≈ 6.8×.
-2. **At B=1 the two curves nearly meet at low depth.** UVA is competitive only at ≤1 GiB and B=1: `uva_1` (2.27 s) vs `prefetch_14x1` (1.51 s, 0.87 GiB) — Prefetch already wins by 33% at the lowest depth. Anywhere above B=1 or above ~1 GiB, Prefetch wins by 2× or more.
-3. **UVA's slowdown is super-linear in batch.** At B=1 → B=16 → B=64, `uva_4`'s latency goes 6.79 → 17.15 → 52.54 s — 7.7× over the batch range. By contrast, `prefetch_14x4`: 5.30 → 5.77 → 7.00 s — 1.3× over the same range. **UVA is structurally batch-hostile**: each kernel reading UVA-mapped weights pays PCIe per-token, so PCIe traffic scales with batch. Prefetch's H2D is per-call (B-independent).
-4. **UVA's latency is roughly linear in offload depth at fixed batch.** At B=64: 1 → 12 GiB ⇒ 15.87 → 145.37 s, slope ≈ 11.8 s/GiB. Cost of crossing PCIe per-token compounds proportionally with the bytes that have to be crossed.
-5. **Prefetch's slope at B=64**: 0.87 → 8.68 GiB ⇒ 2.99 → 15.05 s, slope ≈ 1.55 s/GiB. **Prefetch is ~7.6× more PCIe-efficient than UVA per offloaded GiB** at decode pressure.
-
-### 0.10.2: PrefetchOffloader knob sweep
+### 0.10.1: PrefetchOffloader knob sweep
 
 Measured by `bench_prefetch_knobs.py`. Three sub-sweeps on Qwen2.5-7B BF16 across batch ∈ {1, 16, 64}.
 
@@ -858,34 +830,9 @@ By picking G ∈ {2, 4, 14, 28} (divisors of 28) and N = G/2, every arm offloads
 
 The earlier `bench_native_weight_offload.py` finding that "G=16 N=4 wins at 25% coverage" was an artifact of unequal byte counts (G=16 N=4 offloads 8 layers / 3.47 GiB; G=4 N=1 offloads 7 layers / 3.04 GiB — 14% more bytes for the supposed winner). With truly fixed bytes the picture inverts: **at fixed coverage, denser uniform spacing dominates clustering**.
 
-#### (b) N at fixed G=14 (K=1)
+#### (b) N=1, G varies — canonical coverage sweep (densest possible spread at each depth)
 
-| Arm | N | Coverage | Offloaded GiB | B=1 (s) | B=16 (s) | B=64 (s) |
-|---|---:|---:|---:|---:|---:|---:|
-| `prefetch_14x1`  | 1  | 7.1%  | 0.87 | 1.506 | 1.867 | 2.989 |
-| `prefetch_14x2`  | 2  | 14.3% | 1.74 | 2.772 | 3.169 | 4.313 |
-| `prefetch_14x4`  | 4  | 28.6% | 3.47 | 5.297 | 5.767 | 6.998 |
-| `prefetch_14x7`  | 7  | 50.0% | 6.08 | 9.092 | 9.669 | 11.016 |
-| `prefetch_14x10` | 10 | 71.4% | 8.68 | 12.874 | 13.585 | 15.046 |
-
-**Linear in offloaded bytes** at every batch. Slope at B=64: 0.87 → 8.68 GiB ⇒ 2.99 → 15.05 s = **1.55 s/GiB**. At 22 GB/s effective PCIe, theoretical minimum for 7.81 GiB is 7.81/22 × 32 (for 32 output tokens) ≈ 11.4 s — measured 12.06 s incremental, so PrefetchOffloader achieves ~93% of theoretical PCIe throughput at 50%+ coverage.
-
-#### (c) K at fixed G=14, N=4
-
-| Arm | K | B=1 (s) | B=16 (s) | B=64 (s) |
-|---|---:|---:|---:|---:|
-| `prefetch_14x4`     | 1 | 5.297 | 5.767 | 6.998 |
-| `prefetch_14x4_k2`  | 2 | 5.174 | 5.542 | 6.603 |
-| `prefetch_14x4_k3`  | 3 | 5.175 | 5.527 | 6.597 |
-| `prefetch_14x4_k4`  | 4 | 5.176 | 5.561 | **OOM** |
-
-**K=2 captures most of the benefit; K≥3 is flat; K=4 OOMs at B=64.** At B=64, K=2 buys 5.6% latency improvement over K=1; K=3 adds nothing further. K=4 succeeds at B=1 and B=16 (no measurable gain over K=2/3) but fails at B=64 — the K=4 buffer pool is ~1.86 GiB extra GPU residency, which combined with B=64 activations (~296 MiB allocations) overruns the 24 GiB budget.
-
-**This empirically validates the COTS commitment to layer-ahead** in `pcie_bandwidth_allocation_design.md` (§Prefetch Distance). The marginal benefit of K>1 (≤6% at B=64) is small relative to the buffer cost (linear in K) and the OOM risk at large batch. Layer-ahead (effectively K=1 in our partition) gives ~95% of the achievable hiding without the buffer pressure.
-
-#### (d) N=1 with G varies — densest spread at each depth
-
-Sub-sweep (a) showed that at fixed 50% coverage, denser uniform spacing wins. (d) tests whether that finding generalizes to other depths by holding N=1 (single offloaded layer per group → max spread) and varying G. The arm at each depth has the **densest possible** spatial pattern at that byte count — so each arm is the strongest possible prefetch baseline at its offload depth, against which any later comparison should be measured.
+(a) showed that at fixed 50% coverage, denser uniform spacing wins. (b) generalizes that finding to all depths by holding N=1 (single offloaded layer per group → max spread) and varying G. The arm at each depth has the **densest possible** spatial pattern at that byte count — these are the empirically best prefetch baselines at every offload depth and what every downstream cross-section comparison should use.
 
 | Arm | G | N | Offloaded layers | GiB | B=1 (s) | B=16 (s) | B=64 (s) |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -895,9 +842,9 @@ Sub-sweep (a) showed that at fixed 50% coverage, denser uniform spacing wins. (d
 | `prefetch_4x1`  | 4  | 1 | 7 | 3.04 | 4.546 | 4.888 | 5.959 |
 | `prefetch_2x1`  | 2  | 1 | 14 | 6.08 | 8.990 | 9.451 | 10.439 |
 
-Comparison against (b) (`prefetch_14xN`, clustered) at matched depths:
+Comparison against the legacy clustered baseline (c) (`prefetch_14xN`) at matched depths:
 
-| Depth | (b) clustered | (d) max spread | B=64 (b/d) | gap |
+| Depth | (c) clustered | (b) max spread | B=64 (c/b) | gap |
 |---|---|---|---|---:|
 | 0.87 GiB (2 layers) | `prefetch_14x1` | `prefetch_14x1` (same arm) | 2.973 / 2.973 | 0% |
 | 1.74 GiB (4 layers) | `prefetch_14x2` | `prefetch_7x1` | 4.310 / 4.090 | **5.1%** |
@@ -907,29 +854,224 @@ Comparison against (b) (`prefetch_14xN`, clustered) at matched depths:
 
 **(a)'s finding generalizes: at every byte-equal depth tested, the densest-spread (N=1) arm beats the clustered (G=14) arm by 5±0% at B=64.** The gap is small but consistent, and grows with batch (B=1: ~1%, B=16: ~5%, B=64: ~5%).
 
-**Why the win shrinks at B=1.** At B=1 decode is bandwidth-bound and per-layer compute time is roughly fixed regardless of how many layers are clustered together — clustering vs spreading affects how much "drain time" each prefetched layer gets, but at B=1 the drain time is short either way. At larger batches, GPU compute per layer grows; clusters of consecutive offloaded layers can't fully hide their H2D behind that compute (the second-and-later cluster member gets only ~1 ms of compute hiding for ~20 ms H2D), while uniformly-spread offloads always have a fresh non-offloaded layer's compute window to hide behind. Hence (d)'s lead expands at higher batches.
+**Why the win shrinks at B=1.** At B=1 decode is bandwidth-bound and per-layer compute time is roughly fixed regardless of how many layers are clustered together — clustering vs spreading affects how much "drain time" each prefetched layer gets, but at B=1 the drain time is short either way. At larger batches, GPU compute per layer grows; clusters of consecutive offloaded layers can't fully hide their H2D behind that compute (the second-and-later cluster member gets only ~1 ms of compute hiding for ~20 ms H2D), while uniformly-spread offloads always have a fresh non-offloaded layer's compute window to hide behind. Hence (b)'s lead expands at higher batches.
 
-**Implication for cross-section comparison:** the right prefetch baseline at any offload depth `d` is the (G, N=1) arm whose `28/G` matches `d / per-layer-bytes`. The §0.10.1 sweep used `G=14` with N varying and was therefore representative within ~5% of optimal at every depth — useful as a quick-look baseline, but for the strongest-prefetch comparison the (d) numbers are what to use.
+**Implication for cross-section comparison:** the right prefetch baseline at any offload depth `d` is the (G, N=1) arm whose `28/G` matches `d / per-layer-bytes`. The §0.10.2 head-to-head uses these N=1 arms directly, anchored at matched offloaded GiB against UVA.
 
-### 0.10.3: nsys overlap probe
+#### (c) N at fixed G=14, K=1 — legacy clustered baseline
+
+Pre-restructure, this was the canonical coverage sweep. Now retained only as the matched-bytes anchor used in (b)'s "uniform vs clustered" comparison above.
+
+| Arm | N | Coverage | Offloaded GiB | B=1 (s) | B=16 (s) | B=64 (s) |
+|---|---:|---:|---:|---:|---:|---:|
+| `prefetch_14x1`  | 1  | 7.1%  | 0.87 | 1.506 | 1.867 | 2.989 |
+| `prefetch_14x2`  | 2  | 14.3% | 1.74 | 2.772 | 3.169 | 4.313 |
+| `prefetch_14x4`  | 4  | 28.6% | 3.47 | 5.297 | 5.767 | 6.998 |
+| `prefetch_14x7`  | 7  | 50.0% | 6.08 | 9.092 | 9.669 | 11.016 |
+| `prefetch_14x10` | 10 | 71.4% | 8.68 | 12.874 | 13.585 | 15.046 |
+
+**Linear in offloaded bytes** at every batch. Slope at B=64: 0.87 → 8.68 GiB ⇒ 2.99 → 15.05 s = **1.55 s/GiB**. At matched bytes the canonical (b) `prefetch_2x1` is ~5% faster — see (b)'s comparison table above.
+
+#### (d) K at fixed G=4, N=1 — uniform-spread K sweep
+
+K sweep at the empirically best knob configuration (uniform N=1, ~25% coverage, 7 offloaded layers). K>1's potential upside is structurally smaller under uniform spread than under a clustered config, because each prefetch already gets G−1 = 3 actual layers of compute hiding from K=1 alone. This is therefore a K=1-conservative measurement: if K>1 doesn't help here, it's not going to help at the canonical N=1 configurations downstream consumers actually use.
+
+| Arm | K | B=1 (s) | B=16 (s) | B=64 (s) |
+|---|---:|---:|---:|---:|
+| `prefetch_4x1`     | 1 | 4.546 | 4.888 | 5.959 |
+| `prefetch_4x1_k2`  | 2 | 4.432 | 4.723 | 5.784 |
+| `prefetch_4x1_k3`  | 3 | 4.436 | 4.775 | 5.808 |
+| `prefetch_4x1_k4`  | 4 | 4.437 | 4.712 | **OOM** |
+
+**K=2 captures essentially all of the available benefit; K≥3 is flat; K=4 OOMs at B=64.** At B=64 K=2 buys **2.9%** over K=1 (5.96 → 5.78 s). K=3 is within run-to-run noise of K=2. K=4 succeeds at B=1 / B=16 with no measurable gain (4.44 / 4.71 s) but fails at B=64 — the K=4 buffer pool (4 × per-layer-buffer slots, ~1.7 GiB extra GPU residency) combined with B=64 activations overruns the 24 GiB budget.
+
+**The K>1 win is structurally smaller under uniform spread than under clustering.** Each prefetch already gets G−1 = 3 actual layers of compute hiding from K=1 alone, leaving little for K>1 to add. Concretely, the legacy K-sweep at (G=14, N=4) — clustered, where the 2nd–4th members of each cluster benefit most from K>1 — measured a K=2 win of 5.6% at B=64 (data not shown). Under (G=4, N=1) that win shrinks to 2.9%: roughly half the legacy gap, exactly as expected from the spacing argument.
+
+**This empirically validates the COTS commitment to layer-ahead** in `pcie_bandwidth_allocation_design.md` (§Prefetch Distance). The marginal benefit of K>1 is small (≤3% at B=64 under the empirically best spacing) and the OOM risk at large batch + large K is real. Layer-ahead (K=1, the COTS partition) gives essentially all the achievable hiding without the buffer pressure.
+
+### 0.10.2: UVA vs Prefetch — head-to-head
+
+Measured by `bench_uva_vs_prefetch.py`. Prefetch arm: N=1, K=1, varying G ∈ {1, 2, 4, 7, 14, 28} (the empirically best knob configuration per §0.10.1 — uniform spacing dominates clustering). UVA arm: varying `cpu_offload_gb` ∈ {1, 2, 4, 6, 8, 10, 12}. Both curves on the same offloaded-GiB x-axis.
+
+| Arm | Offloaded GiB | B=1 (s) | B=16 (s) | B=64 (s) | tok/s @ B=64 |
+|---|---:|---:|---:|---:|---:|
+| `none`           | 0.00  | 0.522  | 0.893  |  2.046 | 1001 |
+| `prefetch_28x1`  | 0.43  | 1.104  | 1.486  |  2.631 |  778 |
+| `prefetch_14x1`  | 0.87  | 1.506  | 1.867  |  2.989 |  685 |
+| `prefetch_7x1`   | 1.74  | 2.667  | 3.001  |  4.084 |  502 |
+| `prefetch_4x1`   | 3.04  | 4.540  | 4.860  |  5.942 |  345 |
+| `prefetch_2x1`   | 6.08  | 8.983  | 9.451  | 10.429 |  196 |
+| `prefetch_1x1`   | 12.16 | 17.948 | 18.838 | 20.479 |  100 |
+| `uva_1`          | 1.00  | 2.274  | 5.330  | 15.871 |  129 |
+| `uva_2`          | 2.00  | 3.563  | 8.707  | 26.509 |   77 |
+| `uva_4`          | 4.00  | 6.791  | 17.153 | 52.541 |   39 |
+| `uva_6`          | 6.00  | 9.552  | 24.378 | 74.648 |   27 |
+| `uva_8`          | 8.00  | 12.601 | 30.913 | 99.389 |   21 |
+| `uva_10`         | 10.00 | 15.415 | 39.221 | 121.129 |  17 |
+| `uva_12`         | 12.00 | 18.398 | 45.999 | 145.366 |  14 |
+
+#### Findings
+
+1. **Prefetch dominates UVA at B ≥ 16 across the entire offload-depth range.** At B=64, comparing matched-GiB pairs: `prefetch_7x1` (1.74 GiB) at 4.08 s vs `uva_2` (2.00 GiB) at 26.51 s → Prefetch is **6.5×** faster. `prefetch_4x1` (3.04 GiB) at 5.94 s vs `uva_4` (4.00 GiB) at 52.54 s ≈ **8.8×**. `prefetch_2x1` (6.08 GiB) at 10.43 s vs `uva_6` (6.00 GiB) at 74.65 s ≈ **7.2×**. At full coverage `prefetch_1x1` (12.16 GiB) at 20.48 s vs `uva_12` (12.00 GiB) at 145.37 s ≈ **7.1×**.
+2. **At B=1 the two curves nearly meet at low depth, with prefetch always ahead.** UVA is competitive only at ≤1 GiB and B=1: `uva_1` (2.27 s) vs `prefetch_14x1` (1.51 s, 0.87 GiB) — Prefetch wins by 33% at the lowest depth. At full 12 GiB, `prefetch_1x1` (17.95 s) beats `uva_12` (18.40 s) by only 2.4% at B=1; the win expands at larger batches because UVA scales with B while prefetch doesn't.
+3. **UVA's slowdown is super-linear in batch.** At B=1 → B=16 → B=64, `uva_4` goes 6.79 → 17.15 → 52.54 s — **7.7×** over the batch range. By contrast, `prefetch_4x1`: 4.54 → 4.86 → 5.94 s — only **1.3×**. **UVA is structurally batch-hostile**: each kernel reading UVA-mapped weights pays PCIe per-token, so PCIe traffic scales with batch. Prefetch's H2D is per-call (B-independent).
+4. **UVA's latency is roughly linear in offload depth at fixed batch.** At B=64: 1 → 12 GiB ⇒ 15.87 → 145.37 s, slope ≈ **11.8 s/GiB**. Cost of crossing PCIe per-token compounds proportionally with the bytes that have to be crossed.
+5. **Prefetch's slope at B=64**: 0.43 → 12.16 GiB ⇒ 2.63 → 20.48 s, slope ≈ **1.52 s/GiB** — within 2% of the legacy clustered-G=14 slope (1.55 s/GiB) at the same batch. **Prefetch is ~7.8× more PCIe-efficient than UVA per offloaded GiB** at decode pressure.
+
+### 0.10.3: Prefetch vs none — finding the prefetch free regime
+
+Measured by `bench_prefetch_vs_none.py`. Three-arm decomposition mirrors `phase1a_findings.md §1.14`'s COTS-vs-`none` methodology applied to vLLM's stock `PrefetchOffloader`:
+
+| Arm | What it isolates |
+|---|---|
+| `none` | baseline (no offload) |
+| `prefetch_dryrun_g{G}` | wrappers/custom ops/event sync installed, H2D copy skipped via `--prefetch-dry-run` (added in `vllm/config/offload.py`) |
+| `prefetch_real_g{G}` | end-to-end prefetch |
+
+Decomposition:
+- `orch = dryrun − none` → pure host orchestration (Python forward hooks + `wait_prefetch` / `start_prefetch` custom op dispatch + `_copy_done_event` recording + stream fork/join)
+- `pcie = real − dryrun` → unhidden H2D transfer cost not absorbed by the GPU layer budget
+- `total = real − none` → net regression vs no offload; "free regime" = total ≤ ~0 within run-to-run noise
+
+Coverage axis: N=1, K=1 (the empirically best prefetch knob choice per §0.10.1); G ∈ {1, 2, 4, 7, 14, 28} (divisors of 28 → exact uniform coverage = 1/G).
+
+#### Grid A — decode-heavy (matches §1.14 condition)
+
+Workload: Qwen2.5-7B BF16, `--input-len 8 --output-len 128 --enforce-eager`. Same condition as `bench_cots_dryrun_vs_none.py` so the prefetch and COTS gap tables overlay apples-to-apples. `none` baselines: B=1 2.034s, B=4 2.110s, B=16 2.148s, B=64 2.481s.
+
+| B | G | cov | dryrun (s) | real (s) | orch (s) | pcie (s) | total (s) | orch % |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1  | 28 |  3.6% |  2.032 |  4.371 | −0.002 |  +2.339 |  +2.337 | −0% |
+| 1  | 14 |  7.1% |  2.034 |  6.000 |  0.000 |  +3.966 |  +3.966 |  0% |
+| 1  |  7 | 14.3% |  2.033 | 10.656 | −0.001 |  +8.623 |  +8.622 | −0% |
+| 1  |  4 | 25.0% |  2.033 | 18.161 | −0.001 | +16.128 | +16.127 | −0% |
+| 1  |  2 | 50.0% |  2.039 | 35.941 | +0.005 | +33.902 | +33.906 |  0% |
+| 1  |  1 |100.0% |  2.043 | 71.788 | +0.009 | +69.745 | +69.754 |  0% |
+| 4  | 28 |  3.6% |  2.106 |  4.446 | −0.004 |  +2.340 |  +2.336 | −0% |
+| 4  | 14 |  7.1% |  2.100 |  6.036 | −0.011 |  +3.936 |  +3.926 | −0% |
+| 4  |  7 | 14.3% |  2.111 | 10.685 | +0.001 |  +8.574 |  +8.575 |  0% |
+| 4  |  4 | 25.0% |  2.113 | 18.171 | +0.003 | +16.057 | +16.060 |  0% |
+| 4  |  2 | 50.0% |  2.114 | 36.086 | +0.004 | +33.972 | +33.976 |  0% |
+| 4  |  1 |100.0% |  2.115 | 71.855 | +0.004 | +69.741 | +69.745 |  0% |
+| 16 | 28 |  3.6% |  2.148 |  4.498 |  0.000 |  +2.350 |  +2.350 |  0% |
+| 16 | 14 |  7.1% |  2.147 |  6.100 |  0.000 |  +3.952 |  +3.952 |  0% |
+| 16 |  7 | 14.3% |  2.147 | 10.779 |  0.000 |  +8.632 |  +8.631 |  0% |
+| 16 |  4 | 25.0% |  2.149 | 18.326 | +0.002 | +16.176 | +16.178 |  0% |
+| 16 |  2 | 50.0% |  2.155 | 36.293 | +0.007 | +34.138 | +34.145 |  0% |
+| 16 |  1 |100.0% |  2.157 | 72.454 | +0.009 | +70.297 | +70.307 |  0% |
+| 64 | 28 |  3.6% |  2.480 |  4.796 | −0.001 |  +2.316 |  +2.315 | −0% |
+| 64 | 14 |  7.1% |  2.479 |  6.261 | −0.002 |  +3.783 |  +3.781 | −0% |
+| 64 |  7 | 14.3% |  2.477 | 10.888 | −0.004 |  +8.411 |  +8.408 | −0% |
+| 64 |  4 | 25.0% |  2.483 | 18.429 | +0.003 | +15.945 | +15.948 |  0% |
+| 64 |  2 | 50.0% |  2.482 | 36.458 | +0.001 | +33.976 | +33.977 |  0% |
+| 64 |  1 |100.0% |  2.486 | 72.718 | +0.006 | +70.231 | +70.237 |  0% |
+
+#### Grid B — §0.10-matched workload
+
+Workload: Qwen2.5-7B BF16, `--input-len 256 --output-len 32 --enforce-eager`. Cross-validates the `prefetch_real_g{G}` numbers against the existing knob-sweep results in `0.10_prefetch_knobs/summary.json` (where `prefetch_14x1` at B=1 measured 1.505 s — within 0% of this grid's 1.506 s, confirming the `--prefetch-dry-run` plumbing did not perturb the non-dryrun path). `none` baselines: B=1 0.521s, B=16 0.889s, B=64 2.035s.
+
+| B | G | cov | dryrun (s) | real (s) | orch (s) | pcie (s) | total (s) | orch % |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1  | 28 |  3.6% | 0.521 |  1.103 |  0.000 |  +0.581 |  +0.581 |  0% |
+| 1  | 14 |  7.1% | 0.522 |  1.506 |  0.000 |  +0.984 |  +0.985 |  0% |
+| 1  |  7 | 14.3% | 0.522 |  2.668 | +0.001 |  +2.147 |  +2.147 |  0% |
+| 1  |  4 | 25.0% | 0.522 |  4.539 | +0.001 |  +4.017 |  +4.018 |  0% |
+| 1  |  2 | 50.0% | 0.523 |  8.991 | +0.002 |  +8.468 |  +8.469 |  0% |
+| 1  |  1 |100.0% | 0.523 | 17.936 | +0.002 | +17.413 | +17.415 |  0% |
+| 16 | 28 |  3.6% | 0.887 |  1.485 | −0.002 |  +0.598 |  +0.595 | −0% |
+| 16 | 14 |  7.1% | 0.885 |  1.865 | −0.005 |  +0.981 |  +0.976 | −1% |
+| 16 |  7 | 14.3% | 0.884 |  2.988 | −0.005 |  +2.104 |  +2.099 | −0% |
+| 16 |  4 | 25.0% | 0.880 |  4.868 | −0.010 |  +3.989 |  +3.979 | −0% |
+| 16 |  2 | 50.0% | 0.875 |  9.451 | −0.014 |  +8.576 |  +8.562 | −0% |
+| 16 |  1 |100.0% | 0.875 | 18.825 | −0.015 | +17.951 | +17.936 | −0% |
+| 64 | 28 |  3.6% | 2.028 |  2.635 | −0.007 |  +0.607 |  +0.600 | −1% |
+| 64 | 14 |  7.1% | 2.023 |  2.978 | −0.012 |  +0.954 |  +0.942 | −1% |
+| 64 |  7 | 14.3% | 2.016 |  4.101 | −0.019 |  +2.085 |  +2.066 | −1% |
+| 64 |  4 | 25.0% | 2.009 |  5.965 | −0.026 |  +3.955 |  +3.930 | −1% |
+| 64 |  2 | 50.0% | 1.983 | 10.429 | −0.053 |  +8.446 |  +8.394 | −1% |
+| 64 |  1 |100.0% | 1.967 | 20.480 | −0.068 | +18.513 | +18.445 | −0% |
+
+#### Four observations
+
+1. **Prefetch's free-regime topology is opposite to the CPU-compute path's — and that's what motivated the two-grid design.** The CPU-compute path (one of COTS's two offload mechanisms; characterized in `phase1a_findings.md §1.14`) finds its free regime at *small* workload: small `f_cpu × num_tokens` fits in the GPU compute window, and workload growth kills it because CPU GEMM scales with `num_tokens` faster than the hiding window. Prefetch (the other COTS mechanism, and what the stock `PrefetchOffloader` exclusively uses) should be the *opposite*: per-layer PCIe time is `bytes / BW = 466 MB / 24 GB/s ≈ 19.5 ms`, **fixed, independent of `num_tokens` and B**, while the per-forward GPU compute window grows monotonically with `num_tokens` (15.8 ms at decode_heavy B=1 → 62 ms at pf_match B=64, a 4× window growth from the same 28-layer model). By theory, prefetch's free regime should appear at the **high-compute** end of the sweep. The two-grid design (decode_heavy with 8 input / 128 output tokens, pf_match with 32× more `num_tokens` per forward at 256 input / 32 output) probes exactly this axis. Together the two mechanisms are intended to cover complementary regions of the workload space.
+
+2. **Empirically, prefetch's free regime never materializes — per-forward unhidden PCIe is ~18 ms across every cell, regardless of forward duration. The mechanism is verified across all G ∈ {1, 2, 4, 7, 14, 28} by nsys probe (`probe_native_offload_overlap.py`).** At G=28 (1 prefetched layer per forward), per-forward unhidden is 18.1, 18.1, 18.2, 18.0 ms across decode_heavy B ∈ {1, 4, 16, 64} and 17.6, 18.0, 18.2 ms across pf_match B ∈ {1, 16, 64} — within run-to-run noise despite forward times spanning 15.8 → 62.0 ms. The cross-grid total-pcie ratio (4×: pf_match has 33 forwards/generate vs decode_heavy's 129) is *purely from fewer forwards*, not from better per-forward hiding.
+
+   **Root cause: the prefetch H2D and vLLM's per-step input-prep H2Ds contend for the same hardware copy engine (CE0), and CE0 is FIFO at the engine level — not the stream level.** §0.5.1 already established this property: *"once bg chunks are queued on CE0, fg's `cudaMemcpyAsync` goes to the end of the queue — its wait scales with total queued bg, not just the in-flight chunk's remainder."* That finding was framed as a concern for activation returns; the same hardware property bites prefetch even harder.
+
+   The full chain, verified at the trace level for the G=28 decode_heavy probe (`probe_native_offload_overlap.py` arm `prefetch_g28_decode`):
+
+   1. At end of iter N's offloaded layer compute, `start_prefetch` queues a 466 MB H2D on `prefetch_copy_stream`. The copy gets dispatched onto **CE0**, the sole H2D copy engine on the RTX 4090.
+   2. Iter N+1's input prep (vLLM v1 async-scheduling path) does many small `tensor.to('cuda', non_blocking=True)` calls for `input_ids`, `positions`, block-table indices, attention metadata, etc. — typically ~20 tiny H2Ds each a few bytes. These are also dispatched onto CE0 (regardless of which CUDA stream they belong to) and **queue FIFO behind the in-flight 466 MB prefetch H2D**.
+   3. The prefetch H2D occupies CE0 for ~19.5 ms. Input prep H2Ds wait the full 19.5 ms before they get serviced. Once they drain (microseconds), `prepare_inputs_event.record()` (`vllm/v1/worker/gpu_model_runner.py:3489`, recorded on main_stream after input prep) fires.
+   4. Iter N+2's `synchronize_input_prep()` calls `prepare_inputs_event.synchronize()` (`vllm/v1/worker/gpu_model_runner.py:3485`) — Python blocks until that event fires. Block duration ≈ prefetch H2D duration ≈ 18 ms. (In the non-async-scheduling path, the analogous block is `transfer_event.synchronize()` for the sampled-token D2H at `vllm/v1/worker/gpu_model_runner.py:6943`; same shape of bug, different code site.)
+   5. While Python is blocked, main_stream is idle (next forward's compute kernels haven't been dispatched yet). When the sync returns, Python rapidly dispatches iter N+2's forward and main_stream resumes.
+
+   **Direct trace evidence (window from the G=28 probe, sequential events on CE0):**
+
+   ```
+   19.62055   stream 21   271.6 MB   prefetch H2D running on CE0  ┐
+   19.63194   stream 21   135.8 MB   prefetch H2D continues       │ FIFO on CE0
+   19.63766   stream 21       7 B    last byte of prefetch H2D    ┘
+   19.63766   stream  7       8 B    input prep H2D STARTS  ← exact same instant
+   19.63767   stream  7       1 B    more input prep H2Ds drain
+   ...                               (~20 tiny H2Ds in <1 ms)
+   ```
+
+   At the precise instant the prefetch H2D bundle finishes on CE0, the queued input prep H2Ds on main_stream drain. The two streams are software-independent (no `wait_event` between them) but the hardware FIFO at CE0 serializes them anyway.
+
+   **There is no software-level sync bug.** vLLM didn't accidentally chain the prefetch into the per-step sync. The per-step sync is necessary and correct (it ensures the previous step's input prep is done before reusing the CPU pinned-memory tensors). The serialization is implicit in the hardware: any H2D issued anywhere on the device after the prefetch's H2D has to wait for it to drain CE0.
+
+   Per-G nsys evidence (decode_heavy workload, input=8 output=32 B=1, 2 iters; sync events filtered to syncType=2, duration > 1ms, post-warmup):
+
+| G | layers offloaded /forward | sync events | sync_avg_ms | sync_total_s | mean inter-bundle gap (ms) | min gap (ms) | H2D total (GB) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 28 |  1 | 125 |  **25.88** |  3.24 | 59.25 | 14.73 |  31.2 |
+| 14 |  2 | 125 |  **32.28** |  4.04 | 25.88 |  0.53 |  62.0 |
+|  7 |  4 | 125 |  **50.55** |  6.32 | 11.91 |  0.53 | 123.5 |
+|  4 |  7 | 125 |  **80.02** | 10.00 |  6.71 |  0.53 | 215.8 |
+|  2 | 14 | 125 | **149.96** | 18.75 |  3.19 |  0.53 | 431.1 |
+|  1 | 28 | 125 | **290.94** | 36.37 |  1.83 |  0.53 | 861.8 |
+
+   What this shows:
+
+   - **Sync count is fixed at 125 (~2 per forward) regardless of G** — the sync is per-step Python control flow, not per-prefetch.
+   - **Sync duration scales monotonically with the number of prefetched layers per forward** — each added offloaded layer adds another 19.5 ms of CE0 occupancy that input prep H2Ds (and intra-forward `wait_prefetch` events on main_stream) must wait through.
+   - **`min_gap_ms = 0.53 ms` for every G ≥ 14** — copy_stream's FIFO is fully back-to-back saturated; consecutive prefetches serialize at 19.5 ms cadence on CE0. Only G=28's `min_gap = 14.73 ms` reflects the inter-forward gap (the only G with a single bundle per forward).
+   - **The G=28 sync time (~26 ms) ≈ 1 H2D**; the G=1 sync time (~291 ms) ≈ chain of ~15 of the 28 H2Ds (the rest gets ~10 ms intra-forward hide each via the `(G−1)·layer_time` window in observation 4).
+
+   **Suggested fix (offloader-localized, no vLLM core changes):** move the wrap-around prefetch out of the previous iter's tail. Today, `start_prefetch` at the end of the *last* offloaded layer queues a 466 MB H2D onto CE0 immediately, where it lands ahead of next iter's input prep H2Ds. Instead, defer that single wrap-around prefetch to the *beginning* of the next iter — issued from a hook on the first decoder layer's forward, after vLLM's input prep H2Ds have already been queued. The CE0 FIFO then services the tiny input prep H2Ds first (microseconds) and the big prefetch H2D second; the per-step sync no longer transitively waits for the prefetch. The first offloaded layer's `wait_prefetch` then sees the H2D in flight and stalls main_stream by `max(0, PCIe − L·layer_time)` instead of by the full PCIe time. Expected impact at G=28 decode B=1: per-forward time drops from ~34 ms to ~21 ms (≈40% reduction). Effect shrinks at higher coverage where intra-forward CE0 saturation already dominates (G≤4). The fix lives entirely inside `prefetch.py`'s `wrap_modules` / `_hook_module_forward`; no changes to vLLM's per-step pipeline.
+
+   **Confirmatory experiment (not a fix — used to verify CE0 contention is the root cause):** route input prep through a UVA-style mapped pinned buffer instead of going through CE0 (per §0.5.3, UVA reads use an SM-issued PCIe path that bypasses CE0). If the per-step sync block disappears under this configuration — even without applying the offloader fix above — the CE0 FIFO contention is unambiguously confirmed as the mechanism. If the block remains, we're missing something and the offloader-localized fix above wouldn't help either.
+
+3. **Prefetch's host orchestration is essentially zero** — `dryrun − none` is in the −68 to +9 ms range across all 42 cells, with magnitude ≤10 ms even at G=1 (28 layers wrapped, full Python wrapper count). Two orders of magnitude smaller than the COTS-CPU-compute-path orch column in `phase1a_findings.md §1.14` (~450 ms). The C++-backed prefetch path has effectively no Python tax compared to the Python `ThreadPoolExecutor` substrate measured for the CPU compute path. **Implication for Phase 1c:** closing the host orchestration gap to prefetch's level (~450 → ~10 ms) is what `cudaLaunchHostFunc` + native CPU runner needs to achieve on the CPU compute path. The remaining ~2 s active-CPU-work penalty in §1.14 is the only structural gap COTS's CPU-compute side will still have post-Phase-1c.
+
+4. **Unhidden PCIe scales linearly with coverage** (Grid A B=64, G=28→14→7→4→2→1 gives pcie = 2.32, 3.78, 8.41, 15.95, 33.98, 70.23 s — a clean power-of-2 sweep) **and is flat across B at fixed G** (Grid A G=2: pcie ≈ 33.9 s for B ∈ {1, 4, 16, 64}). Combined with observation 2, total PCIe penalty per generate ≈ `(~18 ms unhidden per forward per offloaded layer) × forwards × layers_offloaded` — scales with coverage and forward count, but not per-forward duration. The clean linearity in coverage is consistent with each prefetched layer being independently throttled by the same per-forward hiding cap.
+
+Cross-references:
+- `phase1a_findings.md §1.14` — sister table for COTS. Anchors the cots-vs-prefetch competition against `none` for both arms.
+- `phase1a_findings.md §1.13b` — cots-vs-prefetch numbers; the prefetch column there can now be re-anchored against `none`.
+
+### 0.10.4: nsys overlap probe
 
 Three short nsys traces written by `probe_native_offload_overlap.py` to `results/0.10_overlap_probe/`. Probe uses 25% coverage with the cleanest spatial pattern (uniform single-layer offloads via G=4 N=1):
 
 - **`prefetch_4x1.nsys-rep`** — open in `nsys-ui`. Look for: `copy_stream` (separate from the default CUDA stream) showing `Pinned→Device` memcpy events occurring *during* the cuBLAS / SDPA kernels of preceding GPU-resident layers. Stream attribution confirms compute and H2D run on different streams. Quantitatively from `nsys stats`: 3,109 H2D ops totaling 7.26 s of activity (vs 918 ops / 1.13 s for `none` — same baseline traffic, plus ~6 GB of explicit prefetch).
-- **`uva_4.nsys-rep`** — no extra H2D events versus `none` (801 ops / 0.80 s, ≈ baseline). UVA is a memory mapping, not a copy; per-kernel weight reads happen *inside* the cuBLAS/SDPA kernels and show up as inflated kernel durations on the layers whose weights are UVA-offloaded. This is the timeline manifestation of finding §0.10.1 (3).
+- **`uva_4.nsys-rep`** — no extra H2D events versus `none` (801 ops / 0.80 s, ≈ baseline). UVA is a memory mapping, not a copy; per-kernel weight reads happen *inside* the cuBLAS/SDPA kernels and show up as inflated kernel durations on the layers whose weights are UVA-offloaded. This is the timeline manifestation of finding §0.10.2 (3).
 - **`none.nsys-rep`** — sanity baseline. No offload-related stream activity inside the decode region.
 
 ### Implications for COTS
 
-1. **Headline native-baseline at B=64**: at ~25% coverage, the strongest native option is `prefetch_14x4` (G=14, N=4 → 8 layers, 3.47 GiB, K=2 best at 6.60 s) — about 3.2× of `none`. COTS targets closing this gap by routing the offloaded fraction through CPU compute (idle in PrefetchOffloader) plus overlapping with concurrent CPU suffix attention.
-2. **At fixed bytes, denser uniform spacing wins** (§0.10.2a, generalized in §0.10.2d to all depths — the densest-spread N=1 arms beat the clustered G=14 arms by ~5% at B=64 across the depth range). This argues for the COTS partition's tensor-granularity approach over Group-style clustering — COTS spreads the offloaded fraction *within every layer* (no clustering at all), the limit case of "smaller G" in this sweep.
+1. **Headline native-baseline at B=64**: at ~25% coverage, the strongest native option is `prefetch_4x1` (G=4, N=1, K=2 → 7 layers, 3.04 GiB, 5.78 s) — about 2.8× of `none`. COTS targets closing this gap by routing the offloaded fraction through CPU compute (idle in PrefetchOffloader) plus overlapping with concurrent CPU suffix attention.
+2. **At fixed bytes, denser uniform spacing wins** (§0.10.1a, generalized in §0.10.1b to all depths — the densest-spread N=1 arms beat the clustered G=14 arms by ~5% at B=64 across the depth range). This argues for the COTS partition's tensor-granularity approach over Group-style clustering — COTS spreads the offloaded fraction *within every layer* (no clustering at all), the limit case of "smaller G" in this sweep.
 3. **UVA is never the right baseline above B=1.** Even at low offload depth the per-token PCIe cost of UVA-mapped reads is prohibitive. When comparing COTS against "vLLM stock offloading", we use `prefetch_*` — `uva_*` is reported only as a sanity floor.
-4. **Layer-ahead (K=1) is empirically near-optimal.** K=2 buys ≤6% at B=64 and risks OOM at K≥4. COTS's commitment to one prefetch queue per layer boundary is supported by both the contention analysis (§0.5/§0.9) and now this direct latency comparison.
+4. **Layer-ahead (K=1) is empirically near-optimal.** Under the empirically best uniform spacing (§0.10.1d, G=4 N=1), K=2 buys only 2.9% at B=64 and K=4 OOMs. COTS's commitment to one prefetch queue per layer boundary is supported by both the contention analysis (§0.5/§0.9) and now this direct latency comparison.
+5. **Prefetch's host orchestration is structurally smaller than COTS's** (§0.10.3 — `dryrun − none` measured at ~5–10 ms per generate even at full coverage G=1, vs the §1.14 COTS orch column of ~450 ms — a ~50× gap). The prefetch path's C++-backed wrappers are not where any prefetch-vs-none regression comes from; the gap is essentially all unhidden PCIe transfer (`pcie = real − dryrun`). For COTS to compete at the high-coverage end, the Phase 1c native runner has to close most of that 450 ms orch column — the structural Python-substrate gap, not the GEMM path.
 
 ### Recommendation for Phase 3 evaluation
 
 The §0.10 numbers form the headline native baselines COTS is compared against in Phase 3:
 
-- For each (model, batch, offload depth) point, the right native reference is **the best `prefetch_*` configuration at matched offloaded bytes** with tuning over (G, N, K). Default vLLM settings (G=8 N=1 K=1) are *not* the best; the comparison should use measured optima. Per §0.10.2d, the "densest-spread" arms are `prefetch_28x1` / `prefetch_14x1` / `prefetch_7x1` / `prefetch_4x1` / `prefetch_2x1` covering 0.43 / 0.87 / 1.74 / 3.04 / 6.08 GiB.
+- For each (model, batch, offload depth) point, the right native reference is **the best `prefetch_*` configuration at matched offloaded bytes** with tuning over (G, N, K). Default vLLM settings (G=8 N=1 K=1) are *not* the best; the comparison should use measured optima. Per §0.10.1b (canonical coverage sweep, re-confirmed by the §0.10.2 head-to-head), the "densest-spread" arms are `prefetch_28x1` / `prefetch_14x1` / `prefetch_7x1` / `prefetch_4x1` / `prefetch_2x1` / `prefetch_1x1` covering 0.43 / 0.87 / 1.74 / 3.04 / 6.08 / 12.16 GiB. K=1 is near-optimal under uniform spread (§0.10.1d); K=2 is at most a 3% improvement and risks OOM at large batch.
 - `uva_*` is reported as a sanity floor (worst-case stock option above B=1) but is not the primary comparison target.
 - `none` is a valid comparison only at zero offload — at non-trivial offload depths the baseline simply OOMs without an offloader.

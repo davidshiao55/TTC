@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "section": "0.10.2",
+  "section": "0.10.1",
   "hardware_id": "nvidiageforcertx4090_x86_64",
   "model": {
     "name": "Qwen/Qwen2.5-7B-Instruct",
@@ -28,24 +28,31 @@
     "num_layers": 28
   },
   "sweeps": {
-    "a_group_size_at_25pct": [
+    "a_G_at_50pct": [
       "prefetch_2x1",
       "prefetch_4x2",
       "prefetch_14x7",
       "prefetch_28x14"
     ],
-    "b_coverage_at_G8": [
+    "b_coverage_uniform_N1": [
+      "prefetch_2x1",
+      "prefetch_4x1",
+      "prefetch_7x1",
+      "prefetch_14x1",
+      "prefetch_28x1"
+    ],
+    "c_coverage_clustered_G14_legacy": [
       "prefetch_14x1",
       "prefetch_14x2",
       "prefetch_14x4",
       "prefetch_14x7",
       "prefetch_14x10"
     ],
-    "c_distance_at_G8_N2": [
-      "prefetch_14x4",
-      "prefetch_14x4_k2",
-      "prefetch_14x4_k3",
-      "prefetch_14x4_k4"
+    "d_K_at_G4_N1": [
+      "prefetch_4x1",
+      "prefetch_4x1_k2",
+      "prefetch_4x1_k3",
+      "prefetch_4x1_k4"
     ]
   },
   "buffer_note": "Buffer pool grows linearly with K \u2014 large K may OOM at this model size on a 24 GiB GPU.",
@@ -130,6 +137,46 @@
         }
       }
     },
+    "prefetch_4x1": {
+      "G": 4,
+      "N": 1,
+      "K": 1,
+      "offloaded_gib": 3.039,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 4.5462,
+          "tokens_per_s": 7.0
+        },
+        "16": {
+          "avg_latency_s": 4.8883,
+          "tokens_per_s": 104.7
+        },
+        "64": {
+          "avg_latency_s": 5.9594,
+          "tokens_per_s": 343.7
+        }
+      }
+    },
+    "prefetch_7x1": {
+      "G": 7,
+      "N": 1,
+      "K": 1,
+      "offloaded_gib": 1.736,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.6701,
+          "tokens_per_s": 12.0
+        },
+        "16": {
+          "avg_latency_s": 2.9944,
+          "tokens_per_s": 171.0
+        },
+        "64": {
+          "avg_latency_s": 4.0905,
+          "tokens_per_s": 500.7
+        }
+      }
+    },
     "prefetch_14x1": {
       "G": 14,
       "N": 1,
@@ -147,6 +194,26 @@
         "64": {
           "avg_latency_s": 2.9733,
           "tokens_per_s": 688.8
+        }
+      }
+    },
+    "prefetch_28x1": {
+      "G": 28,
+      "N": 1,
+      "K": 1,
+      "offloaded_gib": 0.434,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 1.1046,
+          "tokens_per_s": 29.0
+        },
+        "16": {
+          "avg_latency_s": 1.4859,
+          "tokens_per_s": 344.6
+        },
+        "64": {
+          "avg_latency_s": 2.6301,
+          "tokens_per_s": 778.7
         }
       }
     },
@@ -210,121 +277,61 @@
         }
       }
     },
-    "prefetch_14x4_k2": {
-      "G": 14,
-      "N": 4,
-      "K": 2,
-      "offloaded_gib": 3.473,
-      "by_batch": {
-        "1": {
-          "avg_latency_s": 5.1743,
-          "tokens_per_s": 6.2
-        },
-        "16": {
-          "avg_latency_s": 5.5421,
-          "tokens_per_s": 92.4
-        },
-        "64": {
-          "avg_latency_s": 6.6028,
-          "tokens_per_s": 310.2
-        }
-      }
-    },
-    "prefetch_14x4_k3": {
-      "G": 14,
-      "N": 4,
-      "K": 3,
-      "offloaded_gib": 3.473,
-      "by_batch": {
-        "1": {
-          "avg_latency_s": 5.1753,
-          "tokens_per_s": 6.2
-        },
-        "16": {
-          "avg_latency_s": 5.5274,
-          "tokens_per_s": 92.6
-        },
-        "64": {
-          "avg_latency_s": 6.5969,
-          "tokens_per_s": 310.4
-        }
-      }
-    },
-    "prefetch_14x4_k4": {
-      "G": 14,
-      "N": 4,
-      "K": 4,
-      "offloaded_gib": 3.473,
-      "by_batch": {
-        "1": {
-          "avg_latency_s": 5.1764,
-          "tokens_per_s": 6.2
-        },
-        "16": {
-          "avg_latency_s": 5.5611,
-          "tokens_per_s": 92.1
-        },
-        "64": null
-      }
-    },
-    "prefetch_4x1": {
+    "prefetch_4x1_k2": {
       "G": 4,
       "N": 1,
-      "K": 1,
+      "K": 2,
       "offloaded_gib": 3.039,
       "by_batch": {
         "1": {
-          "avg_latency_s": 4.5462,
-          "tokens_per_s": 7.0
+          "avg_latency_s": 4.432,
+          "tokens_per_s": 7.2
         },
         "16": {
-          "avg_latency_s": 4.8883,
-          "tokens_per_s": 104.7
+          "avg_latency_s": 4.7228,
+          "tokens_per_s": 108.4
         },
         "64": {
-          "avg_latency_s": 5.9594,
-          "tokens_per_s": 343.7
+          "avg_latency_s": 5.7837,
+          "tokens_per_s": 354.1
         }
       }
     },
-    "prefetch_7x1": {
-      "G": 7,
+    "prefetch_4x1_k3": {
+      "G": 4,
       "N": 1,
-      "K": 1,
-      "offloaded_gib": 1.736,
+      "K": 3,
+      "offloaded_gib": 3.039,
       "by_batch": {
         "1": {
-          "avg_latency_s": 2.6701,
-          "tokens_per_s": 12.0
+          "avg_latency_s": 4.4358,
+          "tokens_per_s": 7.2
         },
         "16": {
-          "avg_latency_s": 2.9944,
-          "tokens_per_s": 171.0
+          "avg_latency_s": 4.7746,
+          "tokens_per_s": 107.2
         },
         "64": {
-          "avg_latency_s": 4.0905,
-          "tokens_per_s": 500.7
+          "avg_latency_s": 5.8083,
+          "tokens_per_s": 352.6
         }
       }
     },
-    "prefetch_28x1": {
-      "G": 28,
+    "prefetch_4x1_k4": {
+      "G": 4,
       "N": 1,
-      "K": 1,
-      "offloaded_gib": 0.434,
+      "K": 4,
+      "offloaded_gib": 3.039,
       "by_batch": {
         "1": {
-          "avg_latency_s": 1.1046,
-          "tokens_per_s": 29.0
+          "avg_latency_s": 4.4374,
+          "tokens_per_s": 7.2
         },
         "16": {
-          "avg_latency_s": 1.4859,
-          "tokens_per_s": 344.6
+          "avg_latency_s": 4.7116,
+          "tokens_per_s": 108.7
         },
-        "64": {
-          "avg_latency_s": 2.6301,
-          "tokens_per_s": 778.7
-        }
+        "64": null
       }
     }
   }
