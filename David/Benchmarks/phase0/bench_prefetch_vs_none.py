@@ -51,6 +51,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -84,9 +86,16 @@ GRIDS: dict[str, dict] = {
 
 
 def arms_for(G: int) -> dict[str, list[str]]:
-    """Three arms parameterized by G. `none` is G-invariant (no prefetch
-    flags) — handled separately so its JSON path doesn't carry a `_g{G}`
-    suffix."""
+    """Arms parameterized by G. `none` is G-invariant (no prefetch flags)
+    — handled separately so its JSON path doesn't carry a `_g{G}` suffix.
+
+    `prefetch_real_g{G}` uses the default `defer_wraparound=True` (the fix
+    landed alongside §0.10.5). `prefetch_real_unfixed_g{G}` toggles the fix
+    off via `--no-prefetch-defer-wraparound` so the same workload is
+    measured under the legacy end-of-iter-N prefetch ordering — gives an
+    in-script before/after at matched conditions instead of relying on the
+    `0.10_prefetch_vs_none-unfixed/` snapshot from a different driver day.
+    """
     base = [
         "--offload-group-size", str(G),
         "--offload-num-in-group", "1",
@@ -95,6 +104,7 @@ def arms_for(G: int) -> dict[str, list[str]]:
     return {
         f"prefetch_dryrun_g{G}": base + ["--prefetch-dry-run"],
         f"prefetch_real_g{G}": base,
+        f"prefetch_real_unfixed_g{G}": base + ["--no-prefetch-defer-wraparound"],
     }
 
 
@@ -124,12 +134,35 @@ def run_cell(grid: str, arm: str, flags: list[str], batch: int) -> Path:
         *flags,
     ]
     t0 = time.perf_counter()
+    # 5 min covers the largest legitimate cell (B=64, ~30s wall) with margin.
+    # vLLM v1 spawns an engine-core worker; on timeout we must kill the whole
+    # process group or the worker keeps the GPU busy and breaks later cells.
+    PER_CELL_TIMEOUT = 300
     with open(out_log, "w") as fh:
-        proc = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, check=False)
+        proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+        try:
+            rc = proc.wait(timeout=PER_CELL_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=10)
+            dur = time.perf_counter() - t0
+            if out_json.exists():
+                try:
+                    avg = json.loads(out_json.read_text()).get("avg_latency")
+                    print(f"  [hung-but-ok] {grid}/{arm} b={batch}: avg={avg:.4f}s ({dur:.1f}s, killed)")
+                    return out_json
+                except (json.JSONDecodeError, OSError):
+                    pass
+            print(f"  [TIMEOUT] {grid}/{arm} b={batch} ({dur:.1f}s)")
+            return out_json
     dur = time.perf_counter() - t0
-    if proc.returncode != 0:
+    if rc != 0:
         tail = "\n        ".join(out_log.read_text().splitlines()[-15:])
-        print(f"  [FAIL] {grid}/{arm} b={batch} rc={proc.returncode} ({dur:.1f}s)\n        {tail}")
+        print(f"  [FAIL] {grid}/{arm} b={batch} rc={rc} ({dur:.1f}s)\n        {tail}")
     else:
         avg = json.loads(out_json.read_text()).get("avg_latency")
         print(f"  [ok]  {grid}/{arm} b={batch}: avg={avg:.4f}s ({dur:.1f}s)")
@@ -155,7 +188,8 @@ def main() -> None:
     ap.add_argument("--batches", type=int, nargs="*", default=None,
                     help="Override per-grid batches (applies to all selected grids).")
     ap.add_argument("--only-arms", nargs="*", default=None,
-                    choices=["none", "prefetch_dryrun", "prefetch_real"],
+                    choices=["none", "prefetch_dryrun", "prefetch_real",
+                             "prefetch_real_unfixed"],
                     help="Restrict which arms to run (G is appended at runtime).")
     args = ap.parse_args()
 
@@ -184,8 +218,10 @@ def main() -> None:
             arms = arms_for(G)
             if args.only_arms is not None:
                 wanted_prefixes = [a for a in args.only_arms if a != "none"]
+                # Match `prefix_g{G}` exactly so e.g. "prefetch_real" doesn't
+                # also pick up "prefetch_real_unfixed_g{G}".
                 arms = {n: f for n, f in arms.items()
-                        if any(n.startswith(p) for p in wanted_prefixes)}
+                        if any(n.startswith(p + "_g") for p in wanted_prefixes)}
             for arm, flags in arms.items():
                 for B in batches:
                     run_cell(grid, arm, flags, B)
@@ -208,7 +244,8 @@ def main() -> None:
         print("-" * 88)
         rows: dict = {}
         for G in args.gs:
-            for arm_prefix in ("prefetch_dryrun", "prefetch_real"):
+            for arm_prefix in ("prefetch_dryrun", "prefetch_real",
+                               "prefetch_real_unfixed"):
                 arm = f"{arm_prefix}_g{G}"
                 row = {B: parse_avg(cell_path(grid, arm, B)) for B in batches}
                 rows[(arm_prefix, G)] = row
@@ -232,6 +269,7 @@ def main() -> None:
                 none = none_by_b[B]
                 dryrun = rows[("prefetch_dryrun", G)][B]
                 real = rows[("prefetch_real", G)][B]
+                unfixed = rows[("prefetch_real_unfixed", G)][B]
                 if None in (none, dryrun, real):
                     continue
                 orch = dryrun - none
@@ -239,9 +277,15 @@ def main() -> None:
                 gap = real - none
                 orch_pct = orch / gap if gap not in (0.0, None) and abs(gap) > 1e-6 else float("nan")
                 free_marker = "  ← FREE" if gap <= 0.05 else ""  # within 50ms noise
+                # Fix delta: how much the deferred-wraparound fix saved vs
+                # the legacy prefetch ordering at matched conditions.
+                fix_str = ""
+                if unfixed is not None:
+                    saved = unfixed - real
+                    fix_str = f"  fix Δ={saved:+.4f}s"
                 print(f"  G={G:>2} (cov {cov_pct:>5.1f}%) B={B:>2}: "
                       f"orch={orch:+.4f}s  pcie={pcie:+.4f}s  total={gap:+.4f}s "
-                      f"(orch={orch_pct:.0%}){free_marker}")
+                      f"(orch={orch_pct:.0%}){fix_str}{free_marker}")
 
         summary["grids"][grid] = {
             "input_len": spec["input_len"],

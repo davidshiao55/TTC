@@ -57,11 +57,18 @@ def offloader_flags(args: argparse.Namespace) -> list[str]:
     if args.offloader == "none":
         return []
     if args.offloader == "prefetch":
-        return [
+        flags = [
             "--offload-group-size", str(args.group_size),
             "--offload-num-in-group", str(args.num_in_group),
             "--offload-prefetch-step", str(args.prefetch_step),
         ]
+        # Toggle the deferred-wraparound fix from §0.10.5. Default in vLLM
+        # config is True (the fix); pass --no-prefetch-defer-wraparound to
+        # capture the legacy CE0-FIFO-blocked baseline for before/after
+        # trace comparison.
+        if not args.defer_wraparound:
+            flags.append("--no-prefetch-defer-wraparound")
+        return flags
     if args.offloader == "uva":
         return ["--cpu-offload-gb", str(args.cpu_offload_gb)]
     raise SystemExit(f"unknown offloader {args.offloader!r}")
@@ -71,7 +78,11 @@ def default_output_name(args: argparse.Namespace) -> str:
     if args.offloader == "none":
         return "none"
     if args.offloader == "prefetch":
-        return f"prefetch_g{args.group_size}_n{args.num_in_group}_k{args.prefetch_step}"
+        suffix = "" if args.defer_wraparound else "_unfixed"
+        return (
+            f"prefetch_g{args.group_size}_n{args.num_in_group}_"
+            f"k{args.prefetch_step}{suffix}"
+        )
     if args.offloader == "uva":
         return f"uva_{args.cpu_offload_gb}"
     raise SystemExit(f"unknown offloader {args.offloader!r}")
@@ -88,6 +99,10 @@ def main() -> None:
                     help="PrefetchOffloader num_in_group")
     ap.add_argument("-K", "--prefetch-step", type=int, default=1,
                     help="PrefetchOffloader prefetch_step (layers ahead)")
+    ap.add_argument("--no-defer", dest="defer_wraparound", action="store_false",
+                    help="Disable the §0.10.5 deferred-wraparound fix "
+                         "(captures the legacy CE0-FIFO-blocked baseline).")
+    ap.set_defaults(defer_wraparound=True)
     ap.add_argument("--cpu-offload-gb", type=float, default=4.0,
                     help="UVAOffloader cpu_offload_gb")
     # Workload
