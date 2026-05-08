@@ -310,14 +310,12 @@ All three granularities can use f_cpu to compute on CPU in parallel. But finer g
 
 ---
 
-## Implementation Note: WQKV K/V-Pin Optimization
+## Implementation Note: WQKV K/V Positioning
 
-*This is a runtime implementation detail in `CpuComputeDispatcher`, not part of the thesis-level design narrative above.*
+*This is a Planner concern, not a runtime guard.*
 
-Under the uniform per-bucket dispatch story, the Planner emits one `(f_cpu, f_prefetch)` pair applied to WQKV, MLP1, and MLP2. At runtime, `CpuComputeDispatcher` applies an optimization specifically to WQKV: the K/V portion of WQKV (the first `2 × num_kv_heads × head_dim` output columns, ordered by the K/V-biased picker) is **always CPU-computed, never prefetched**. Prefetch on WQKV only applies to Q columns above the K/V boundary.
+WQKV's CPU-stored output columns are laid out by the K/V-biased picker as `[Q_tail | K | V]` — K/V groups are assigned to CPU storage first, Q columns last. The runtime applies the dispatch table verbatim across all sub-modules (WQKV / MLP1 / MLP2): prefetch consumes the contiguous prefix of cpu_indices, CPU compute takes the residual.
 
-**Why this optimization exists.** If the per-bucket `f_cpu` lands below the K/V fraction (e.g., at 7B decode the Planner's optimum is ~1–2% while the K/V fraction is ~22%), uniform dispatch would route part of K/V through the prefetch path: weight H2D to GPU, K/V computed on GPU, K/V output D2H back to the CPU suffix cache. That's a full PCIe round-trip for K/V every forward — wasteful since CPU-computing K/V in-place produces output directly on CPU with no transfer at all. The K/V-pin guard avoids it.
+**K/V round-trip cost belongs in the Planner's objective.** If the per-bucket `f_cpu_compute` lands below the K/V fraction (the K/V portion of out_dim, e.g. ~22% of WQKV at Qwen2.5-7B), the residual K/V columns flow through the prefetch path: weight H2D to GPU, K/V computed on GPU, K/V output D2H back to the CPU suffix cache (Phase 2). That's a PCIe round-trip the Planner can avoid by biasing the WQKV-bucket cost model toward `f_cpu_compute ≥ K/V fraction`. See `planner_design.md §7.3`.
 
-**When the guard binds vs no-ops.** At `f_cpu ≥ K/V-fraction` the guard is a no-op (K/V is already CPU-computed under uniform dispatch). At `f_cpu < K/V-fraction` the guard raises WQKV's effective `f_cpu_compute` to cover K/V, with WQKV's `f_prefetch` correspondingly reduced. The Planner's cost model should account for this nudge — see `planner_design.md §7.3`.
-
-**Why this is an implementation footnote, not a design claim.** The thesis-level story is "uniform dispatch across WQKV/MLP1/MLP2." The K/V-pin guard is a small runtime optimization that happens to live inside WQKV's dispatcher without changing the design-level interface. It's documented here so readers of the implementation can reconstruct the behavior, not as part of the mechanism's contribution story.
+**Why no runtime guard.** A previous design pinned K/V to CPU compute regardless of the Planner's dispatch table. The Phase 1b benchmark sweep (`David/Benchmarks/phase1b/results/cots_prefetch_vs_native/`) showed the guard *overrides* the Planner's intent at runtime — adding unrequested CPU work at low f and large batch (e.g., +49% latency at f=0.05, B=64). The fix is to let the Planner own the routing; its cost model is responsible for the K/V round-trip avoidance, not a hardcoded runtime override.

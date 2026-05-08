@@ -1,0 +1,124 @@
+{
+  "env": {
+    "platform": "Linux-5.15.0-176-generic-x86_64-with-glibc2.35",
+    "python": "3.11.15",
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "gpu": "NVIDIA GeForce RTX 4090"
+  },
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "f_collab": 0.15,
+  "input_len": 8,
+  "output_len": 128,
+  "summary": {
+    "none": {
+      "flags": [],
+      "family": "none",
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.0342,
+          "tokens_per_s": 62.9
+        },
+        "4": {
+          "avg_latency_s": 2.1092,
+          "tokens_per_s": 242.7
+        },
+        "16": {
+          "avg_latency_s": 2.1494,
+          "tokens_per_s": 952.8
+        },
+        "64": {
+          "avg_latency_s": 2.4802,
+          "tokens_per_s": 3303.0
+        }
+      }
+    },
+    "A_per_path_cpu": {
+      "flags": [
+        "--offload-backend",
+        "cots",
+        "--cots-f-cpu-store",
+        "0.15",
+        "--cots-f-prefetch",
+        "0.0"
+      ],
+      "family": "cots",
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 8.1363,
+          "tokens_per_s": 15.7
+        },
+        "4": {
+          "avg_latency_s": 11.1987,
+          "tokens_per_s": 45.7
+        },
+        "16": {
+          "avg_latency_s": 27.934,
+          "tokens_per_s": 73.3
+        },
+        "64": {
+          "avg_latency_s": 93.8614,
+          "tokens_per_s": 87.3
+        }
+      }
+    },
+    "B_per_path_prefetch": {
+      "flags": [
+        "--offload-backend",
+        "cots",
+        "--cots-f-cpu-store",
+        "0.15",
+        "--cots-f-prefetch",
+        "0.15"
+      ],
+      "family": "cots",
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 10.0093,
+          "tokens_per_s": 12.8
+        },
+        "4": {
+          "avg_latency_s": 10.0229,
+          "tokens_per_s": 51.1
+        },
+        "16": {
+          "avg_latency_s": 10.082,
+          "tokens_per_s": 203.1
+        },
+        "64": {
+          "avg_latency_s": 10.1032,
+          "tokens_per_s": 810.8
+        }
+      }
+    },
+    "C_collaborative": {
+      "flags": [
+        "--offload-backend",
+        "cots",
+        "--cots-f-cpu-store",
+        "0.3",
+        "--cots-f-prefetch",
+        "0.15"
+      ],
+      "family": "cots",
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 11.9727,
+          "tokens_per_s": 10.7
+        },
+        "4": {
+          "avg_latency_s": 13.5908,
+          "tokens_per_s": 37.7
+        },
+        "16": {
+          "avg_latency_s": 28.9429,
+          "tokens_per_s": 70.8
+        },
+        "64": {
+          "avg_latency_s": 93.5314,
+          "tokens_per_s": 87.6
+        }
+      }
+    }
+  }
+}

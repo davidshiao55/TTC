@@ -117,7 +117,7 @@ Every CPU-stored byte is dispatched each forward — either CPU-computed or pref
 
 **MLP1↔MLP2 matched-index invariant is automatic.** Because the same `(f_cpu_compute, f_prefetch_compute)` pair applies to both MLP1 and MLP2, and `f_cpu_store_m` is uniform across them, the col→row pipelining's index-matching requirement (MLP1's CPU output columns must equal MLP2's CPU input columns) is satisfied by construction — not an enforced Planner constraint, just a consequence of uniform dispatch.
 
-**WQKV K/V-pin is an implementation detail.** The runtime `CpuComputeDispatcher` pins WQKV's K/V portion to the CPU-compute path (prefetch on WQKV only covers Q columns above the K/V boundary). This avoids K/V-output PCIe round-trips when the per-bucket `f_cpu_compute` lands below the K/V fraction. The Planner's cost model in §7.3 accounts for the round-trip nudge; from the dispatch-table perspective the Planner still emits a single uniform pair and the K/V-pin guard lives inside the dispatcher. See `weight_offload_design.md §Implementation Note: WQKV K/V-Pin Optimization`.
+**WQKV K/V positioning is the Planner's responsibility.** The runtime applies the dispatch table verbatim across all sub-modules; there is no K/V-pin override. To avoid K/V-output PCIe round-trips when the per-bucket `f_cpu_compute` lands below the K/V fraction, the Planner's cost model (§7.3) charges the round-trip and naturally biases toward `f_cpu_compute ≥ K/V fraction` when the budget allows. See `weight_offload_design.md §Implementation Note: WQKV K/V Positioning`.
 
 ### 4.3 Eager-fallback entry
 
@@ -276,7 +276,7 @@ Because CPU μs/MB is uniform across WQKV/MLP1/MLP2 (`phase0_findings.md §0.3.4
 
 **Layer-ahead prefetch feasibility check**: the total prefetch per layer is `f_prefetch × Σ_m W_m` (sum over {WQKV, MLP1, MLP2}). Cap `f_prefetch` if it exceeds `layer_time × pcie_h2d_bw`; excess falls back to `f_cpu`.
 
-**WQKV K/V round-trip cost**: the Planner's objective must account for the round-trip when `f_cpu` falls below WQKV's K/V-fraction (see `weight_offload_design.md §Implementation Note`). Concretely, subtract `max(0, K/V-fraction − f_cpu) × W_WQKV` bytes from the effective prefetch budget for the MLP block — this nudges the optimum toward `f_cpu ≥ K/V-fraction` when PCIe budget is tight, since sitting below wastes budget on a round-trip the K/V-pin guard would otherwise avoid.
+**WQKV K/V round-trip cost**: when `f_cpu` falls below WQKV's K/V-fraction, the residual K/V columns flow through prefetch — incurring a Phase 2 D2H back to the CPU suffix cache after K/V is computed on GPU. The Planner's objective charges this round-trip explicitly: subtract `max(0, K/V-fraction − f_cpu) × W_WQKV` bytes from the effective prefetch budget for the MLP block. This nudges the optimum toward `f_cpu ≥ K/V-fraction` when PCIe budget is tight, *via the cost model* — there is no runtime K/V-pin override; the dispatch table is applied verbatim. See `weight_offload_design.md §Implementation Note: WQKV K/V Positioning`.
 
 This is a dispatch heuristic, not a full optimization — sufficient given the Planner's objective smoothness and the uniform-CPU finding that eliminates per-sub-module variation. Ablation: compare the heuristic against per-bucket search on a small problem to verify it's near-optimal.
 
