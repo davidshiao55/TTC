@@ -75,16 +75,17 @@ def offloader_flags(args: argparse.Namespace) -> list[str]:
 
 
 def default_output_name(args: argparse.Namespace) -> str:
+    mode_tag = "graph" if args.graph else "eager"
     if args.offloader == "none":
-        return "none"
+        return f"none_{mode_tag}"
     if args.offloader == "prefetch":
-        suffix = "" if args.defer_wraparound else "_unfixed"
+        defer_tag = "fixed" if args.defer_wraparound else "unfixed"
         return (
             f"prefetch_g{args.group_size}_n{args.num_in_group}_"
-            f"k{args.prefetch_step}{suffix}"
+            f"k{args.prefetch_step}_{mode_tag}_{defer_tag}"
         )
     if args.offloader == "uva":
-        return f"uva_{args.cpu_offload_gb}"
+        return f"uva_{args.cpu_offload_gb}_{mode_tag}"
     raise SystemExit(f"unknown offloader {args.offloader!r}")
 
 
@@ -103,6 +104,9 @@ def main() -> None:
                     help="Disable the §0.10.5 deferred-wraparound fix "
                          "(captures the legacy CE0-FIFO-blocked baseline).")
     ap.set_defaults(defer_wraparound=True)
+    ap.add_argument("--graph", action="store_true",
+                    help="Drop --enforce-eager so vLLM captures and replays "
+                         "CUDA graphs (required to study sync_prev_onload).")
     ap.add_argument("--cpu-offload-gb", type=float, default=4.0,
                     help="UVAOffloader cpu_offload_gb")
     # Workload
@@ -146,7 +150,7 @@ def main() -> None:
         "--batch-size", str(args.batch_size),
         "--num-iters-warmup", str(args.num_iters_warmup),
         "--num-iters", str(args.num_iters),
-        "--enforce-eager",
+        *([] if args.graph else ["--enforce-eager"]),
         *flags,
     ]
     env = {**os.environ, "VLLM_WORKER_MULTIPROC_METHOD": "spawn"}

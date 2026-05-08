@@ -476,7 +476,7 @@ Two complementary regimes were measured:
 - **§1.13a — Prefill-heavy** (input=256, output=32, batches {1, 16, 64}): inherited from Phase 0 §0.10's setup. CPU work is dominated by prefill (8:1 prefill:decode ratio). The "worst case" for COTS — well outside §0.3.3's "free regime" — but useful as a documented bound.
 - **§1.13b — Decode-heavy** (input=8, output=128, batches {1, 4, 16}): the regime COTS is designed for per `thesis_proposal.md` (FastTTS / TTC: short prompts, decode-dominated, small batch). Prefill:decode CPU ratio is ≤ 0.4% across all batches.
 
-Both regimes use the **densest-spread N=1 G-varies prefetch baseline** from §0.10.1(b) (the strongest possible prefetch reference at each offload depth). UVA omitted per Phase 0 §0.10 finding 3.
+Both regimes use the **densest-spread N=1 G-varies prefetch baseline** from §0.10.3(b) (the canonical divisor-G reference at each offload depth; superseded as "best stock" by §0.10.2's broader (G, N) parameter search but retained here for historical continuity). UVA omitted per Phase 0 §0.10 finding 3.
 
 ### 1.13a: Prefill-heavy regime
 

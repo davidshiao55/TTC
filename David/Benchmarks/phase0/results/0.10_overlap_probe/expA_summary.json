@@ -1,0 +1,280 @@
+{
+  "cells": [
+    {
+      "G": 28,
+      "arm": "eager_unfixed",
+      "avg_latency_s": 1.0971648044651374,
+      "sync_breakdown": {
+        "syncType2": {
+          "count": 317,
+          "avg_ms": 25.895074201892744,
+          "sum_s": 8.208738522,
+          "max_ms": 34.475524
+        },
+        "syncType3": {
+          "count": 7,
+          "avg_ms": 5.183311,
+          "sum_s": 0.036283177,
+          "max_ms": 11.366228
+        }
+      }
+    },
+    {
+      "G": 28,
+      "arm": "graph_unfixed",
+      "avg_latency_s": 1.1346009145199787,
+      "sync_breakdown": {
+        "syncType1": {
+          "count": 130,
+          "avg_ms": 34.83106998461538,
+          "sum_s": 4.528039098,
+          "max_ms": 632.775391
+        },
+        "syncType2": {
+          "count": 160,
+          "avg_ms": 35.230134318750004,
+          "sum_s": 5.636821491,
+          "max_ms": 35.528302
+        },
+        "syncType3": {
+          "count": 7,
+          "avg_ms": 5.184255428571428,
+          "sum_s": 0.036289788,
+          "max_ms": 11.411971
+        }
+      }
+    },
+    {
+      "G": 28,
+      "arm": "graph_fixed",
+      "avg_latency_s": 0.812165127514163,
+      "sync_breakdown": {
+        "syncType1": {
+          "count": 89,
+          "avg_ms": 17.891980808988766,
+          "sum_s": 1.592386292,
+          "max_ms": 45.063413
+        },
+        "syncType2": {
+          "count": 160,
+          "avg_ms": 24.99968291875,
+          "sum_s": 3.999949267,
+          "max_ms": 34.651325
+        },
+        "syncType3": {
+          "count": 7,
+          "avg_ms": 5.169027285714286,
+          "sum_s": 0.036183191,
+          "max_ms": 11.355565
+        }
+      }
+    },
+    {
+      "G": 14,
+      "arm": "eager_unfixed",
+      "avg_latency_s": 1.5022767875052523,
+      "sync_breakdown": {
+        "syncType2": {
+          "count": 317,
+          "avg_ms": 32.26530368769716,
+          "sum_s": 10.228101269,
+          "max_ms": 47.177077
+        },
+        "syncType3": {
+          "count": 16,
+          "avg_ms": 4.6632775,
+          "sum_s": 0.07461244,
+          "max_ms": 11.354435
+        }
+      }
+    },
+    {
+      "G": 14,
+      "arm": "graph_unfixed",
+      "avg_latency_s": 1.5601741750142537,
+      "sync_breakdown": {
+        "syncType1": {
+          "count": 89,
+          "avg_ms": 45.80827905617978,
+          "sum_s": 4.076936836,
+          "max_ms": 58.445693
+        },
+        "syncType2": {
+          "count": 160,
+          "avg_ms": 48.54560694375,
+          "sum_s": 7.767297111,
+          "max_ms": 51.973491
+        },
+        "syncType3": {
+          "count": 15,
+          "avg_ms": 4.895187133333334,
+          "sum_s": 0.073427807,
+          "max_ms": 11.338915
+        }
+      }
+    },
+    {
+      "G": 14,
+      "arm": "graph_fixed",
+      "avg_latency_s": 1.5123396904964466,
+      "sync_breakdown": {
+        "syncType1": {
+          "count": 89,
+          "avg_ms": 33.22775321348315,
+          "sum_s": 2.957270036,
+          "max_ms": 50.513354
+        },
+        "syncType2": {
+          "count": 160,
+          "avg_ms": 46.90757846875,
+          "sum_s": 7.505212555,
+          "max_ms": 54.748692
+        },
+        "syncType3": {
+          "count": 14,
+          "avg_ms": 5.174069642857143,
+          "sum_s": 0.072436975,
+          "max_ms": 11.340639
+        }
+      }
+    },
+    {
+      "G": 4,
+      "arm": "eager_unfixed",
+      "avg_latency_s": 4.5393529444991145,
+      "sync_breakdown": {
+        "syncType2": {
+          "count": 317,
+          "avg_ms": 79.83584947318612,
+          "sum_s": 25.307964283,
+          "max_ms": 142.064362
+        },
+        "syncType3": {
+          "count": 51,
+          "avg_ms": 5.017789784313726,
+          "sum_s": 0.255907279,
+          "max_ms": 11.431114
+        }
+      }
+    },
+    {
+      "G": 4,
+      "arm": "graph_unfixed",
+      "avg_latency_s": 5.115964402997633,
+      "sync_breakdown": {
+        "syncType1": {
+          "count": 89,
+          "avg_ms": 142.00600598876406,
+          "sum_s": 12.638534533,
+          "max_ms": 154.407635
+        },
+        "syncType2": {
+          "count": 160,
+          "avg_ms": 159.8228338,
+          "sum_s": 25.571653408,
+          "max_ms": 203.913387
+        },
+        "syncType3": {
+          "count": 52,
+          "avg_ms": 4.941323942307692,
+          "sum_s": 0.256948845,
+          "max_ms": 11.364406
+        }
+      }
+    },
+    {
+      "G": 4,
+      "arm": "graph_fixed",
+      "avg_latency_s": 5.09721545749926,
+      "sync_breakdown": {
+        "syncType1": {
+          "count": 89,
+          "avg_ms": 137.01410180898876,
+          "sum_s": 12.194255061,
+          "max_ms": 147.947628
+        },
+        "syncType2": {
+          "count": 160,
+          "avg_ms": 158.94779878125,
+          "sum_s": 25.431647805,
+          "max_ms": 210.280186
+        },
+        "syncType3": {
+          "count": 51,
+          "avg_ms": 5.010362666666667,
+          "sum_s": 0.255528496,
+          "max_ms": 11.370182
+        }
+      }
+    },
+    {
+      "G": 1,
+      "arm": "eager_unfixed",
+      "avg_latency_s": 17.945283711509546,
+      "sync_breakdown": {
+        "syncType2": {
+          "count": 317,
+          "avg_ms": 289.8186438201893,
+          "sum_s": 91.872510091,
+          "max_ms": 561.285787
+        },
+        "syncType3": {
+          "count": 202,
+          "avg_ms": 5.06140303960396,
+          "sum_s": 1.022403414,
+          "max_ms": 11.388266
+        }
+      }
+    },
+    {
+      "G": 1,
+      "arm": "graph_unfixed",
+      "avg_latency_s": 17.978701842483133,
+      "sync_breakdown": {
+        "syncType1": {
+          "count": 98,
+          "avg_ms": 509.48012113265304,
+          "sum_s": 49.929051871,
+          "max_ms": 580.314869
+        },
+        "syncType2": {
+          "count": 160,
+          "avg_ms": 561.46937165625,
+          "sum_s": 89.835099465,
+          "max_ms": 562.211701
+        },
+        "syncType3": {
+          "count": 202,
+          "avg_ms": 5.057790227722772,
+          "sum_s": 1.021673626,
+          "max_ms": 11.420418
+        }
+      }
+    },
+    {
+      "G": 1,
+      "arm": "graph_fixed",
+      "avg_latency_s": 17.99656180801685,
+      "sync_breakdown": {
+        "syncType1": {
+          "count": 89,
+          "avg_ms": 557.1661496067416,
+          "sum_s": 49.587787315,
+          "max_ms": 578.672295
+        },
+        "syncType2": {
+          "count": 160,
+          "avg_ms": 561.94960050625,
+          "sum_s": 89.911936081,
+          "max_ms": 565.577003
+        },
+        "syncType3": {
+          "count": 200,
+          "avg_ms": 5.092470495,
+          "sum_s": 1.018494099,
+          "max_ms": 11.48278
+        }
+      }
+    }
+  ]
+}

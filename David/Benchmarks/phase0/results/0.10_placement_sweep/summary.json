@@ -1,0 +1,50 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "config": {
+    "input_len": 8,
+    "output_len": 32,
+    "batch_size": 1,
+    "warmup_iters": 2,
+    "bench_iters": 3,
+    "G": 4,
+    "N": 1,
+    "K": 1
+  },
+  "cells": {
+    "offset0_unfixed": {
+      "offset": 0,
+      "defer_wraparound": false,
+      "last_offloaded_layer": 27,
+      "tail_layers": 0,
+      "avg_latency_s": 4.539629708665113
+    },
+    "offset1_unfixed": {
+      "offset": 1,
+      "defer_wraparound": false,
+      "last_offloaded_layer": 24,
+      "tail_layers": 3,
+      "avg_latency_s": 4.492115040348533
+    },
+    "offset2_unfixed": {
+      "offset": 2,
+      "defer_wraparound": false,
+      "last_offloaded_layer": 25,
+      "tail_layers": 2,
+      "avg_latency_s": 4.5063477899918025
+    },
+    "offset3_unfixed": {
+      "offset": 3,
+      "defer_wraparound": false,
+      "last_offloaded_layer": 26,
+      "tail_layers": 1,
+      "avg_latency_s": 4.521590750994316
+    },
+    "offset0_fixed": {
+      "offset": 0,
+      "defer_wraparound": true,
+      "last_offloaded_layer": 27,
+      "tail_layers": 0,
+      "avg_latency_s": 4.531694371330862
+    }
+  }
+}

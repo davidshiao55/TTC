@@ -1,0 +1,45 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "config": {
+    "input_len": 8,
+    "output_len": 32,
+    "batch_size": 1,
+    "warmup_iters": 3,
+    "bench_iters": 2,
+    "threshold_ms": 1.0
+  },
+  "cells": [
+    {
+      "G": 28,
+      "label": "alpha_eager_noUVA",
+      "eager": true,
+      "uva_input_prep": false,
+      "avg_latency_s": 1.0965093254926614,
+      "sync_breakdown": {}
+    },
+    {
+      "G": 28,
+      "label": "beta_graph_UVA",
+      "eager": false,
+      "uva_input_prep": true,
+      "avg_latency_s": 1.136386461002985,
+      "sync_breakdown": {}
+    },
+    {
+      "G": 28,
+      "label": "gamma_graph_noUVA",
+      "eager": false,
+      "uva_input_prep": false,
+      "avg_latency_s": 1.1344198354927357,
+      "sync_breakdown": {}
+    },
+    {
+      "G": 28,
+      "label": "delta_eager_UVA",
+      "eager": true,
+      "uva_input_prep": true,
+      "avg_latency_s": 0.642514081497211,
+      "sync_breakdown": {}
+    }
+  ]
+}

@@ -1,0 +1,1976 @@
+{
+  "schema_version": 1,
+  "section": "0.10.2",
+  "hardware_id": "nvidiageforcertx4090_x86_64",
+  "model": {
+    "name": "Qwen/Qwen2.5-7B-Instruct",
+    "dtype": "bfloat16"
+  },
+  "env": {
+    "platform": "Linux-5.15.0-177-generic-x86_64-with-glibc2.35",
+    "python": "3.11.15",
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "gpu": "NVIDIA GeForce RTX 4090"
+  },
+  "config": {
+    "input_len": 256,
+    "output_len": 32,
+    "warmup_iters": 2,
+    "bench_iters": 3,
+    "per_layer_decoder_bytes": 466092032,
+    "num_layers": 28
+  },
+  "arms": [
+    {
+      "name": "L1_G15_N1_K1",
+      "G": 15,
+      "N": 1,
+      "K": 1,
+      "L": 1,
+      "offloaded_layers": [
+        14
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 0.4341,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 0.8835673433495685
+        },
+        "16": {
+          "avg_latency_s": 1.2293222926667415
+        },
+        "64": {
+          "avg_latency_s": 2.3201690656663536
+        }
+      }
+    },
+    {
+      "name": "L1_G18_N1_K1",
+      "G": 18,
+      "N": 1,
+      "K": 1,
+      "L": 1,
+      "offloaded_layers": [
+        17
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 0.4341,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 0.9342159483348951
+        },
+        "16": {
+          "avg_latency_s": 1.2804764653331706
+        },
+        "64": {
+          "avg_latency_s": 2.387488082333524
+        }
+      }
+    },
+    {
+      "name": "L1_G20_N1_K1",
+      "G": 20,
+      "N": 1,
+      "K": 1,
+      "L": 1,
+      "offloaded_layers": [
+        19
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 0.4341,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 0.9681264706693279
+        },
+        "16": {
+          "avg_latency_s": 1.315890512999734
+        },
+        "64": {
+          "avg_latency_s": 2.4238555793335763
+        }
+      }
+    },
+    {
+      "name": "L1_G23_N1_K1",
+      "G": 23,
+      "N": 1,
+      "K": 1,
+      "L": 1,
+      "offloaded_layers": [
+        22
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 0.4341,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 1.0189474013168365
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L1_G25_N1_K1",
+      "G": 25,
+      "N": 1,
+      "K": 1,
+      "L": 1,
+      "offloaded_layers": [
+        24
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 0.4341,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 1.0531074216705747
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L1_G28_N1_K1",
+      "G": 28,
+      "N": 1,
+      "K": 1,
+      "L": 1,
+      "offloaded_layers": [
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 0.4341,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 1.1048313576805715
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L2_G10_N1_K1",
+      "G": 10,
+      "N": 1,
+      "K": 1,
+      "L": 2,
+      "offloaded_layers": [
+        9,
+        19
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 0.8682,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 1.4375706916713777
+        },
+        "16": {
+          "avg_latency_s": 1.768987594000161
+        },
+        "64": {
+          "avg_latency_s": 2.8501982136664687
+        }
+      }
+    },
+    {
+      "name": "L2_G14_N1_K1",
+      "G": 14,
+      "N": 1,
+      "K": 1,
+      "L": 2,
+      "offloaded_layers": [
+        13,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 0.8682,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 1.5065017093438655
+        },
+        "16": {
+          "avg_latency_s": 1.8607192850001109
+        },
+        "64": {
+          "avg_latency_s": 2.9788828166668586
+        }
+      }
+    },
+    {
+      "name": "L2_G17_N2_K1",
+      "G": 17,
+      "N": 2,
+      "K": 1,
+      "L": 2,
+      "offloaded_layers": [
+        15,
+        16
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 0.8682,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 1.5398470996685016
+        },
+        "16": {
+          "avg_latency_s": 1.901918962333184
+        },
+        "64": {
+          "avg_latency_s": 3.0210726193333053
+        }
+      }
+    },
+    {
+      "name": "L2_G21_N2_K1",
+      "G": 21,
+      "N": 2,
+      "K": 1,
+      "L": 2,
+      "offloaded_layers": [
+        19,
+        20
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 0.8682,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 1.6084180056738357
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L2_G24_N2_K1",
+      "G": 24,
+      "N": 2,
+      "K": 1,
+      "L": 2,
+      "offloaded_layers": [
+        22,
+        23
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 0.8682,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 1.6596707763383165
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L2_G28_N2_K1",
+      "G": 28,
+      "N": 2,
+      "K": 1,
+      "L": 2,
+      "offloaded_layers": [
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 0.8682,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 1.72794042933189
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L3_G8_N1_K1",
+      "G": 8,
+      "N": 1,
+      "K": 1,
+      "L": 3,
+      "offloaded_layers": [
+        7,
+        15,
+        23
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 1.3022,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.0443272149811187
+        },
+        "16": {
+          "avg_latency_s": 2.353611220666911
+        },
+        "64": {
+          "avg_latency_s": 3.4577376776669553
+        }
+      }
+    },
+    {
+      "name": "L3_G17_N3_K1",
+      "G": 17,
+      "N": 3,
+      "K": 1,
+      "L": 3,
+      "offloaded_layers": [
+        14,
+        15,
+        16
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 1.3022,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.1627967356471345
+        },
+        "16": {
+          "avg_latency_s": 2.5427831343334524
+        },
+        "64": {
+          "avg_latency_s": 3.6780760136671233
+        }
+      }
+    },
+    {
+      "name": "L3_G20_N3_K1",
+      "G": 20,
+      "N": 3,
+      "K": 1,
+      "L": 3,
+      "offloaded_layers": [
+        17,
+        18,
+        19
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 1.3022,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.2157152666865536
+        },
+        "16": {
+          "avg_latency_s": 2.5946729826664523
+        },
+        "64": {
+          "avg_latency_s": 3.7393075610001083
+        }
+      }
+    },
+    {
+      "name": "L3_G22_N3_K1",
+      "G": 22,
+      "N": 3,
+      "K": 1,
+      "L": 3,
+      "offloaded_layers": [
+        19,
+        20,
+        21
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 1.3022,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.2500369289967543
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L3_G25_N3_K1",
+      "G": 25,
+      "N": 3,
+      "K": 1,
+      "L": 3,
+      "offloaded_layers": [
+        22,
+        23,
+        24
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 1.3022,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.3012657006426402
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L3_G28_N3_K1",
+      "G": 28,
+      "N": 3,
+      "K": 1,
+      "L": 3,
+      "offloaded_layers": [
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 1.3022,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.3519860093365423
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L4_G6_N1_K1",
+      "G": 6,
+      "N": 1,
+      "K": 1,
+      "L": 4,
+      "offloaded_layers": [
+        5,
+        11,
+        17,
+        23
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 1.7363,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.651880761317443
+        },
+        "16": {
+          "avg_latency_s": 2.9459281740000733
+        },
+        "64": {
+          "avg_latency_s": 4.023932057333089
+        }
+      }
+    },
+    {
+      "name": "L4_G12_N2_K1",
+      "G": 12,
+      "N": 2,
+      "K": 1,
+      "L": 4,
+      "offloaded_layers": [
+        10,
+        11,
+        22,
+        23
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 1.7363,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.7353946606550985
+        },
+        "16": {
+          "avg_latency_s": 3.0994412936664353
+        },
+        "64": {
+          "avg_latency_s": 4.231579005333212
+        }
+      }
+    },
+    {
+      "name": "L4_G16_N4_K1",
+      "G": 16,
+      "N": 4,
+      "K": 1,
+      "L": 4,
+      "offloaded_layers": [
+        12,
+        13,
+        14,
+        15
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 1.7363,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.7721915453633605
+        },
+        "16": {
+          "avg_latency_s": 3.1679045973332904
+        },
+        "64": {
+          "avg_latency_s": 4.315141943666579
+        }
+      }
+    },
+    {
+      "name": "L4_G20_N4_K1",
+      "G": 20,
+      "N": 4,
+      "K": 1,
+      "L": 4,
+      "offloaded_layers": [
+        16,
+        17,
+        18,
+        19
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 1.7363,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.8397747670145086
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L4_G24_N4_K1",
+      "G": 24,
+      "N": 4,
+      "K": 1,
+      "L": 4,
+      "offloaded_layers": [
+        20,
+        21,
+        22,
+        23
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 1.7363,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.9080564943530285
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L4_G28_N4_K1",
+      "G": 28,
+      "N": 4,
+      "K": 1,
+      "L": 4,
+      "offloaded_layers": [
+        24,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 1.7363,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 2.9774482436672165
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L5_G5_N1_K1",
+      "G": 5,
+      "N": 1,
+      "K": 1,
+      "L": 5,
+      "offloaded_layers": [
+        4,
+        9,
+        14,
+        19,
+        24
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 2.1704,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 3.2758007783365124
+        },
+        "16": {
+          "avg_latency_s": 3.553381955000077
+        },
+        "64": {
+          "avg_latency_s": 4.676445783333293
+        }
+      }
+    },
+    {
+      "name": "L5_G18_N5_K1",
+      "G": 18,
+      "N": 5,
+      "K": 1,
+      "L": 5,
+      "offloaded_layers": [
+        13,
+        14,
+        15,
+        16,
+        17
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 2.1704,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 3.4291827283450402
+        },
+        "16": {
+          "avg_latency_s": 3.8485925770000904
+        },
+        "64": {
+          "avg_latency_s": 5.016738953666693
+        }
+      }
+    },
+    {
+      "name": "L5_G21_N5_K1",
+      "G": 21,
+      "N": 5,
+      "K": 1,
+      "L": 5,
+      "offloaded_layers": [
+        16,
+        17,
+        18,
+        19,
+        20
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 2.1704,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 3.4804676206355603
+        },
+        "16": {
+          "avg_latency_s": 3.8975774706668744
+        },
+        "64": {
+          "avg_latency_s": 5.07642342800015
+        }
+      }
+    },
+    {
+      "name": "L5_G23_N5_K1",
+      "G": 23,
+      "N": 5,
+      "K": 1,
+      "L": 5,
+      "offloaded_layers": [
+        18,
+        19,
+        20,
+        21,
+        22
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 2.1704,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 3.5153523626698493
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L5_G26_N5_K1",
+      "G": 26,
+      "N": 5,
+      "K": 1,
+      "L": 5,
+      "offloaded_layers": [
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 2.1704,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 3.5657460163347423
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L5_G28_N5_K1",
+      "G": 28,
+      "N": 5,
+      "K": 1,
+      "L": 5,
+      "offloaded_layers": [
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 2.1704,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 3.5946049916674383
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L7_G4_N1_K1",
+      "G": 4,
+      "N": 1,
+      "K": 1,
+      "L": 7,
+      "offloaded_layers": [
+        3,
+        7,
+        11,
+        15,
+        19,
+        23,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 3.0386,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 4.536974726322417
+        },
+        "16": {
+          "avg_latency_s": 4.8484792486666874
+        },
+        "64": {
+          "avg_latency_s": 5.9516490259999655
+        }
+      }
+    },
+    {
+      "name": "L7_G18_N7_K1",
+      "G": 18,
+      "N": 7,
+      "K": 1,
+      "L": 7,
+      "offloaded_layers": [
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 3.0386,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 4.6723724520027945
+        },
+        "16": {
+          "avg_latency_s": 5.126903703000001
+        },
+        "64": {
+          "avg_latency_s": 6.339612233666533
+        }
+      }
+    },
+    {
+      "name": "L7_G21_N7_K1",
+      "G": 21,
+      "N": 7,
+      "K": 1,
+      "L": 7,
+      "offloaded_layers": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 3.0386,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 4.729329727337851
+        },
+        "16": {
+          "avg_latency_s": 5.182135627666564
+        },
+        "64": {
+          "avg_latency_s": 6.397369518334017
+        }
+      }
+    },
+    {
+      "name": "L7_G23_N7_K1",
+      "G": 23,
+      "N": 7,
+      "K": 1,
+      "L": 7,
+      "offloaded_layers": [
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 3.0386,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 4.762420938001014
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L7_G26_N7_K1",
+      "G": 26,
+      "N": 7,
+      "K": 1,
+      "L": 7,
+      "offloaded_layers": [
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 3.0386,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 4.813888808324312
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L7_G28_N7_K1",
+      "G": 28,
+      "N": 7,
+      "K": 1,
+      "L": 7,
+      "offloaded_layers": [
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 3.0386,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 4.839363693996954
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L10_G5_N2_K1",
+      "G": 5,
+      "N": 2,
+      "K": 1,
+      "L": 10,
+      "offloaded_layers": [
+        3,
+        4,
+        8,
+        9,
+        13,
+        14,
+        18,
+        19,
+        23,
+        24
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 4.3408,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 6.462421005999204
+        },
+        "16": {
+          "avg_latency_s": 6.861851342666644
+        },
+        "64": {
+          "avg_latency_s": 8.032866283999587
+        }
+      }
+    },
+    {
+      "name": "L10_G13_N5_K1",
+      "G": 13,
+      "N": 5,
+      "K": 1,
+      "L": 10,
+      "offloaded_layers": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 4.3408,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 6.548352105333227
+        },
+        "16": {
+          "avg_latency_s": 7.030514977999701
+        },
+        "64": {
+          "avg_latency_s": 8.272684092999649
+        }
+      }
+    },
+    {
+      "name": "L10_G17_N8_K1",
+      "G": 17,
+      "N": 8,
+      "K": 1,
+      "L": 10,
+      "offloaded_layers": [
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 4.3408,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 6.566955290333378
+        },
+        "16": {
+          "avg_latency_s": 7.07393428999967
+        },
+        "64": {
+          "avg_latency_s": 8.336499734333605
+        }
+      }
+    },
+    {
+      "name": "L10_G20_N10_K1",
+      "G": 20,
+      "N": 10,
+      "K": 1,
+      "L": 10,
+      "offloaded_layers": [
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 4.3408,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 6.579948007666796
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L10_G24_N10_K1",
+      "G": 24,
+      "N": 10,
+      "K": 1,
+      "L": 10,
+      "offloaded_layers": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 4.3408,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 6.645100604000011
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L10_G28_N10_K1",
+      "G": 28,
+      "N": 10,
+      "K": 1,
+      "L": 10,
+      "offloaded_layers": [
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 4.3408,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 6.717756599666548
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L14_G2_N1_K1",
+      "G": 2,
+      "N": 1,
+      "K": 1,
+      "L": 14,
+      "offloaded_layers": [
+        1,
+        3,
+        5,
+        7,
+        9,
+        11,
+        13,
+        15,
+        17,
+        19,
+        21,
+        23,
+        25,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 6.0771,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 8.989729423000275
+        },
+        "16": {
+          "avg_latency_s": 9.450179816000249
+        },
+        "64": {
+          "avg_latency_s": 10.44315879999946
+        }
+      }
+    },
+    {
+      "name": "L14_G14_N7_K1",
+      "G": 14,
+      "N": 7,
+      "K": 1,
+      "L": 14,
+      "offloaded_layers": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 6.0771,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 9.09278174100018
+        },
+        "16": {
+          "avg_latency_s": 9.679319073666798
+        },
+        "64": {
+          "avg_latency_s": 11.035195348667912
+        }
+      }
+    },
+    {
+      "name": "L14_G17_N10_K1",
+      "G": 17,
+      "N": 10,
+      "K": 1,
+      "L": 14,
+      "offloaded_layers": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        24,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 6.0771,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 9.093488566999744
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L14_G21_N14_K1",
+      "G": 21,
+      "N": 14,
+      "K": 1,
+      "L": 14,
+      "offloaded_layers": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 6.0771,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 9.081489876333157
+        },
+        "16": {
+          "avg_latency_s": 9.682784618666423
+        },
+        "64": {
+          "avg_latency_s": 11.030704617332958
+        }
+      }
+    },
+    {
+      "name": "L14_G24_N14_K1",
+      "G": 24,
+      "N": 14,
+      "K": 1,
+      "L": 14,
+      "offloaded_layers": [
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 6.0771,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 9.133933756666616
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L14_G28_N14_K1",
+      "G": 28,
+      "N": 14,
+      "K": 1,
+      "L": 14,
+      "offloaded_layers": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 6.0771,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 9.209737816333472
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L21_G4_N3_K1",
+      "G": 4,
+      "N": 3,
+      "K": 1,
+      "L": 21,
+      "offloaded_layers": [
+        1,
+        2,
+        3,
+        5,
+        6,
+        7,
+        9,
+        10,
+        11,
+        13,
+        14,
+        15,
+        17,
+        18,
+        19,
+        21,
+        22,
+        23,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 9.1157,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 13.475239130999702
+        },
+        "16": {
+          "avg_latency_s": 14.153725443333315
+        },
+        "64": {
+          "avg_latency_s": 15.482041925334974
+        }
+      }
+    },
+    {
+      "name": "L21_G9_N7_K1",
+      "G": 9,
+      "N": 7,
+      "K": 1,
+      "L": 21,
+      "offloaded_layers": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 9.1157,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 13.490595442999924
+        },
+        "16": {
+          "avg_latency_s": 14.178303408333099
+        },
+        "64": {
+          "avg_latency_s": 15.613250352666606
+        }
+      }
+    },
+    {
+      "name": "L21_G25_N21_K1",
+      "G": 25,
+      "N": 21,
+      "K": 1,
+      "L": 21,
+      "offloaded_layers": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 9.1157,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 13.526338396333509
+        },
+        "16": {
+          "avg_latency_s": 14.257251803999983
+        },
+        "64": {
+          "avg_latency_s": 15.738725140665338
+        }
+      }
+    },
+    {
+      "name": "L21_G26_N21_K1",
+      "G": 26,
+      "N": 21,
+      "K": 1,
+      "L": 21,
+      "offloaded_layers": [
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 9.1157,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 13.54361718766692
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L21_G27_N21_K1",
+      "G": 27,
+      "N": 21,
+      "K": 1,
+      "L": 21,
+      "offloaded_layers": [
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26
+      ],
+      "includes_final_layer": false,
+      "saved_GiB": 9.1157,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 13.561556038999697
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L21_G28_N21_K1",
+      "G": 28,
+      "N": 21,
+      "K": 1,
+      "L": 21,
+      "offloaded_layers": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 9.1157,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 13.562978683666794
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L28_G1_N1_K1",
+      "G": 1,
+      "N": 1,
+      "K": 1,
+      "L": 28,
+      "offloaded_layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 12.1543,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 17.94103738099966
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L28_G6_N6_K1",
+      "G": 6,
+      "N": 6,
+      "K": 1,
+      "L": 28,
+      "offloaded_layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 12.1543,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 17.946167397333436
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    },
+    {
+      "name": "L28_G12_N12_K1",
+      "G": 12,
+      "N": 12,
+      "K": 1,
+      "L": 28,
+      "offloaded_layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 12.1543,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 17.933843739000014
+        },
+        "16": {
+          "avg_latency_s": 18.836221910333432
+        },
+        "64": {
+          "avg_latency_s": 20.47448962433312
+        }
+      }
+    },
+    {
+      "name": "L28_G17_N17_K1",
+      "G": 17,
+      "N": 17,
+      "K": 1,
+      "L": 28,
+      "offloaded_layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 12.1543,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 17.938283902666626
+        },
+        "16": {
+          "avg_latency_s": 18.83642513966667
+        },
+        "64": {
+          "avg_latency_s": 20.47737235700212
+        }
+      }
+    },
+    {
+      "name": "L28_G23_N23_K1",
+      "G": 23,
+      "N": 23,
+      "K": 1,
+      "L": 28,
+      "offloaded_layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 12.1543,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 17.939839250333534
+        },
+        "16": {
+          "avg_latency_s": 18.83630958366666
+        },
+        "64": {
+          "avg_latency_s": 20.47609533466554
+        }
+      }
+    },
+    {
+      "name": "L28_G28_N28_K1",
+      "G": 28,
+      "N": 28,
+      "K": 1,
+      "L": 28,
+      "offloaded_layers": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "includes_final_layer": true,
+      "saved_GiB": 12.1543,
+      "buffer_pool_GiB": 0.4341,
+      "by_batch": {
+        "1": {
+          "avg_latency_s": 17.941628483333563
+        },
+        "16": {
+          "avg_latency_s": null
+        },
+        "64": {
+          "avg_latency_s": null
+        }
+      }
+    }
+  ]
+}

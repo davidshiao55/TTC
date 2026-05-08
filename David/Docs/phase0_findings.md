@@ -791,9 +791,10 @@ Both disabled is the apples-to-apples comparison. Re-enabling V1 offload for the
 
 ## 0.10: vLLM native weight offloader baseline (decode-step latency)
 
-§0.8/0.9 covered the V1 *KV* offload. This section measures the two stock vLLM *weight* offloaders, which are the natural reference points the COTS thesis claims to outperform:
+§0.8/0.9 covered the V1 *KV* offload. This section measures the shipped vLLM *weight* offloaders, and also records the thesis-only native-prefetch variant used as an optimized reference point:
 
-- **`PrefetchOffloader`** (`vllm/model_executor/offloader/prefetch.py`) — group-granularity, multi-layer-ahead prefetch with a static GPU buffer pool and event-driven CUDA-graph compatibility. Tunable knobs: `offload_group_size` (G), `offload_num_in_group` (N), `offload_prefetch_step` (K).
+- **Stock `PrefetchOffloader`** (`--offload-backend prefetch`, `vllm/model_executor/offloader/prefetch.py`) — group-granularity, multi-layer-ahead prefetch with a static GPU buffer pool and event-driven CUDA-graph compatibility. Tunable knobs: `offload_group_size` (G), `offload_num_in_group` (N), `offload_prefetch_step` (K). This file and `prefetch_ops.py` are kept factory-clean for shipped-vLLM comparisons.
+- **Thesis `PrefetchDeferOffloader`** (`--offload-backend prefetch_defer`, `vllm/model_executor/offloader/prefetch_defer.py`) — a temporary optimized-native baseline that adds the §0.10.3 deferred-wraparound fix, with its custom op isolated in `prefetch_defer_ops.py`. It exists so the optimized baseline can be removed later without unwinding changes from the stock class.
 - **`UVAOffloader`** (`vllm/model_executor/offloader/uva.py`) — zero-copy mapping of pinned CPU tensors via `get_accelerator_view_from_cpu_tensor`. Tunable: `cpu_offload_gb` (X).
 
 Each cell shells out to vLLM's native CLI `vllm bench latency` so every measurement runs in a fresh engine. All cells use `--enforce-eager` for clean attribution. We do **not** measure the `VLLM_WEIGHT_OFFLOADING_DISABLE_UVA=1` escape hatch — it's an undocumented compatibility shim, not a deployment vLLM recommends. Setup: Qwen2.5-7B BF16, `(input_len, output_len) = (256, 32)`, batch ∈ {1, 16, 64}, 2 warmup + 3 bench iters.
@@ -809,11 +810,115 @@ Decoder-layer arithmetic (used to express prefetch coverage in GiB so it shares 
 | **per layer total** | | **444.5 MiB** |
 | 28 layers | | **12.15 GiB** |
 
-All prefetch arms below use `G ∈ {1, 2, 4, 7, 14, 28}` (divisors of 28, including the full-coverage G=1 / 100% case used as the OOM-ceiling probe in §0.10.3), so coverage = N/G is exact and offloaded layer counts are clean. Earlier sweeps with G=8 or G=16 produced inhomogeneous byte counts because 28 doesn't divide cleanly into those Gs (partial last group).
+**Section structure.** The narrative is built around answering "how good is stock vLLM's prefetch when properly tuned?" first, then layering optimizations on top:
 
-### 0.10.1: PrefetchOffloader knob sweep
+- §0.10.1 — **Stock Native Prefetch Mechanics** (exposition). Picker math, wraparound prefetch, and the implications of the wraparound H2D landing on CE0 / copy_stream.
+- §0.10.2 — **Stock Native Parameter Search**. A 60-cell sweep across `(G, N)` at K=1 finds the best stock config per offloaded-layer count. Naturally exposes when placement (avoiding layer 27) wins versus uniform spacing.
+- §0.10.3 — **Canonical Stock Sweep** (historical). The four sub-sweeps at G ∈ {1, 2, 4, 7, 14, 28} (divisors of 28). Kept for narrative continuity; not "best stock", just "default-canonical stock".
+- §0.10.4 — **UVA Comparison**. Stock prefetch vs UVA at matched offloaded GiB.
+- §0.10.5 — **PrefetchDefer Ablation**. The thesis-only `prefetch_defer` backend (deferred-wraparound fix) measured as an optimization on top of stock-best. Includes the eager/graph-mode mechanism analysis and the two-bug isolation experiment.
+- §0.10.6 — **nsys overlap probe**. Trace-level visualization of compute/H2D overlap.
 
-Measured by `bench_prefetch_knobs.py`. Three sub-sweeps on Qwen2.5-7B BF16 across batch ∈ {1, 16, 64}.
+Historical arm names like `prefetch_28x1` are retained; rows described as "post-fix" or "fixed" correspond to the thesis `prefetch_defer` backend, while "unfixed" corresponds to stock `prefetch` behavior.
+
+### 0.10.1: Stock Native Prefetch Mechanics
+
+This section explains how the shipped `PrefetchOffloader` behaves before any benchmarks. The mechanics establish *why* the wraparound prefetch is the most fragile part of the design and *what* the parameter search in §0.10.2 is actually exploring.
+
+**Layer picker.** For each decoder-layer index `i ∈ [0, num_layers)`, the layer is offloaded if and only if:
+
+```
+i % group_size >= group_size − num_in_group
+```
+
+with the user-tunable knobs `group_size` (G), `num_in_group` (N), `offload_prefetch_step` (K). Equivalently: within every G-sized window of consecutive layer indices, the *last* N layers go to CPU. For Qwen2.5-7B (28 layers) this means:
+
+- G=28, N=1 → offloaded set is `{27}` (just the final decoder layer).
+- G=14, N=1 → `{13, 27}`.
+- G=4, N=1 → `{3, 7, 11, 15, 19, 23, 27}`.
+- G=15, N=1 → `{14}` (only the first window has its last position; layers 15–27 fall in a partial window where `i % 15 ∈ [0, 12]` never reaches `G − N = 14`).
+
+When G doesn't divide num_layers, the picker silently drops candidates that would otherwise sit at positions `G − N, G − N + 1, …, G − 1` of an incomplete window. This is the placement freedom §0.10.2 exploits: a non-divisor G with N=1 places its single offloaded layer at the *first* satisfying position (e.g. layer 14 for G=15), not at layer 27.
+
+**Prefetch ordering.** When offloaded module `i` finishes its forward, the offloader fires `start_prefetch((i + K) % num_offloaded)` on a dedicated `copy_stream`. With K=1, each offloaded layer's forward triggers the H2D for the *next* offloaded layer, copying a 466 MB per-layer weight bundle (BF16, all 4 sub-modules) onto a static GPU buffer that the prefetched layer's forward will consume one (or K) layer-stride steps later.
+
+The *wraparound prefetch* is the special case where the offloaded layer with the highest index calls `start_prefetch` for the offloaded layer with the lowest index — wrapping around the circular indexing. For canonical (G, N=1) configs that include layer 27 (the final decoder layer), this wraparound fires at the END of the model's forward, with no remaining iter compute to overlap the H2D against. It then races against the next iter's startup machinery.
+
+**Two sync exposure surfaces from one wraparound H2D.**
+
+The wraparound H2D meets two different sync surfaces depending on execution mode. Only the first is true CE0 FIFO blocking; the second is a separate copy_stream drain caused by vLLM's graph machinery. Both are characterized empirically in §0.10.5.
+
+1. **Eager mode (`--enforce-eager`) — CE0 FIFO contention with input prep.** The wraparound H2D queues on **CE0** (the GPU's H2D copy engine) at end-of-iter-N. Iter N+1's per-step input-prep H2Ds (vLLM's V1 async-scheduling path: `tensor.to('cuda', non_blocking=True)` for `input_ids` / `positions` / block-table indices / attention metadata) ALSO go to CE0, and CE0 is FIFO at the engine level — input prep queues *behind* the wraparound and waits ~19.5 ms (1 wraparound at 24 GB/s PCIe). The per-step `prepare_inputs_event.synchronize()` (`vllm/v1/worker/gpu_model_runner.py:3485`) blocks for this wait, propagating into wall-clock latency.
+
+2. **Graph mode (no `--enforce-eager`) — `sync_prev_onload`'s copy_stream drain.** vLLM captures and replays per-batch-shape graphs. Because the prefetch copy_stream is external to any captured graph, vLLM drains it before each capture/replay via `PrefetchOffloader.sync_prev_onload()` — a `wait_stream(self.copy_stream)` barrier on the compute stream (call sites: `cudagraph_utils.py:259`, `gpu_ubatch_wrapper.py:259/493`). This is NOT CE0 contention; it's a deliberate cross-stream barrier that waits for copy_stream's pending work to finish. Per-event sync time scales as `layers_offloaded × 19.5 ms` (G=1: 561 ms ≈ 28 × 19.5 ms; G=4: 160 ms ≈ 7 × 23 ms; within 3% across the sweep).
+
+**The two surfaces are mutually occluding.** Same wraparound bytes, two different watching points — but only one fires per run. In graph mode, `sync_prev_onload` runs *before* the next replay's input prep gets a chance to queue on CE0, draining the wraparound from copy_stream first. By the time input prep H2Ds queue, the bytes are gone — the eager-mode CE0 contention has nothing to wait on. So a single run pays exactly one wraparound wait, exposed through whichever surface its mode happens to use first. §0.10.5 confirms with a 2x2 isolation experiment (eager × UVA-input-prep flags).
+
+**The placement implication.** Because the wraparound exposure is tied to the *last offloaded layer being layer 27*, a config that places its highest offloaded layer earlier (e.g., layer 14 via G=15 N=1) leaves tail compute (layers 15..27) to overlap with the wraparound H2D — at least partially. This is the placement story §0.10.2 explores empirically.
+
+### 0.10.2: Stock Native Parameter Search
+
+The canonical sweep in §0.10.3 fixes G to a divisor of num_layers (G ∈ {1, 2, 4, 7, 14, 28}). Every one of those configs offloads layer 27 — the worst position for the wraparound. The new question: does varying G away from divisors find better stock configs?
+
+**Methodology.** Smart-subsample sweep across `(G ∈ 1..28, N ∈ 1..G, K=1)`: for each target offloaded-layer count L ∈ {1, 2, 3, 4, 5, 7, 10, 14, 21, 28}, enumerate all `(G, N)` producing exactly L offloaded layers, cap at ~6 per L (stratified on G to cover small/mid/large group sizes), always include the canonical divisor-G config when valid. Total: 60 cells. Workload: Qwen2.5-7B BF16, `input=256 output=32, --enforce-eager`, factory `prefetch` backend (no defer). Top-3 per L re-run at B ∈ {1, 16, 64}; K-sweep at the chosen Pareto-knee config (L=4 G=6 N=1) at B ∈ {1, 16, 64} × K ∈ {1, 2, 3, 4}. All cells run on stock vLLM with no thesis instrumentation patches. Bench script: `bench_prefetch_full_sweep.py`. Results: `results/0.10_full_sweep/`.
+
+**Best stock config per offloaded-layer count.** B=1 latencies (matches §0.10.3 workload). `final?` indicates whether the config's offloaded set includes layer 27.
+
+| L | best (G, N) | final? | last offloaded layer | avg lat (s) | canonical (G, N=1) | canonical lat (s) | Δ best vs canonical |
+|---:|:---:|:---:|---:|---:|:---:|---:|---:|
+|  1 | **G=15, N=1** | no  | 14 | **0.884** | G=28, N=1 | 1.105 | **−20.0%** |
+|  2 | **G=10, N=1** | no  | 19 | **1.438** | G=14, N=1 | 1.507 | **−4.6%** |
+|  3 | **G=8, N=1**  | no  | 23 | 2.044 | (no divisor) | — | — |
+|  4 | **G=6, N=1**  | no  | 23 | 2.652 | (no divisor) | — | — |
+|  5 | **G=5, N=1**  | no  | 24 | 3.276 | (no divisor) | — | — |
+|  7 | G=4, N=1      | YES | 27 | 4.537 | G=4, N=1 (same) | 4.537 | tied |
+| 10 | G=5, N=2      | no  | 24 | 6.462 | (no divisor) | — | — |
+| 14 | G=2, N=1      | YES | 27 | 8.990 | G=2, N=1 (same) | 8.990 | tied |
+| 21 | G=4, N=3      | YES | 27 | 13.475 | (no divisor) | — | — |
+| 28 | G=12, N=12    | YES | 27 | 17.934 | G=1, N=1 | 17.941 | flat |
+
+**Three regimes.**
+
+1. **Low L (1–5): placement wins by 5–20%.** Non-divisor G with N=1 places the single offloaded layer earlier in the model, leaving 1–13 tail compute layers to hide the wraparound H2D. Headline: at L=1, `G=15, N=1` (offloads only layer 14, leaving 13 tail layers) beats canonical `G=28, N=1` (offloads only layer 27, 0 tail) by 20% with identical 0.43 GiB.
+
+2. **Mid L (7, 14): uniform spacing wins.** With 7+ offloaded layers, the per-layer drain interval shortens enough that *uniform* spacing matters more than any single-layer placement choice. `G=4, N=1` (every 4th layer: {3, 7, 11, 15, 19, 23, 27}) and `G=2, N=1` (every other: {1, 3, …, 27}) win because they maximize per-layer hide budget. Placement-aware alternatives at these L *cluster* the offloaded layers (e.g. `G=18, N=7` = layers {11..17}), losing the uniform-spread advantage despite avoiding layer 27.
+
+3. **High L (21, 28): negligible differences.** At 21+ offloaded layers, every spread is dense enough that placement is irrelevant; intra-forward CE0 saturation between consecutive offloaded layers dominates. All configs converge within <0.5%.
+
+**Top-3 batch validation.** The B=1 winner at every L remains the B=16 and B=64 winner. Selected rows (full table in `results/0.10_full_sweep/summary.json`):
+
+| L | best arm | B=1 (s) | B=16 (s) | B=64 (s) |
+|---:|---|---:|---:|---:|
+|  1 | L1_G15_N1_K1 | 0.884 | 1.229 | 2.320 |
+|  4 | L4_G6_N1_K1  | 2.652 | 2.946 | 4.024 |
+|  7 | L7_G4_N1_K1  | 4.537 | 4.849 | 5.952 |
+| 14 | L14_G2_N1_K1 | 8.990 | 9.450 | 10.443 |
+
+Placement effect is robust across batches.
+
+**K-sweep at the Pareto-knee config (L=4 G=6 N=1).** The non-divisor `G=6, N=1` (offloads {5, 11, 17, 23}) is the placement-aware best at ~25% offload depth. K ∈ {1, 2, 3, 4} at B ∈ {1, 16, 64}:
+
+| K | B=1 (s) | B=16 (s) | B=64 (s) |
+|---:|---:|---:|---:|
+| 1 | 2.652 | 2.946 | 4.024 |
+| 2 | 2.600 | 2.889 | 3.967 |
+| 3 | 2.600 | 2.894 | 3.962 |
+| 4 | 2.600 | 2.905 | **OOM** |
+
+Same shape as the canonical `G=4, N=1` K-sweep in §0.10.3d: K=2 captures essentially all the benefit (~2% over K=1), K≥3 flat, K=4 OOMs at B=64. K is orthogonal to placement — K=1 is near-optimal regardless of (G, N).
+
+**Conclusion for stock vLLM tuning.** When picking a stock prefetch config:
+
+- **Low offload depth** (≤ ~17% of weights, ≤ 5 offloaded layers on Qwen2.5-7B): prefer non-divisor G with N=1. Placement matters more than spacing.
+- **Mid depth** (~25–50%): prefer divisor G with small N. Uniform spacing dominates.
+- **High depth** (≥75%): the choice barely matters; pick the smallest G that fits the buffer pool budget.
+- **K=1 is near-optimal everywhere**; K=2 buys ~2% with mild buffer-pool risk.
+
+The §0.10.5 defer fix is an *additional* optimization on top of these stock-best choices. As shown there, defer-at-canonical-G is structurally stronger than placement-at-tuned-G at low L (because defer eliminates the wraparound's CE0 occupancy entirely, while placement only shortens the wait), but the two converge at mid L where stock-best IS the canonical config.
+
+### 0.10.3: Native prefetch knob sweep (canonical, divisor-G)
+
+Measured by `bench_prefetch_knobs.py`. Three sub-sweeps on Qwen2.5-7B BF16 across batch ∈ {1, 16, 64}. The post-fix numbers use `--offload-backend prefetch_defer`; the stock `--offload-backend prefetch` baseline remains available as the unfixed/shipped-vLLM comparison.
 
 #### (a) G at fixed 50% coverage (all 14 layers offloaded, 6.08 GiB)
 
@@ -826,7 +931,7 @@ By picking G ∈ {2, 4, 14, 28} (divisors of 28) and N = G/2, every arm offloads
 | `prefetch_14x7`  | 14 | 7  | clusters of 7 in 2 groups         | 9.014 | 9.561 | 10.889 |
 | `prefetch_28x14` | 28 | 14 | single cluster of 14 at end       | 9.011 | 9.607 | 10.942 |
 
-**Monotonic — smaller G (denser, more uniform spacing) wins.** G=2 beats G=28 by ~5% at B=64, with monotone progression in between. The mechanism: smaller G means the offloaded layers are interleaved more uniformly with GPU-resident layers, giving each H2D event a fresh "drain" interval. Larger G concentrates offloads into clusters where consecutive offloaded layers must serialize through a single buffer slot (with K=1) — the second-and-later cluster members get only ~1 ms of compute hiding for ~20 ms H2D. The four arms benefit roughly equally from the §0.10.3 deferred-wraparound fix (each has exactly one wrap-around per iter at this 50% coverage), so the relative ordering is preserved post-fix.
+**Monotonic — smaller G (denser, more uniform spacing) wins.** G=2 beats G=28 by ~5% at B=64, with monotone progression in between. The mechanism: smaller G means the offloaded layers are interleaved more uniformly with GPU-resident layers, giving each H2D event a fresh "drain" interval. Larger G concentrates offloads into clusters where consecutive offloaded layers must serialize through a single buffer slot (with K=1) — the second-and-later cluster members get only ~1 ms of compute hiding for ~20 ms H2D. The four arms benefit roughly equally from the §0.10.3 `prefetch_defer` wraparound fix (each has exactly one wrap-around per iter at this 50% coverage), so the relative ordering is preserved post-fix.
 
 The earlier `bench_native_weight_offload.py` finding that "G=16 N=4 wins at 25% coverage" was an artifact of unequal byte counts (G=16 N=4 offloads 8 layers / 3.47 GiB; G=4 N=1 offloads 7 layers / 3.04 GiB — 14% more bytes for the supposed winner). With truly fixed bytes the picture inverts: **at fixed coverage, denser uniform spacing dominates clustering**.
 
@@ -885,13 +990,13 @@ K sweep at the empirically best knob configuration (uniform N=1, ~25% coverage, 
 | `prefetch_4x1_k3`  | 3 | 4.419 | 4.674 | 5.743 |
 | `prefetch_4x1_k4`  | 4 | 4.423 | 4.699 | **OOM** |
 
-**K=2 captures essentially all of the available benefit; K≥3 is flat; K=4 OOMs at B=64.** At B=64 K=2 buys **2.7%** over K=1 (5.89 → 5.74 s). K=3 is within run-to-run noise of K=2. K=4 succeeds at B=1 / B=16 with no measurable gain (4.42 / 4.70 s) but fails at B=64 — the K=4 buffer pool (4 × per-layer-buffer slots, ~1.7 GiB extra GPU residency) combined with B=64 activations overruns the 24 GiB budget. The deferred-wraparound fix supports K>1 (`pending_wraparound_indices: list[int]` accumulates the deferred indices in FIFO order; see §0.10.3 "Fix delivered"), so this measurement is post-fix and apples-to-apples with the K=1 cells in (b)/(c).
+**K=2 captures essentially all of the available benefit; K≥3 is flat; K=4 OOMs at B=64.** At B=64 K=2 buys **2.7%** over K=1 (5.89 → 5.74 s). K=3 is within run-to-run noise of K=2. K=4 succeeds at B=1 / B=16 with no measurable gain (4.42 / 4.70 s) but fails at B=64 — the K=4 buffer pool (4 × per-layer-buffer slots, ~1.7 GiB extra GPU residency) combined with B=64 activations overruns the 24 GiB budget. The `prefetch_defer` wraparound fix supports K>1 under the `last`-only policy: only the very last wrap-around (zero compute window) is deferred; earlier wrap-around layers at K>1 fire immediately so their H2D overlaps with iter N's tail compute (see §0.10.3 "Fix delivered"). This measurement is post-fix and apples-to-apples with the K=1 cells in (b)/(c).
 
 **The K>1 win is structurally smaller under uniform spread than under clustering.** Each prefetch already gets G−1 = 3 actual layers of compute hiding from K=1 alone, leaving little for K>1 to add. Concretely, the legacy K-sweep at (G=14, N=4) — clustered, where the 2nd–4th members of each cluster benefit most from K>1 — measured a K=2 win of 5.6% at B=64 (data not shown). Under (G=4, N=1) that win shrinks to 2.9%: roughly half the legacy gap, exactly as expected from the spacing argument.
 
 **This empirically validates the COTS commitment to layer-ahead** in `pcie_bandwidth_allocation_design.md` (§Prefetch Distance). The marginal benefit of K>1 is small (≤3% at B=64 under the empirically best spacing) and the OOM risk at large batch + large K is real. Layer-ahead (K=1, the COTS partition) gives essentially all the achievable hiding without the buffer pressure.
 
-### 0.10.2: UVA vs Prefetch — head-to-head
+### 0.10.4: UVA vs Prefetch — head-to-head
 
 Measured by `bench_uva_vs_prefetch.py`. Prefetch arm: N=1, K=1, varying G ∈ {1, 2, 4, 7, 14, 28} (the empirically best knob configuration per §0.10.1 — uniform spacing dominates clustering). UVA arm: varying `cpu_offload_gb` ∈ {1, 2, 4, 6, 8, 10, 12}. Both curves on the same offloaded-GiB x-axis.
 
@@ -914,22 +1019,50 @@ Measured by `bench_uva_vs_prefetch.py`. Prefetch arm: N=1, K=1, varying G ∈ {1
 
 #### Findings
 
-1. **Prefetch dominates UVA at B ≥ 16 across the entire offload-depth range.** At B=64, comparing matched-GiB pairs: `prefetch_7x1` (1.74 GiB) at 3.97 s vs `uva_2` (2.00 GiB) at 26.53 s → Prefetch is **6.7×** faster. `prefetch_4x1` (3.04 GiB) at 5.90 s vs `uva_4` (4.00 GiB) at 52.03 s ≈ **8.8×**. `prefetch_2x1` (6.08 GiB) at 10.42 s vs `uva_6` (6.00 GiB) at 74.62 s ≈ **7.2×**. At full coverage `prefetch_1x1` (12.15 GiB) at 20.54 s vs `uva_12` (12.00 GiB) at 145.52 s ≈ **7.1×**. Prefetch numbers are post-fix (defer_wraparound=True); UVA numbers are unaffected by the fix.
+1. **Prefetch dominates UVA at B ≥ 16 across the entire offload-depth range.** At B=64, comparing matched-GiB pairs: `prefetch_7x1` (1.74 GiB) at 3.97 s vs `uva_2` (2.00 GiB) at 26.53 s → Prefetch is **6.7×** faster. `prefetch_4x1` (3.04 GiB) at 5.90 s vs `uva_4` (4.00 GiB) at 52.03 s ≈ **8.8×**. `prefetch_2x1` (6.08 GiB) at 10.42 s vs `uva_6` (6.00 GiB) at 74.62 s ≈ **7.2×**. At full coverage `prefetch_1x1` (12.15 GiB) at 20.54 s vs `uva_12` (12.00 GiB) at 145.52 s ≈ **7.1×**. Prefetch numbers here are the optimized-native `prefetch_defer` post-fix numbers; UVA numbers are unaffected by the fix.
 2. **At B=1 the two curves nearly meet at low depth, with prefetch always ahead.** UVA is competitive only at the lowest depth and B=1: `uva_1` (2.27 s) vs `prefetch_14x1` (1.32 s, 0.87 GiB) — Prefetch wins by 42% at the lowest depth (was 33% pre-fix; the fix widened the gap because the low-coverage prefetch arms are exactly where the fix helps most). At full 12 GiB, `prefetch_1x1` (17.98 s) beats `uva_12` (18.41 s) by only 2.3% at B=1; the win expands at larger batches because UVA scales with B while prefetch doesn't.
 3. **UVA's slowdown is super-linear in batch.** At B=1 → B=16 → B=64, `uva_4` goes 6.79 → 16.97 → 52.03 s — **7.7×** over the batch range. By contrast, `prefetch_4x1`: 4.53 → 4.83 → 5.90 s — only **1.3×**. **UVA is structurally batch-hostile**: each kernel reading UVA-mapped weights pays PCIe per-token, so PCIe traffic scales with batch. Prefetch's H2D is per-call (B-independent).
 4. **UVA's latency is roughly linear in offload depth at fixed batch.** At B=64: 1 → 12 GiB ⇒ 16.10 → 145.52 s, slope ≈ **11.8 s/GiB**. Cost of crossing PCIe per-token compounds proportionally with the bytes that have to be crossed.
 5. **Prefetch's slope at B=64**: 0.43 → 12.15 GiB ⇒ 2.10 → 20.54 s, slope ≈ **1.57 s/GiB** — within 2% of the clustered-G=14 slope (1.57 s/GiB; §0.10.1c) at the same batch. **Prefetch is ~7.5× more PCIe-efficient than UVA per offloaded GiB** at decode pressure.
 6. **The fix matters most at the low-depth end.** `prefetch_28x1` at B=64 (0.43 GiB) is now within ~3.5% of `none` (2.10 s vs 2.03 s baseline) — the prefetch free regime materializes here. UVA's smallest depth (`uva_1`, 1.00 GiB) costs 16.10 s at B=64 — still ~8× over `none`. At low depth the post-fix prefetch advantage over UVA is closer to **15×**, vs ~7× at full depth.
 
-### 0.10.3: Prefetch vs none — finding the prefetch free regime
+### 0.10.5: PrefetchDefer ablation — defer fix vs stock-best
 
-Measured by `bench_prefetch_vs_none.py`. Three-arm decomposition mirrors `phase1a_findings.md §1.14`'s COTS-vs-`none` methodology applied to vLLM's stock `PrefetchOffloader`:
+This section measures the thesis-only `prefetch_defer` backend (`vllm/model_executor/offloader/prefetch_defer.py`) as an *optimization on top of stock-best* (§0.10.2). Defer's mechanism is to take the wraparound prefetch (the H2D from the highest-index offloaded layer to the lowest) out of iter N's tail and issue it from a forward pre-hook on the first decoder layer of iter N+1, AFTER vLLM's per-step input-prep H2Ds have already queued on CE0. This re-orders both wraparound exposure surfaces from §0.10.1: in eager mode the prefetch H2D no longer queues on CE0 ahead of input prep; in graph mode the prefetch is moved out of the captured graph so `sync_prev_onload`'s pre-replay barrier has no wraparound to drain.
+
+**Stock-best vs defer-at-canonical comparison (B=1).** Defer was originally measured against canonical divisor-G configs in this section; that comparison is preserved below for continuity. The new framing: defer-at-canonical-G vs the §0.10.2 stock-best at matched offloaded GiB.
+
+| L | stock-best (tuned G) | latency | defer at canonical G | latency | defer wins by |
+|---:|:---:|---:|:---:|---:|---:|
+|  1 | G=15, N=1 | 0.884 s | G=28, N=1 + defer | **0.687 s** | **−22.3%** |
+|  2 | G=10, N=1 | 1.438 s | G=14, N=1 + defer | **1.325 s** | **−7.9%** |
+|  4 | G=6, N=1  | 2.652 s | (no L=4 canonical) | — | — |
+|  7 | G=4, N=1  | 4.537 s | G=4, N=1 + defer | 4.525 s | tied |
+| 14 | G=2, N=1  | 8.990 s | G=2, N=1 + defer | 9.011 s | tied |
+| 28 | G=1, N=1  | 17.941 s | G=1, N=1 + defer | 17.980 s | tied |
+
+**At low L (1, 2), defer beats stock-best despite stock-best already exploiting placement.** Defer eliminates the wraparound's CE0 occupancy entirely by moving it to a stream that runs *after* input prep, while placement only gives the wraparound more compute window to overlap with. The two are not equivalent fixes:
+
+- Placement at `G=15, N=1`: wraparound fires after layer 14, 13 tail layers (~6.5 ms compute) try to hide 19.5 ms H2D → ~13 ms still exposed.
+- Defer at `G=28, N=1`: wraparound moved off iter-N tail, fires at iter N+1 start AFTER input prep, then hides behind 27 layers of compute (~13.5 ms) → ~6 ms exposed.
+
+**At mid L (7, 14), they converge.** Stock-best at L=7 is `G=4, N=1` (canonical), and at L=14 it's `G=2, N=1` (canonical). Defer measurement uses the same configs → no placement difference, and defer's marginal contribution is tiny (~0.3% at L=7, slightly *negative* at L=14 because defer's pre-hook adds a small per-iter overhead with negligible benefit when there are many offloaded layers).
+
+**At high L (28), both flat.** Wraparound is irrelevant; intra-forward CE0 saturation dominates either way.
+
+**Untested compound: defer × placement.** No data exists for `prefetch_defer` at non-divisor G (e.g. `G=15, N=1` + defer at L=1). Conceptually they're orthogonal — defer removes the wraparound from CE0; placement gives the wraparound more compute window — and combining could approach the `none` baseline (0.521 s at L=1). Adding a 10-cell follow-up at non-divisor G with defer would round out the ablation.
+
+The remainder of this section retains the original §0.10.3 wraparound-diagnosis content: the "free regime" finding, the per-G `sync_prev_onload` exposure table for graph mode, the UVA-input-prep confirmatory experiment, and the 2x2 isolation table that shows the eager and graph mech surfaces are mutually-occluding manifestations of one wraparound.
+
+### 0.10.5a: Prefetch vs none — finding the prefetch free regime (legacy framing)
+
+Measured by `bench_prefetch_vs_none.py`. Three-arm decomposition mirrors `phase1a_findings.md §1.14`'s COTS-vs-`none` methodology applied to the native prefetch path. The `real` stock-vs-fixed comparisons use `--offload-backend prefetch` for shipped/factory behavior and `--offload-backend prefetch_defer` for the thesis optimized-native behavior; the `dryrun` arm belongs to `prefetch_defer` because stock `prefetch.py` intentionally has no dry-run or deferred-wraparound state.
 
 | Arm | What it isolates |
 |---|---|
 | `none` | baseline (no offload) |
-| `prefetch_dryrun_g{G}` | wrappers/custom ops/event sync installed, H2D copy skipped via `--prefetch-dry-run` (added in `vllm/config/offload.py`) |
-| `prefetch_real_g{G}` | end-to-end prefetch |
+| `prefetch_dryrun_g{G}` | `prefetch_defer` wrappers/custom ops/event sync installed, H2D copy skipped via `--prefetch-dry-run` |
+| `prefetch_real_g{G}` | end-to-end native prefetch (`prefetch` for unfixed stock, `prefetch_defer` for fixed/optimized rows) |
 
 Decomposition:
 - `orch = dryrun − none` → pure host orchestration (Python forward hooks + `wait_prefetch` / `start_prefetch` custom op dispatch + `_copy_done_event` recording + stream fork/join)
@@ -1054,7 +1187,7 @@ Workload: Qwen2.5-7B BF16, `--input-len 256 --output-len 32 --enforce-eager`. Cr
 
    The sync block disappears on the input-prep side without touching prefetch — diagnosis confirmed. Traces: `results/0.10_uva_validation/prefetch_g28_decode_{unfixed,uva_inputprep_v3}.{nsys-rep,sqlite}`.
 
-   **Fix delivered.** With the diagnosis confirmed, the offloader-localized fix is straightforward and lives entirely inside `prefetch.py`. New `PrefetchOffloadConfig.defer_wraparound: bool = True` (default on; CLI flag `--prefetch-defer-wraparound` / `--no-prefetch-defer-wraparound`). When enabled, the wrap-around `start_prefetch` calls (any whose target index `(i + K) >= N`) are *skipped* at the end of iter N and instead issued from a forward pre-hook on the first decoder layer at the start of iter N+1 — *after* vLLM's per-step input-prep H2Ds have already queued on CE0. The CE0 FIFO then services the tiny input prep H2Ds first (microseconds) and the deferred prefetch H2D second; the per-step `prepare_inputs_event.synchronize()` no longer transitively waits for the prefetch, and the first offloaded layer's `wait_prefetch` stalls main_stream by `max(0, PCIe − L·layer_time)` instead of by the full PCIe time. Implementation: `pending_wraparound_indices: list[int]` accumulates the deferred indices on iter N's offloaded-layer tails and is FIFO-drained by the first-decoder pre-hook on iter N+1, so the fix supports any `prefetch_step` (K), not just K=1. Token output is byte-identical to `defer_wraparound=False` at K=1 and K=2 (verified empirically).
+   **Fix delivered as a separate thesis backend.** With the diagnosis confirmed, the offloader-localized fix is now isolated in `PrefetchDeferOffloader` (`--offload-backend prefetch_defer`) rather than mixed into the stock `PrefetchOffloader`. Stock `prefetch.py` / `prefetch_ops.py` stay byte-for-byte factory-clean; `prefetch_defer.py` implements the scheduling policy and `prefetch_defer_ops.py` registers the deferred custom op. In the fixed backend, **only the last wrap-around `start_prefetch`** (the one fired by `index == n_offloaders - 1`, whose post-hook has zero remaining iter-N compute window) is *skipped* at the end of iter N and instead issued from a forward pre-hook on the first decoder layer at the start of iter N+1 — *after* vLLM's per-step input-prep H2Ds have already queued on CE0. The CE0 FIFO then services the tiny input prep H2Ds first (microseconds) and the deferred prefetch H2D second; the per-step `prepare_inputs_event.synchronize()` no longer transitively waits for the prefetch, and the first offloaded layer's `wait_prefetch` stalls main_stream by `max(0, PCIe − L·layer_time)` instead of by the full PCIe time. At K > 1 the *earlier* wrap-around layers (those whose post-hook still has remaining iter-N compute) fire immediately so their H2D overlaps with iter N's tail compute — empirically Pareto-dominant vs defer-all and defer-none across G ∈ {1..14} K=2 (`David/Benchmarks/phase1b/results/native_defer_policy/`: defer-only-last beats defer-all by +0.3% at G=1 to +5.1% at G=14, and beats defer-none by +0.1% at G=1 to +22% at G=14). Implementation: static `deferred_wraparound_index` identifies the single deferred target; the first-decoder pre-hook starts it through `torch.ops.vllm.start_deferred_prefetch`. Token output is byte-identical to stock prefetch at K=1 and K=2 (verified empirically).
 
    **Post-fix sync table (same per-G probe condition as the unfixed table above):**
 
@@ -1072,7 +1205,7 @@ Workload: Qwen2.5-7B BF16, `--input-len 256 --output-len 32 --enforce-eager`. Cr
    - **Per-event sync_avg_ms goes UP at G ≤ 14** because the deferred prefetches now queue ahead of the next iter's `transfer_event` window, but the *count* halving dominates so `sync_total_s` still drops. At G=28 even the per-event sync drops because there's only one deferred prefetch per iter — well-hidden by the (G−1)·layer_time compute window.
    - **Effect shrinks with coverage** as the diagnosis predicted: ~59% sync-time saving at G=28 (1 layer offloaded, 27 GPU-resident layers of compute window) but only ~3% at G=1 (no GPU-resident layers to hide behind).
 
-   **End-to-end latency confirmation (`bench_prefetch_vs_none.py` Grid B `pf_match`, `input=256 output=32`).** Re-runs include a third arm `prefetch_real_unfixed_g{G}` — same workload, same hour, only `--no-prefetch-defer-wraparound` differs — for matched-condition before/after.
+   **End-to-end latency confirmation (`bench_prefetch_vs_none.py` Grid B `pf_match`, `input=256 output=32`).** Re-runs include a third arm `prefetch_real_unfixed_g{G}` — same workload, same hour, stock `--offload-backend prefetch` instead of optimized `--offload-backend prefetch_defer` — for matched-condition before/after.
 
 | G | B=1 unfixed (s) | B=1 fixed (s) | Δ % | B=64 unfixed (s) | B=64 fixed (s) | Δ % | "Free" at B=64? |
 |---:|---:|---:|---:|---:|---:|---:|---|
@@ -1087,7 +1220,112 @@ Workload: Qwen2.5-7B BF16, `--input-len 256 --output-len 32 --enforce-eager`. Cr
 
    At full coverage (G=1, G=2) the fix delivers ~0% improvement because every layer's prefetch must drain on CE0 anyway; the wrap-around is no longer the rate limiter (intra-forward CE0 serialization between consecutive offloaded layers dominates). The decode_heavy grid (`input=8 output=128`) shows a similar shape with smaller absolute fix-Δ in the high-coverage cells; full numbers in `results/0.10_prefetch_vs_none/summary.json`. Pre-fix snapshots are preserved unmodified under `results/0.10_*-unfixed/` for the four affected sweeps.
 
-3. **Prefetch's host orchestration is essentially zero** — `dryrun − none` is in the −68 to +9 ms range across all 42 cells, with magnitude ≤10 ms even at G=1 (28 layers wrapped, full Python wrapper count). Two orders of magnitude smaller than the COTS-CPU-compute-path orch column in `phase1a_findings.md §1.14` (~450 ms). The C++-backed prefetch path has effectively no Python tax compared to the Python `ThreadPoolExecutor` substrate measured for the CPU compute path. **Implication for Phase 1c:** closing the host orchestration gap to prefetch's level (~450 → ~10 ms) is what `cudaLaunchHostFunc` + native CPU runner needs to achieve on the CPU compute path. The remaining ~2 s active-CPU-work penalty in §1.14 is the only structural gap COTS's CPU-compute side will still have post-Phase-1c.
+   **Graph-mode wraparound (Codex follow-up).** The eager-mode CE0 FIFO bug above is one face of the wraparound problem; CUDA-graph mode has its own face. Outside `--enforce-eager`, vLLM captures and replays per-batch-shape graphs (`vllm/v1/worker/gpu/cudagraph_utils.py`, `gpu_ubatch_wrapper.py`). Because the prefetch copy_stream is external to any graph, vLLM must drain it before each capture/replay via `PrefetchOffloader.sync_prev_onload()` — a `wait_stream(self.copy_stream)` barrier on the compute stream. Pre-fix, that barrier waits exactly one wraparound H2D worth of work each time it fires.
+
+   Per-G probes at the §0.10.3 condition (`input=8 output=32 B=1, 3 warmup + 2 bench iters`), comparing `--enforce-eager` to graph mode (`--enforce-eager` removed). Filter syncType=2, duration > 1 ms (matches the §0.10.3 unfixed table's filter):
+
+   | G | layers offloaded /forward | eager_unfixed sync_ms (n=317) | graph_unfixed sync_ms (n=160) | graph_fixed sync_ms (n=160) | predicted PCIe × layers |
+   |---:|---:|---:|---:|---:|---:|
+   | 28 |  1 |  25.90 |  35.23 | **25.00** | ~19.5 ms |
+   | 14 |  2 |  32.27 |  48.55 |  46.91 | ~39.0 ms |
+   |  4 |  7 |  79.84 | 159.82 | 158.95 | ~136.5 ms |
+   |  1 | 28 | 289.82 | 561.47 | 561.95 | ~546.0 ms |
+
+   The graph_unfixed per-event sync time **scales exactly with `layers_offloaded × per-layer-PCIe-time`** at every G (G=1: 561 ms vs predicted 546 ms; G=4: 160 ms vs predicted 156 ms — within 3% across the sweep). This confirms Codex's diagnosis: in graph mode, `sync_prev_onload()` exposes the entire pre-replay wraparound state in one barrier, instead of the per-step input-prep CE0 exposure pattern of eager mode. The two mechanisms have different sync surfaces but the bytes that have to drain are the same.
+
+   Sync count drops from 317 (eager) to 160 (graph) because the graph-mode path issues fewer host-side syncs per generate; total sync_total_s is similar in unfixed cells. End-to-end avg latency in unfixed mode is also similar (G=28: eager 1.10 s vs graph 1.13 s; G=4: eager 4.54 s vs graph 5.12 s — graph is slightly slower at high coverage because of capture overhead, no benefit at low coverage because the pathology dominates). Probe traces: `results/0.10_overlap_probe/prefetch_g{G}_{eager,graph}_{unfixed,fixed}.{nsys-rep,sqlite}`.
+
+   **Same bytes, two mode-exclusive sync surfaces (mutually occluding).** A direct 2x2 isolation experiment confirms the two sync exposures are different surfaces of the *same underlying wraparound H2D bytes*, gated by execution mode. Two binary axes:
+
+   - `--enforce-eager` ON → mech 2 structurally impossible (graph code path never runs; `sync_prev_onload` never called).
+   - `VLLM_INPUT_PREP_UVA=1` (a temporary diagnostic shim that monkey-patches small `Tensor.{to, copy_}` H2Ds to use an SM-issued Triton kernel reading UVA-mapped pinned memory) → mech 1 structurally impossible (input-prep H2Ds bypass CE0 entirely; nothing for the wraparound to queue ahead of).
+
+   Four cells per G, factory `prefetch` backend, G=28 N=1 K=1, `input=8 output=32 B=1`, 3 warmup + 2 bench iters:
+
+   | cell | `--enforce-eager` | UVA shim | mech 1 can fire? | mech 2 can fire? | avg latency (s) | Δ vs δ baseline |
+   |---|:---:|:---:|:---:|:---:|---:|---:|
+   | **α** eager + noUVA | ✓ | ✗ | ✓ | ✗ | 1.097 | +0.455 s |
+   | **β** graph + UVA   | ✗ | ✓ | ✗ | ✓ | 1.136 | +0.494 s |
+   | **γ** graph + noUVA | ✗ | ✗ | ✓ | ✓ | 1.134 | +0.492 s |
+   | **δ** eager + UVA   | ✓ | ✓ | ✗ | ✗ | 0.642 | baseline |
+
+   Two facts visible immediately:
+
+   1. **The two single-mechanism waits are equal in magnitude** (α: +0.455 s, β: +0.494 s, both ≈ ~one wraparound H2D worth of PCIe per ~33 forwards). Same bytes, same total wait — just exposed through different sync surfaces.
+
+   2. **γ ≈ β, NOT α + β.** The "both active" cell adds *zero* sync penalty over the "mech 2 only" cell. So the two surfaces don't compound — they're mutually occluding.
+
+   The reason mech 2 occludes mech 1: `sync_prev_onload` runs *before* the next graph replay starts. Its `wait_stream(copy_stream)` drains the wraparound H2D from copy_stream entirely. By the time the next replay's input-prep H2Ds queue on CE0, the wraparound bytes have already finished — there's nothing for input prep to queue behind, so mech 1 has nothing to wait on.
+
+   ```text
+   eager mode timeline:
+     iter N tail   → wraparound H2D enters CE0 (running)
+     iter N+1     → input prep H2Ds queue on CE0 ← QUEUES BEHIND wraparound
+                                                ← prepare_inputs_event waits ~19.5 ms (mech 1)
+
+   graph mode timeline:
+     prev replay end → wraparound H2D still pending on copy_stream
+     next replay START
+       → sync_prev_onload() ← STALLS ~19.5 ms here (mech 2; drains the wraparound)
+       → wraparound H2D NOW DONE on CE0
+       → graph replay's input-prep H2Ds queue on CE0 ← finds CE0 EMPTY → no mech 1
+   ```
+
+   So mech 1 and mech 2 are mode-exclusive **and** mutually-occluding: a single run pays exactly one ~19.5 ms wait per wraparound, exposed through whichever surface its mode happens to use first. Probe data: `results/0.10_two_bug_isolation/`.
+
+   Practical consequence: **the defer fix is necessary in both modes for the same reason** — it removes the wraparound H2D source so neither sync surface has anything to wait on. UVA-routed input prep would also work in eager mode (and was the P1 confirmatory experiment) but doesn't help in graph mode because mech 2 isn't routed through CE0 at all. Conversely, `--enforce-eager` switches the exposure surface but doesn't reduce the wait. Defer is the only single fix that addresses both modes.
+
+   **Graph-compatible defer-wraparound fix.** The first attempt registered `_first_decoder_pre_hook` as a bound method on `PrefetchOffloader`. That ran *inside* the model forward, which Dynamo traces as part of the full graph. Dynamo's AOT guard serialization then walked the hook's closure into `module_offloaders[*]._copy_done_event` (a `torch.cuda.Event`), failing with `TypeError: cannot pickle 'Event' object`. Wrapping the hook with `torch.compiler.disable` reached a different error (`Skip calling torch.compiler.disable()'d function`) because vLLM compiles via `aot_compile_fullgraph` which forbids graph breaks.
+
+   The graph-compatible solution now lives in the separate thesis files: `vllm/model_executor/offloader/prefetch_defer_ops.py` registers `torch.ops.vllm.start_deferred_prefetch(input_tensor)`, and `vllm/model_executor/offloader/prefetch_defer.py` installs a top-level free-function pre-hook that dispatches the op. The stock `prefetch_ops.py` remains limited to `wait_prefetch` / `start_prefetch`. The deferred op reaches into the active offloader from C-level — opaque to Dynamo:
+
+   ```python
+   def _start_deferred_prefetch_pre_hook(module, args, kwargs):
+       anchor = args[0] if args else kwargs.get("hidden_states")
+       if anchor is not None:
+           torch.ops.vllm.start_deferred_prefetch(anchor)
+   ```
+
+   The empty closure (`del module`, no `self`) means Dynamo never sees offloader state. The deferred target is a static `deferred_wraparound_index` set once at `wrap_modules`, not a per-iter mutable flag. Initial prefetches (`post_init`) skip that index so iter 0 doesn't double-fire it. The wrap-around case at the end of the last offloaded layer's forward simply skips its own `start_prefetch` instead of stashing a Python flag.
+
+   **Post-fix graph-mode results (third column above):**
+   - G=28 (1 layer offloaded): per-event sync **35.23 → 25.00 ms (−29%)**, end-to-end **1.135 → 0.812 s (−28.5%)**. The fix transforms graph mode at low coverage from "slightly slower than eager" into "fastest of the three modes" (eager_unfixed 1.097 s vs graph_fixed 0.812 s = **−26%**, because graph capture eliminates the per-step host overhead the deferred eager path still pays).
+   - G=14 (2 layers): **48.55 → 46.91 ms (−3%)** — only one of the two wraparounds is deferred, the other still drains in the barrier.
+   - G=4 (7 layers): **159.82 → 158.95 ms (−0.5%)** — intra-forward CE0 saturation dominates, the single deferred wraparound is a tiny fraction.
+   - G=1 (28 layers): **561.47 → 561.95 ms (~0%)** — at full coverage every layer is offloaded, the one deferred prefetch is rounding error.
+
+   The shape exactly matches the eager-mode defer benefit pattern (§0.10.3 post-fix sync table): big win at low coverage, decaying to zero at full coverage. Graph mode's win is slightly smaller than eager (−29% vs −38%) because graph_unfixed already amortizes input-prep barriers across the captured graph, leaving less for the defer fix to recover. With `prefetch_defer`, **graph mode is now the recommended optimized-native deployment** at low offload depth — it captures the kernel-launch overhead AND avoids the sync_prev_onload wraparound drain.
+
+   **Placement-sensitivity workaround (Codex follow-up).** Independent of the defer fix, the shared stock/deferred picker (`idx % G >= G − N`) always offloads the *last* model layer when G is a divisor of `num_layers`. On Qwen2.5-7B (28 layers), every G ∈ {1, 2, 4, 7, 14, 28} hits this case — the offloaded layer's wraparound prefetch sees zero tail compute to hide behind. A small picker shift (`(idx − offset) % G >= G − N`) moves the last offloaded layer earlier and gives the wraparound H2D some same-iter compute to overlap with.
+
+   Two probes (`input=8 output=32 B=1, --enforce-eager`, stock `prefetch` unless noted):
+
+   *G=4 N=1 (7 offloaded layers, 3.04 GiB):*
+
+   | offset | last offloaded | tail layers | avg latency (s) |
+   |---:|---:|---:|---:|
+   | 0 (canonical) | 27 | 0 | 4.540 |
+   | 1 | 24 | 3 | **4.492** |
+   | 2 | 25 | 2 | 4.506 |
+   | 3 | 26 | 1 | 4.522 |
+   | 0 + defer fix | 27 | 0 | 4.532 |
+
+   At G=4 placement is monotone in tail count (predicted), but the magnitude is small (~1% best-case relief, 4.540 → 4.492). Defer fix is also tiny here (~0.2%) because intra-forward CE0 saturation at 7 offloaded layers dominates either way.
+
+   *G=28 N=1 (1 offloaded layer, 0.43 GiB) — where the wraparound is the rate limiter:*
+
+   | offset | last offloaded | tail layers | avg latency (s) | gap vs `none` (~0.52 s) |
+   |---:|---:|---:|---:|---:|
+   | 0 (canonical) | 27 | 0 | 1.094 | +0.57 s (109% over) |
+   | **1** | 0 | **27** | **0.643** | **+0.12 s (24% over)** |
+   | 13 | 12 | 15 | 0.841 | +0.32 s |
+   | 0 + defer fix | 27 | 0 | 0.682 | +0.16 s (32% over) |
+
+   At G=28, **placement (offset=1) actually outperforms the defer fix** — 0.643 s vs 0.682 s, a 41% reduction over canonical vs the defer fix's 38%. Mechanism: with one offloaded layer at position 0, the wraparound prefetch fires at end-of-iter-N for iter-N+1's layer 0, has 27 layers of iter-N tail compute window before that prefetch ends up CE0-blocked, and (importantly) finishes well before iter-N+1's input prep. The defer fix achieves a similar but slightly weaker overlap because it puts the prefetch issue *after* iter-N+1's input prep, leaving only ~13 ms of compute to hide ~19.5 ms of H2D.
+
+   **Implication for the thesis recommendation.** Placement is a real, measurable win at low coverage on a model whose layer count is divisible by the chosen G — but it is brittle: it assumes a known model layer count, doesn't help the K>1 case (multiple wraparound prefetches), and silently fails on models or G values where the canonical picker happens not to hit the last layer. The defer fix is general and now graph-compatible, but it is reported as the explicit `prefetch_defer` optimized-native baseline rather than as shipped vLLM stock behavior. Placement (`offload_offset > 0`) remains an additional tunable for future ablations, not part of the factory-clean `prefetch` baseline. Probe data: `results/0.10_placement_sweep/`.
+
+3. **Prefetch's host orchestration is essentially zero** — `prefetch_defer` dryrun − none is in the −68 to +9 ms range across all 42 cells, with magnitude ≤10 ms even at G=1 (28 layers wrapped, full Python wrapper count). Two orders of magnitude smaller than the COTS-CPU-compute-path orch column in `phase1a_findings.md §1.14` (~450 ms). The C++-backed prefetch path has effectively no Python tax compared to the Python `ThreadPoolExecutor` substrate measured for the CPU compute path. **Implication for Phase 1c:** closing the host orchestration gap to prefetch's level (~450 → ~10 ms) is what `cudaLaunchHostFunc` + native CPU runner needs to achieve on the CPU compute path. The remaining ~2 s active-CPU-work penalty in §1.14 is the only structural gap COTS's CPU-compute side will still have post-Phase-1c.
 
 4. **Unhidden PCIe scales linearly with coverage** (Grid A B=64, G=28→14→7→4→2→1 gives pcie = 2.32, 3.78, 8.41, 15.95, 33.98, 70.23 s — a clean power-of-2 sweep) **and is flat across B at fixed G** (Grid A G=2: pcie ≈ 33.9 s for B ∈ {1, 4, 16, 64}). Combined with observation 2, total PCIe penalty per generate ≈ `(~18 ms unhidden per forward per offloaded layer) × forwards × layers_offloaded` — scales with coverage and forward count, but not per-forward duration. The clean linearity in coverage is consistent with each prefetched layer being independently throttled by the same per-forward hiding cap.
 
@@ -1095,26 +1333,41 @@ Cross-references:
 - `phase1a_findings.md §1.14` — sister table for COTS. Anchors the cots-vs-prefetch competition against `none` for both arms.
 - `phase1a_findings.md §1.13b` — cots-vs-prefetch numbers; the prefetch column there can now be re-anchored against `none`.
 
-### 0.10.4: nsys overlap probe
+### 0.10.6: nsys overlap probe
 
 Three short nsys traces written by `probe_native_offload_overlap.py` to `results/0.10_overlap_probe/`. Probe uses 25% coverage with the cleanest spatial pattern (uniform single-layer offloads via G=4 N=1). All three traces refreshed post-fix; pre-fix copies preserved under `results/0.10_overlap_probe-unfixed/` for direct visual comparison in `nsys-ui`.
 
-- **`prefetch_4x1.nsys-rep`** — open in `nsys-ui`. Look for: `copy_stream` (separate from the default CUDA stream) showing `Pinned→Device` memcpy events occurring *during* the cuBLAS / SDPA kernels of preceding GPU-resident layers. Stream attribution confirms compute and H2D run on different streams. Quantitatively from `nsys stats`: 3,466 H2D ops totaling 8.26 s of activity (vs 918 ops / 1.14 s for `none` — same baseline traffic, plus ~7 GB of explicit prefetch). Visually contrast against the `-unfixed` version where the wrap-around prefetch lands at the iter boundary ahead of input prep H2Ds; in the post-fix trace the same prefetch H2D fires ~one input-prep-window later, after the per-step H2Ds drain.
+- **`prefetch_4x1.nsys-rep`** — open in `nsys-ui`. Look for: `copy_stream` (separate from the default CUDA stream) showing `Pinned→Device` memcpy events occurring *during* the cuBLAS / SDPA kernels of preceding GPU-resident layers. Stream attribution confirms compute and H2D run on different streams. Quantitatively from `nsys stats`: 3,466 H2D ops totaling 8.26 s of activity (vs 918 ops / 1.14 s for `none` — same baseline traffic, plus ~7 GB of explicit prefetch). Visually contrast stock `prefetch` against `prefetch_defer`: in stock, the wrap-around prefetch lands at the iter boundary ahead of input prep H2Ds; in the optimized trace the same prefetch H2D fires ~one input-prep-window later, after the per-step H2Ds drain.
 - **`uva_4.nsys-rep`** — no extra H2D events versus `none` (801 ops / 0.79 s, ≈ baseline). UVA is a memory mapping, not a copy; per-kernel weight reads happen *inside* the cuBLAS/SDPA kernels and show up as inflated kernel durations on the layers whose weights are UVA-offloaded. This is the timeline manifestation of finding §0.10.2 (3).
 - **`none.nsys-rep`** — sanity baseline. No offload-related stream activity inside the decode region.
 
 ### Implications for COTS
 
-1. **Headline native-baseline at B=64**: at ~25% coverage, the strongest native option is `prefetch_4x1` (G=4, N=1, K=2 → 7 layers, 3.04 GiB, 5.74 s) — about 2.8× of `none`. At ~3.6% coverage (`prefetch_28x1`, 0.43 GiB) prefetch is now within ~3.5% of `none` post-fix (2.10 vs 2.03 s), so the COTS comparison surface shifts: at the low-depth end there is essentially no headroom for COTS to beat prefetch; the meaningful battleground is medium/high depth (≥1.7 GiB, G≤7) where prefetch still pays a structural intra-forward CE0 saturation tax that COTS's CPU-compute path can route around.
-2. **At fixed bytes, denser uniform spacing wins** (§0.10.1a, generalized in §0.10.1b to all depths — the densest-spread N=1 arms beat the clustered G=14 arms by 0–5% at B=64 across the depth range). This argues for the COTS partition's tensor-granularity approach over Group-style clustering — COTS spreads the offloaded fraction *within every layer* (no clustering at all), the limit case of "smaller G" in this sweep.
-3. **UVA is never the right baseline above B=1.** Even at low offload depth the per-token PCIe cost of UVA-mapped reads is prohibitive. When comparing COTS against "vLLM stock offloading", we use `prefetch_*` — `uva_*` is reported only as a sanity floor.
-4. **Layer-ahead (K=1) is empirically near-optimal.** Under the empirically best uniform spacing (§0.10.1d, G=4 N=1), K=2 buys only 2.7% at B=64 and K=4 OOMs. COTS's commitment to one prefetch queue per layer boundary is supported by both the contention analysis (§0.5/§0.9) and now this direct latency comparison.
-5. **Prefetch's host orchestration is structurally smaller than COTS's** (§0.10.3 — `dryrun − none` measured at ~5–10 ms per generate even at full coverage G=1, vs the §1.14 COTS orch column of ~450 ms — a ~50× gap). The prefetch path's C++-backed wrappers are not where any prefetch-vs-none regression comes from; the gap is essentially all unhidden PCIe transfer (`pcie = real − dryrun`). For COTS to compete at the high-coverage end, the Phase 1c native runner has to close most of that 450 ms orch column — the structural Python-substrate gap, not the GEMM path.
+1. **Headline native baselines at B=64 (post-restructure):**
+   - **Stock-best (§0.10.2)** at ~25% coverage = `prefetch_4x1` (canonical, 7 layers, 3.04 GiB) at K=1: 5.94 s (B=64). At ~17% coverage = `L4_G6_N1` (placement-aware, 4 layers, 1.74 GiB): 4.02 s.
+   - **Optimized-native (§0.10.5)** at ~25% coverage = `prefetch_defer` at G=4 N=1 K=2: 5.74 s (B=64) — within 1% of stock-best because at L=7 the canonical IS the stock-best.
+   - At ~3.6% coverage (L=1, 0.43 GiB) the gap between stock-best (`L1_G15_N1`: 2.32 s @ B=64, placement-aware) and `prefetch_defer` at canonical `G=28, N=1` (2.10 s @ B=64): defer wins by ~10% even after stock-best exploits placement, because defer's mechanism is structurally stronger (eliminates the wraparound's CE0 occupancy entirely, not just shortens the wait).
+   - **The COTS comparison surface shifts.** At the low-depth end (L=1, 0.43 GiB), the optimized-native baseline is within ~3.5% of `none` (2.10 vs 2.03 s) — essentially free. There is no headroom for COTS to beat it. The meaningful battleground is **medium/high depth** (≥1.7 GiB, L ≥ 4) where prefetch still pays a structural intra-forward CE0 saturation tax that COTS's CPU-compute path can route around.
+
+2. **At fixed bytes, placement vs spacing depends on L** (§0.10.2). At low L (≤5 layers), placement-aware non-divisor G with N=1 wins by 5–20%; at mid L (7–14), uniform divisor-G wins because dense spacing matters more. COTS's tensor-granularity approach (split *within* every layer) is the limit case — no clustering AND no final-layer concentration.
+
+3. **UVA is never the right baseline above B=1.** Even at low offload depth the per-token PCIe cost of UVA-mapped reads is prohibitive. When comparing COTS against shipped vLLM, use stock `prefetch` (`--offload-backend prefetch`) tuned per §0.10.2; when comparing against the thesis optimized-native baseline, use `prefetch_defer` (`--offload-backend prefetch_defer`). `uva_*` is reported only as a sanity floor.
+
+4. **Layer-ahead (K=1) is empirically near-optimal.** §0.10.2's K-sweep at the placement-aware Pareto-knee `(G=6, N=1)` and §0.10.3d's K-sweep at canonical `(G=4, N=1)` both find K=2 buys only ~2–3% over K=1 with K=4 OOMs at B=64. COTS's commitment to one prefetch queue per layer boundary is supported by both the contention analysis (§0.5/§0.9) and these direct latency comparisons.
+
+5. **Prefetch's host orchestration is structurally smaller than COTS's** (§0.10.5 — `prefetch_defer` dryrun − none measured at ~5–10 ms per generate even at full coverage G=1, vs the §1.14 COTS orch column of ~450 ms — a ~50× gap). The prefetch path's C++-backed wrappers are not where any prefetch-vs-none regression comes from; the gap is essentially all unhidden PCIe transfer (`pcie = real − dryrun`). For COTS to compete at the high-coverage end, the Phase 1c native runner has to close most of that 450 ms orch column — the structural Python-substrate gap, not the GEMM path.
 
 ### Recommendation for Phase 3 evaluation
 
 The §0.10 numbers form the headline native baselines COTS is compared against in Phase 3:
 
-- For each (model, batch, offload depth) point, the right native reference is **the best `prefetch_*` configuration at matched offloaded bytes** with tuning over (G, N, K), with `defer_wraparound=True` (the new default). Default vLLM settings (G=8 N=1 K=1) are *not* the best; the comparison should use measured optima. Per §0.10.1b (canonical coverage sweep, re-confirmed by the §0.10.2 head-to-head), the "densest-spread" arms are `prefetch_28x1` / `prefetch_14x1` / `prefetch_7x1` / `prefetch_4x1` / `prefetch_2x1` / `prefetch_1x1` covering 0.43 / 0.87 / 1.74 / 3.04 / 6.08 / 12.15 GiB. K=1 is near-optimal under uniform spread (§0.10.1d); K=2 is at most a 3% improvement and risks OOM at large batch.
+- Report two native references when possible. **Shipped vLLM stock** is `--offload-backend prefetch` with the best `(G, N, K)` from §0.10.2 (depth-dependent: placement-aware non-divisor G at low L, canonical divisor-G at mid L). **Optimized native thesis baseline** is `--offload-backend prefetch_defer` with the same matched-byte tuning; this captures the deferred-wraparound improvement without modifying stock `prefetch.py`.
+- Default vLLM settings (G=8 N=1 K=1) are *not* the best — at L=3 the picker would offload 3 layers including layer 27 (worst-case wraparound). The §0.10.2 best-stock-per-L table is the right reference for "what stock vLLM can do when properly tuned":
+  - L=1 (0.43 GiB): `--offload-group-size 15 --offload-num-in-group 1`
+  - L=2 (0.87 GiB): `--offload-group-size 10 --offload-num-in-group 1`
+  - L=4 (1.74 GiB): `--offload-group-size 6 --offload-num-in-group 1`
+  - L=7 (3.04 GiB): `--offload-group-size 4 --offload-num-in-group 1` (canonical divisor-G wins here)
+  - L=14 (6.08 GiB): `--offload-group-size 2 --offload-num-in-group 1` (canonical wins here too)
 - `uva_*` is reported as a sanity floor (worst-case stock option above B=1) but is not the primary comparison target.
+- K=1 is near-optimal at every depth (§0.10.2 K-sweep + §0.10.3d K-sweep agree). K=2 is at most a ~2–3% improvement and risks OOM at B=64 large batch.
 - `none` is a valid comparison only at zero offload — at non-trivial offload depths the baseline simply OOMs without an offloader.

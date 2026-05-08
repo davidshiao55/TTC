@@ -120,18 +120,20 @@ Section numbering aligns with `phase0_findings.md`. Each entry below is a forwar
 
 ### 0.10 vLLM native weight offloader baseline (Prefetch + UVA)
 
-**What:** Decode-step latency under vLLM's stock weight offloaders on 7B BF16. Four sub-experiments:
-- **PrefetchOffloader knob sweep** (§0.10.1): G ∈ {2, 4, 14, 28} (divisors of 28) at fixed 50% coverage, N at fixed G=14, K ∈ {1, 2, 3, 4} at fixed (G=14, N=4), and a densest-spread sub-sweep (N=1, varying G). Establishes the empirically best prefetch config.
-- **Head-to-head** (§0.10.2): Prefetch vs UVA at matched offloaded GiB across batch ∈ {1, 16, 64}, using prefetch's best config (N=1, G ∈ divisors of 28) from §0.10.1.
-- **Prefetch vs none — free regime** (§0.10.3): 3-arm `none / dryrun / real` sweep at fixed (N=1, K=1), varying G ∈ {1, 2, 4, 7, 14, 28}, on both decode-heavy and §0.10-matched workloads. Mirrors `phase1a_findings.md §1.14`'s COTS decomposition methodology, splitting the prefetch-vs-none gap into host orchestration vs unhidden PCIe transfer. Anchors the cots-vs-prefetch claim against `none` for both arms.
-- **nsys overlap probe** (§0.10.4): visual confirmation of H2D ↔ compute overlap on the best prefetch config.
+**What:** Decode-step latency under vLLM's stock weight offloaders on 7B BF16. Six sub-experiments:
+- **Stock Native Prefetch Mechanics** (§0.10.1): picker math + wraparound H2D theory; identifies the two sync surfaces (eager-mode CE0 contention, graph-mode `sync_prev_onload` drain).
+- **Stock Native Parameter Search** (§0.10.2): broad `(G, N)` sweep at K=1 finds the best stock config per offloaded-layer count. Headline: at low offload depth, non-divisor G with N=1 (placement-aware, avoiding layer 27) wins by 5–20% over canonical divisor-G.
+- **Canonical knob sweep** (§0.10.3): G ∈ {2, 4, 14, 28} (divisors of 28) at fixed 50% coverage, N at fixed G=14, K ∈ {1, 2, 3, 4} at fixed (G=14, N=4), and a densest-spread sub-sweep (N=1, varying G). Historical reference; superseded as "best stock" by §0.10.2.
+- **Head-to-head** (§0.10.4): Prefetch vs UVA at matched offloaded GiB across batch ∈ {1, 16, 64}, using prefetch's best config from §0.10.2.
+- **PrefetchDefer ablation** (§0.10.5): defer fix as an optimization on top of stock-best. Includes the 3-arm `none / dryrun / real` decomposition, the eager/graph mechanism analysis, and the 2x2 isolation experiment showing the two sync surfaces are mutually-occluding manifestations of one wraparound.
+- **nsys overlap probe** (§0.10.6): visual confirmation of H2D ↔ compute overlap on the best prefetch config.
 
 **Why:** The COTS thesis claims to outperform stock vLLM offloading. Without on-hardware baselines for both stock options, "COTS is faster" has no anchor point. Three empirical findings also feed back into the COTS design:
-1. **At fixed offload bytes, denser uniform spacing dominates clustering** — argues for tensor-granularity over Group-style partitioning.
-2. **K=1 (layer-ahead) within ≤6% of optimal K**, K=4 OOMs at B=64 — empirically validates the layer-ahead commitment in `pcie_bandwidth_allocation_design.md`.
-3. **Prefetch's free regime narrows quickly with coverage at small B** (§0.10.3) — anchors the cots-vs-prefetch competition against `none` for both arms, replacing "COTS regression vs none > prefetch regression vs none" as a structural assumption with measured numbers.
+1. **At fixed offload bytes, placement vs spacing depends on depth** — at low L, placement-aware non-divisor G wins; at mid L, dense uniform divisor-G wins. COTS's tensor-granularity approach is the limit case.
+2. **K=1 (layer-ahead) within ≤3% of optimal K**, K=4 OOMs at B=64 — empirically validates the layer-ahead commitment in `pcie_bandwidth_allocation_design.md`.
+3. **The defer fix recovers ~22% on top of stock-best at low L** (§0.10.5) — anchors the cots-vs-prefetch competition. The optimized-native baseline (`prefetch_defer`) is within ~3.5% of `none` at L=1; meaningful COTS headroom exists only at mid/high depth.
 
-**How:** `bench_prefetch_knobs.py` + `bench_uva_vs_prefetch.py` + `bench_prefetch_vs_none.py` + `probe_native_offload_overlap.py`. See `phase0_findings.md §0.10`.
+**How:** `bench_prefetch_full_sweep.py` + `bench_prefetch_knobs.py` + `bench_uva_vs_prefetch.py` + `bench_prefetch_vs_none.py` + `probe_native_offload_overlap.py`. See `phase0_findings.md §0.10`.
 
 ---
 
@@ -149,7 +151,7 @@ CPU-resident weights are CPU-computed each forward; `f_prefetch = 0`. Ships as a
 
 - Extend `MergedColumnParallelLinear` (MLP1 / gate_up) for a col-parallel CPU slice on the output dim.
 - Extend `RowParallelLinear` (MLP2 / down) for a row-parallel CPU slice on the input dim; assembly is `add_` (partial-sum reduce), not `concat`.
-- Extend `QKVParallelLinear` (WQKV) for a col-parallel CPU slice with the K/V-biased column picker. Implement the K/V-pin guard inside `CpuComputeDispatcher` (see `weight_offload_design.md §Implementation Note`).
+- Extend `QKVParallelLinear` (WQKV) for a col-parallel CPU slice with the K/V-biased column picker.
 - WO is untouched — stays fully GPU-resident, no CPU path, no prefetch path.
 - At model load: split each sub-module's weights into `W_gpu` and `W_cpu` along its assigned axis per the Planner's single `f_cpu_store` output (applied to WQKV/MLP1/MLP2 uniformly).
 - At forward: CPU and GPU compute their slices in parallel; assembly is `concat` for col-parallel and `add_` for row-parallel. For the MLP block, SwiGLU runs locally on each device's intermediate slice between MLP1 and MLP2 — no intermediate transfer (matched-index invariant is automatic under uniform dispatch).
@@ -165,16 +167,15 @@ Add `f_prefetch` to the per-bucket dispatch: CPU-stored bytes not covered by `f_
 
 - Add layer-ahead prefetch queue: one `cudaMemcpyAsync` (on CE0, the H2D copy engine) per layer boundary covering `Σ_m (f_prefetch × W_m)` across WQKV/MLP1/MLP2. One `cudaStreamWaitEvent` per layer. Bg prefetch and fg activation return use different PCIe paths (CE0 vs SM-issued UVA), so they share link BW but don't serialize on each other (`phase0_findings.md §0.5`).
 - Extend `CpuComputeDispatcher` to accept the `f_prefetch` share — prefetched weights land in the circular buffer and are consumed by the layer's GEMMs from GPU memory. `f_cpu_compute + f_prefetch_compute = f_cpu_store` exactly.
-- K/V-pin guard on WQKV (from 1a) ensures prefetch on WQKV only applies to Q columns above the K/V-bias boundary.
 - Planner's per-bucket output becomes a single `(f_cpu, f_prefetch)` pair — see `planner_design.md §4.2` and §7.3.
 
 **Expected result (7B at sub-milestone 1b):** layer-ahead prefetch enables meaningful `f_cpu_store` values without CPU-compute latency dominating at large batch. Free up GPU memory for larger KV pool without per-step latency regression at decode buckets where `f_prefetch` absorbs most of the offload.
 
 ### WQKV Column Choice (K/V-Biased)
 
-CPU columns for WQKV are assigned in priority order: KV-head groups (K+V together per head) first, then Q heads. For Qwen2.5-7B GQA, K+V together is 22% of WQKV output; at `f_cpu_store = 22%`, the strict Q | K | V split emerges naturally. See `weight_offload_design.md` for the full rationale (volume savings + H2D contention avoidance) and the K/V-pin guard as an implementation detail.
+CPU columns for WQKV are assigned in priority order: KV-head groups (K+V together per head) first, then Q heads. For Qwen2.5-7B GQA, K+V together is 22% of WQKV output; at `f_cpu_store = 22%`, the strict Q | K | V split emerges naturally. See `weight_offload_design.md` for the full rationale (volume savings + H2D contention avoidance).
 
-**Relevance to Phase 2**: above the 22% K/V-biased boundary, the K/V-pin guard keeps all K/V columns CPU-computed — K/V output lands directly in the suffix cache, no D2H. Below 22%, K/V output for the GPU-resident portion still requires D2H to CPU cache each step; K/V-group bias only *reduces* this transfer vs. uniform, not eliminates it.
+**Relevance to Phase 2**: at `f_cpu_compute ≥ 22%` all K/V columns are CPU-computed by the dispatch table — K/V output lands directly in the suffix cache, no D2H. At `f_cpu_compute < 22%`, K/V output for the GPU-resident / prefetched portion still requires D2H to CPU cache each step. The Planner's cost model (`planner_design.md §7.3`) charges this round-trip and biases toward `f_cpu_compute ≥ K/V fraction` when the budget allows.
 
 ### Size Budget (Qwen2.5-7B, GQA: 28 Q heads, 4 KV heads, head_dim=128)
 
@@ -394,11 +395,12 @@ Phase 2 work lives in the attention backend + CPU attention kernel and is orthog
    (`phase0_findings.md §0.5`: fg activation returns use a separate
    PCIe path from CE0, so they don't queue behind bg DMA prefetches).
 
-5. **K/V-biased WQKV column choice + K/V-pin guard.** Picker assigns CPU
-   columns in priority order (K+V head pairs first, then Q tail). Runtime
-   K/V-pin guard in `CpuComputeDispatcher` keeps K/V CPU-computed regardless
-   of the uniform `f_cpu`, avoiding K/V round-trip. See
-   `weight_offload_design.md §Implementation Note`.
+5. **K/V-biased WQKV column choice.** Picker assigns CPU columns in
+   priority order (K+V head pairs first, then Q tail) so the K/V slice
+   sits at the start of cpu_indices. The Planner's cost model charges
+   the K/V round-trip when `f_cpu_compute < K/V fraction` and biases the
+   optimum toward avoiding it. See `weight_offload_design.md §Implementation
+   Note: WQKV K/V Positioning` and `planner_design.md §7.3`.
 
 6. **All PCIe to weight prefetch.** No KV prefetch. Suffix attention → CPU
    only. Batch size is the control variable for CPU attention bottleneck.
