@@ -990,7 +990,31 @@ Patch sites:
   `runner._infer.set_worker_affinity(mask)` becomes
   `cots_ops.set_worker_affinity(runner._runner_id, mask)`.
 
-Coverage: `David/Tests/phase1c/test_runner_picklable.py` (4 tests):
+### Ownership: pickled copies must be non-owning (review fix)
+
+The first cut of the §1c.19 fix had a high-severity bug. The
+unpickled facade shared `_runner_id` with the original AND ran the
+same `__del__`. PyTorch's AOT guard cache pickles+unpickles the
+runner during guard serialization — GC of any unpickled copy could
+hit `_unregister_infer(rid)` on a live entry, causing the original
+runner's next custom-op call to fail with `runner_id not in
+registry`.
+
+Fix:
+
+- `NativeCotsRunner.__init__` adds
+  `self._owns_infer_registry_entry: bool = True`. The original
+  constructor is the sole owner; only it may drop the registry
+  entry.
+- `__getstate__` flips the flag to False on the pickled state, so
+  unpickled copies are non-owning by construction. `__setstate__`
+  defaults to non-owning if a future state dict ever omits the
+  flag.
+- `close()` and `__del__` both early-return when
+  `_owns_infer_registry_entry` is False. Owning `close()` clears
+  the flag after unregistering so a second `close()` is a no-op.
+
+Coverage: `David/Tests/phase1c/test_runner_picklable.py` (8 tests):
 - `pickle.dumps(NativeCotsRunner)` succeeds (the AOT-cache
   serialization path).
 - The runner's `__dict__` contains no `CotsCpuInfer` instance
@@ -1002,6 +1026,12 @@ Coverage: `David/Tests/phase1c/test_runner_picklable.py` (4 tests):
 - After a pickle round-trip, the unpickled facade still names the
   same registry slot — i.e., the runner facade is "a tagged
   pointer into `cots_ops._COTS_INFER`."
+- **Ownership tests (review-fix, the high-severity finding):**
+  - GC of an unpickled copy does NOT unregister the original.
+  - `close()` on an unpickled copy is a no-op.
+  - `close()` on the owning original still drains and unregisters.
+  - `__getstate__` marks the pickled state non-owning; the
+    original's flag is unchanged by introspection.
 
 Plus seven existing tests rewritten for the new registry surface
 (`test_stage2_substrate.test_infer_registry_*`,

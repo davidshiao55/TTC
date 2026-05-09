@@ -112,3 +112,92 @@ def test_pickled_runner_can_be_used_via_registry_id() -> None:
         )
     finally:
         r.close()
+
+
+# --- Ownership semantics — review-fix for the high-severity finding -------
+#
+# After §1c.19's first cut, an unpickled NativeCotsRunner shared the
+# original's `_runner_id` AND the same `__del__`. PyTorch's AOT guard
+# cache pickles + unpickles the runner as part of guard serialization;
+# GC of any unpickled copy could `_unregister_infer(rid)` on the live
+# entry, causing a downstream `runner_id not in registry` failure on
+# the next custom op call. The fix adds an ownership flag,
+# `_owns_infer_registry_entry`, that `__getstate__` flips to False on
+# the pickled state. `close()` / `__del__` no-op for non-owners.
+
+
+def test_unpickled_copy_gc_does_not_unregister_original() -> None:
+    """The exact bug the reviewer flagged: unpickle a runner, drop the
+    copy, GC, and confirm the ORIGINAL's registry entry is still
+    intact. Before the ownership fix this would fail."""
+    import gc
+
+    from vllm.model_executor.offloader import cots, cots_ops
+
+    r = cots.NativeCotsRunner(dry_run=False)
+    try:
+        rid = r._runner_id
+        assert cots_ops._COTS_INFER.get(rid) is not None
+        r2 = pickle.loads(pickle.dumps(r))
+        assert r2._runner_id == rid
+        # Drop the unpickled copy and force GC. Its `__del__` must NOT
+        # unregister rid because it does not own the registry entry.
+        del r2
+        gc.collect()
+        assert cots_ops._COTS_INFER.get(rid) is not None, (
+            "Unpickled copy's GC unregistered the live runner's infer; "
+            "ownership flag is missing or incorrect."
+        )
+    finally:
+        r.close()
+        assert cots_ops._COTS_INFER.get(r._runner_id) is None
+
+
+def test_unpickled_copy_close_is_noop() -> None:
+    """`r2.close()` on a non-owning copy must NOT touch the registry."""
+    from vllm.model_executor.offloader import cots, cots_ops
+
+    r = cots.NativeCotsRunner(dry_run=False)
+    try:
+        rid = r._runner_id
+        r2 = pickle.loads(pickle.dumps(r))
+        r2.close()  # non-owning: should no-op
+        assert cots_ops._COTS_INFER.get(rid) is not None, (
+            "Unpickled copy's close() unregistered the live runner's infer."
+        )
+    finally:
+        r.close()
+
+
+def test_owning_runner_close_still_unregisters() -> None:
+    """The owning runner's `close()` is unchanged — it drains and
+    unregisters. The ownership flag must not interfere with the
+    happy path."""
+    from vllm.model_executor.offloader import cots, cots_ops
+
+    r = cots.NativeCotsRunner(dry_run=False)
+    rid = r._runner_id
+    assert cots_ops._COTS_INFER.get(rid) is not None
+    r.close()
+    assert cots_ops._COTS_INFER.get(rid) is None
+    # Idempotent: second close on the now-non-owning runner no-ops.
+    r.close()
+
+
+def test_pickled_state_marks_non_owning() -> None:
+    """Inspect the pickle state directly to confirm `__getstate__` flips
+    the ownership flag. This is a defense-in-depth gate: future
+    refactors that add new attrs need to keep this invariant.
+    Independent of `__del__` behavior."""
+    from vllm.model_executor.offloader import cots
+
+    r = cots.NativeCotsRunner(dry_run=False)
+    try:
+        state = r.__getstate__()
+        assert state["_owns_infer_registry_entry"] is False, (
+            "__getstate__ must mark the pickled state as non-owning."
+        )
+        # Original's flag is unchanged by `__getstate__`.
+        assert r._owns_infer_registry_entry is True
+    finally:
+        r.close()
