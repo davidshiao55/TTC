@@ -122,6 +122,24 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   the controlled experiment, the counter-attribution fix
   (immutable `bucket_capacity_tokens`), and the §1c.23 prototype
   scope.
+- §1c.23 (UVA-side prototype) — **PROTOTYPE TRIED, NOT ENOUGH TO
+  LAND**. Static-grid Triton UVA kernel reading device-resident
+  `live_n` and masking rows ≥ live_n was implemented on a working
+  tree / experimental branch and gated behind a flag. Output
+  bit-identical to baseline. A/B at default cap sizes:
+  `delta_off = +0.7679 s`, `delta_on = +0.7748 s`,
+  `improvement = −0.007 s/gen` — i.e., the masked arm was 7 ms
+  SLOWER than the baseline arm, within run-to-run noise. The
+  decision gate (≥+0.12 s/gen) was not met. Runtime code was
+  REVERTED from the thesis branch and preserved on the
+  `phase1c23-live-masked-uva-experiment` branch in the vllm
+  submodule for future revisits if the input-D2H side is
+  patched. Implication: the bucket-sensitive component is not
+  output-bytes-bound; remaining attribution (input D2H byte
+  cost, host-callback overhead, Triton dispatch cost, Dynamo
+  guard overhead) needs nsys to separate before further
+  prototyping (§1c.24 candidate would patch the captured
+  cudaMemcpyAsync via `cudaGraphExec*Node*Params`).
 
 ---
 
@@ -1597,6 +1615,73 @@ relative to the re-measured `live_masked=off` arm, with no
 correctness regression and no `none_capture` regression. Below
 that, document as "tried, not enough to land" and move to nsys
 attribution of the residual graph-shape effects.
+
+#### §1c.23 result — prototype tried, not enough to land
+
+UVA-side static-grid masked Triton kernel was implemented on a
+working tree / experimental branch
+(`phase1c23-live-masked-uva-experiment` in the vllm submodule)
+and gated behind a `CotsOffloadConfig.live_masked_uva` flag
+(default off) plus a `--cots-live-masked-uva` CLI flag. Output
+parity verified bit-identical to baseline at `temperature=0.0,
+seed=0` for a 32-token sample under both flag values.
+
+Wall-clock A/B at default capture sizes, B=1, input_len=8,
+output_len=128, Qwen2.5-7B BF16, f_cpu_store=0.05, **0 warmup +
+1 iter**:
+
+| arm | wall-clock | COTS delta vs C |
+|---|---|---|
+| C: `none_capture` | 2.044 s | — |
+| A: `native_capture_real`, `live_masked_uva=False` | 2.812 s | +0.768 s |
+| B: `native_capture_real`, `live_masked_uva=True`  | 2.818 s | +0.775 s |
+
+**Improvement: −0.007 s/gen** — B is 7 ms slower than A, within
+run-to-run variance. Decision gate of ≥+0.12 s/gen NOT met.
+
+Runtime code was **reverted** from the thesis branch after the
+A/B failed. The implementation lives on the
+`phase1c23-live-masked-uva-experiment` branch in the vllm
+submodule for future revisits if the input-D2H side is patched.
+The §1c.23 bench script
+(`David/Benchmarks/phase1c/bench_live_masked_uva_ab.py`) is
+kept as the reproducible methodology for the failed prototype;
+running it requires the experiment branch.
+
+Interpretation: the bucket-sensitive ~0.24 s/gen component
+identified in the §1c.22 controlled diagnostic is **not
+output-bytes-bound**. Output rows are smaller than input rows
+in absolute bytes for QKV (cpu_out_dim < in_dim by the
+KV-fraction at f=0.05), and the SM-issued masked Triton kernel
+also adds a per-element mask check that offsets some of the
+saved memory traffic. Remaining attribution candidates:
+
+* **Input D2H byte cost.** The captured `cudaMemcpyAsync`
+  byte count is bucket-sized and runs on the H2D copy engine
+  in parallel with GPU compute. If GPU compute is the longer
+  pole, the copy is hidden; if not, it adds. nsys timeline
+  inspection is the next attribution step.
+* **Host-callback dispatch cost.** Each replay fires
+  `cudaLaunchHostFunc` for submit and sync. Latency adds
+  per-layer, scaled by bucket count visited (irrelevant to
+  byte-traffic but bucket-shape-correlated).
+* **Triton dispatch / kernel-launch overhead.** The masked
+  kernel is the same shape as before (same grid, same bytes
+  reserved); a per-replay kernel launch cost dominates if
+  bytes are small.
+* **Dynamo guard / FX overhead.** PIECEWISE re-execution at
+  decode time runs Python code per forward; bucket
+  distribution affects how often each PIECEWISE bucket
+  graph fires. Independent of byte-traffic.
+
+Recommendation: **stop bucket-side prototyping; switch to
+nsys attribution** before any further mechanism work. The
+matched-delta diagnostic established that ~0.24 s/gen is
+bucket-correlated; nsys is the right tool to separate that
+into D2H bytes vs host_fn vs Triton dispatch vs PIECEWISE
+Python overhead. Future mechanism choices (§1c.24+) should
+be motivated by that breakdown, not by extending the UVA
+mask.
 
 ---
 
