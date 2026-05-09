@@ -102,13 +102,14 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   tensor visible in the captured graph (CLOSED — both ops now
   CUDA-tensors-and-scalar-ids only; pinned buffers reached via
   slab pointers in C++)
-- §1c.21 — Open: perf investigation of native+capture vs
-  native+eager. Settled multi-iter numbers across t={4,8,16}: orch
-  +0.46–0.47 s under capture vs +0.28–0.31 s under eager;
-  cpu_work +120–190 s under capture vs +0.09–0.28 s under eager
-  (425× per-GEMM amplifier). Thread-gate fix (`torch.set_num_threads`
-  scoped to python runner) ruled out as primary cause. Next step:
-  C++ counters before nsys.
+- §1c.21 — **DIAGNOSED, fix open**: under vLLM's full CUDA graph
+  capture, the runtime selects a LARGE captured bucket (>64
+  tokens) for B=1 decodes instead of bucket=1. C++ counters
+  (added in this round) show 76% of capture-mode submits fire
+  at `nt > 64` vs 70% at `nt = 1` under eager. The fix is to
+  decouple "graph shape" from "logical active tokens" — runner
+  must pass live num_tokens to C++, not `x_gpu.shape[0]` which
+  reflects the captured padded shape.
 
 ---
 
@@ -1355,9 +1356,117 @@ how that investigation lands: any future fix to the perf path
 requires Inductor not materializing our CPU views, which is
 exactly what the §1c.20 schema swap guarantees.
 
-§1c.21 follow-up (open): perf investigation of native+capture vs
-native+eager. Numbers above (multi-iter, t={4,8,16}) localize the
-shape of the regression:
+§1c.21 follow-up: DIAGNOSED via C++ counters; fix open.
+
+### Counter-driven diagnosis
+
+A focused histogram of submitted `num_tokens` by op kind, exposed
+via `CotsCpuInfer.get_counters()` and dumped at process exit when
+`VLLM_COTS_DUMP_COUNTERS=1`, revealed the root cause immediately.
+Tiny smoke at `output_len=8`, B=1, t=16, f=0.05, 1 iter no warmup:
+
+```
+                 EAGER (native_eager_real)   CAPTURE (native_capture_real)
+                 wall: 0.22 s                wall: 7.78 s (35× slower)
+
+submit_count_qkv   280                       5096   (18×)
+submit_count_mlp   280                       5096   (18×)
+
+QKV num_tokens histogram:
+  nt_le_1          196   (70%)               112    (2.2%)
+  nt_le_2            0                       112    (2.2%)
+  nt_le_4            0                       112    (2.2%)
+  nt_le_8           28   (10%)               112    (2.2%)
+  nt_le_16           0                       112    (2.2%)
+  nt_le_32           0                       224    (4.4%)
+  nt_le_64           0                       448    (8.8%)
+  nt_gt_64          56   (20%)              3864   (76%)   ← !!!
+
+D2H bytes:
+  d2h_1d_count      560                      10192  (18×)
+  d2h_1d_bytes      3.4 GB                   16.4 GB (4.8×)
+```
+
+Under eager 70% of all CPU GEMM submits fire at `num_tokens=1`
+(matching the actual B=1 decode), with the prefill of input_len=8
+showing up as 28 ops at `nt_le_8` and a one-time KV-profile forward
+at `nt_gt_64`. Under capture, **only 2.2% of submits fire at
+`nt=1`**; **76% fire at `nt>64`**. Capture is doing CPU GEMMs for
+the **captured graph-bucket size, not the live decode count**.
+
+The reviewer's microbench data closes the math:
+
+- Captured QKV at tokens=1: 52 μs.
+- Captured MLP at tokens=1: 176 μs.
+- Captured QKV at tokens=256: 4.8 ms.
+- Captured MLP at tokens=256: 28.5 ms.
+- Combined per layer at tokens=256: ~33 ms.
+- 28 layers × 128 decode steps × 33 ms ≈ **118 s** ≈ observed
+  `cpu_work_native_capture` of 120 s @ t=16.
+
+So the per-call host-callback machinery is fine; the worker is
+just doing 256× more arithmetic per call than it should be.
+
+### Why this happens
+
+`NativeCotsRunner.submit_with_d2h(x_gpu, op_descriptor)` reads
+`num_tokens = int(x_gpu.shape[0])` and hands it to
+`infer.submit_on_stream`. Under eager, `x_gpu.shape[0]` IS the live
+token count (B=1 decode → 1). Under capture, vLLM compiles the
+forward into a captured graph for some bucket size (e.g., 256 if
+that's the smallest captured bucket ≥ live tokens, or more
+typically a fixed full-graph descriptor) — `x_gpu.shape[0]` at
+capture time is the bucket size. That value is BAKED into the
+captured graph: the cudaMemcpyAsync byte count, the `num_tokens`
+written into the slab, and downstream ATen view shapes are all
+frozen at the capture-time bucket value. Replays at B=1 decode
+re-fire the captured ops at the bucket size, doing 256× the work.
+
+Eager mode doesn't go through capture, so each forward sees the
+true live token count. The `cpu_work_native_eager` of +0.09–0.28 s
+is what the workload actually costs.
+
+### Fix direction (open)
+
+The runner needs the **logical active token count**, not
+`x.shape[0]`. vLLM tracks this in the BatchDescriptor handed to
+`prepare_before_forward(num_actual_tokens)` (called at
+`cudagraph_utils.py:267`, OUT OF GRAPH). The offloader already
+caches `_current_bucket = self._bucket_for(num_actual_tokens)`
+there. The fix is to plumb the live `num_actual_tokens` to the
+C++ side via a side channel that varies per replay:
+
+- Option A: store live `num_actual_tokens` on the offloader, read
+  it in the operator's Python code, hand to `submit_on_stream`.
+  The catch: under capture, the operator is traced by Inductor —
+  reading `offloader._current_bucket` bakes in a constant. Need a
+  graph-input-style entry that varies per replay.
+- Option B: set up vLLM's capture so each captured graph DOES
+  encode the live num_tokens. The bucket selection at decode
+  time would then pick the bucket=1 graph for B=1 decodes,
+  which captured num_tokens=1 and replays accordingly. This is
+  what the existing per-bucket capture machinery is supposed
+  to do; investigating why it isn't picking bucket-1 for B=1
+  is the first step.
+- Option C: capture-sizes restricted to [1] as a quick experiment
+  to verify the diagnosis. The reviewer noted: "if the 120s
+  collapses, that confirms the diagnosis immediately." If the
+  bug is "vLLM picked the wrong captured graph", restricting to
+  one captured size forces the right one.
+
+Of these, (B)/(C) are tactical (working with vLLM's existing
+mechanism); (A) is more invasive but most direct. The next
+investigation step is to instrument WHICH bucket the
+`prepare_before_forward` call is receiving for B=1 decodes —
+that pins down whether vLLM is selecting the wrong captured
+graph or whether the graph itself is wrong.
+
+### Original analysis below (now superseded)
+
+Numbers above (multi-iter, t={4,8,16}) localized the shape of the
+regression but did NOT pin the root cause. The counter-driven
+diagnosis above did. Keeping the wall-clock observations for
+historical reference:
 
 - The capture orch overhead is roughly constant at ~+0.18 s
   (capture - eager) across thread counts → the per-layer dispatch
