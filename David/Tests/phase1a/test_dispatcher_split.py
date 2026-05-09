@@ -79,7 +79,9 @@ def _run_cpu_gemm(
     runner.install({op_descriptor: _cb})
     dummy_anchor = torch.empty(1, dtype=torch.bfloat16, device="cuda")
     runner.submit_with_d2h(x_gpu, x_pinned_view, y_pinned_view, op_descriptor)
-    runner.wait_and_uva(y_pinned_view, y_gpu_view, dummy_anchor, dummy_anchor)
+    runner.wait_and_uva(
+        y_pinned_view, y_gpu_view, dummy_anchor, dummy_anchor, x_gpu
+    )
     return y_gpu_view
 
 

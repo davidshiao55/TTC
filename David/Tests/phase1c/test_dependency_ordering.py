@@ -58,28 +58,71 @@ def _schema_mutated_args(schema_str: str) -> list[str]:
     return pattern.findall(schema_str)
 
 
-def test_cots_submit_gemm_mutates_x_gpu_and_y_pinned() -> None:
-    """`cots_submit_gemm` must declare `x_gpu` and `y_pinned` as
-    mutated arguments specifically. `x_gpu` is the CUDA-anchor that
-    pins the op BEFORE every GPU GEMM that reads it; `y_pinned` is
-    the buffer the worker fills."""
+def test_cots_submit_gemm_mutates_only_x_gpu() -> None:
+    """`cots_submit_gemm` must declare ONLY `x_gpu` as mutated.
+
+    §1c.20: `y_pinned` was previously declared mutated, which caused
+    Inductor's functionalization to clone the pinned slice into a
+    fresh pageable CPU buffer post-mutation. The new schema removes
+    `y_pinned` from the op signature entirely; the worker writes to
+    the pinned output via the slab-side pointer populated at install
+    time, and `cots_sync_then_uva` reads `submit_anchor` (= x_gpu)
+    to enforce the (submit → sync) data dependency.
+    """
     schema = str(torch.ops.vllm.cots_submit_gemm.default._schema)
     mutated = _schema_mutated_args(schema)
     assert "x_gpu" in mutated, (
         f"cots_submit_gemm must mutate `x_gpu` (the CUDA-anchor that "
-        f"pins this op before GPU GEMMs reading x_gpu). Schema: {schema}"
+        f"pins this op before GPU GEMMs reading x_gpu, AND the read by "
+        f"cots_sync_then_uva that pins sync after submit). Schema: {schema}"
     )
-    assert "y_pinned" in mutated, (
-        f"cots_submit_gemm must mutate `y_pinned` (the worker output "
-        f"buffer). Schema: {schema}"
+    assert "y_pinned" not in mutated, (
+        f"§1c.20: `y_pinned` MUST NOT be in cots_submit_gemm's "
+        f"mutates_args. Inductor's functionalization clones the pinned "
+        f"slice into a fresh pageable CPU buffer when y_pinned is "
+        f"declared mutated, breaking uva_copy_into_gpu's page-locked-"
+        f"storage requirement. The worker writes via the slab pointer; "
+        f"the (submit → sync) dep rides on x_gpu's submit_anchor read. "
+        f"Schema: {schema}"
     )
-    # No OTHER args should be marked mutated — the design intentionally
-    # restricts the mutation set to exactly these two so torch.compile's
-    # alias-set tracking matches the actual semantics.
-    unexpected = set(mutated) - {"x_gpu", "y_pinned"}
+    unexpected = set(mutated) - {"x_gpu"}
     assert not unexpected, (
         f"cots_submit_gemm has unexpected mutated args {unexpected}; "
         f"schema: {schema}"
+    )
+
+
+def test_cots_submit_gemm_does_not_take_y_pinned() -> None:
+    """§1c.20: `y_pinned` is not just removed from `mutates_args` —
+    it's removed from the op's argument list entirely. This is what
+    ensures Inductor never sees the pinned slice as a custom-op
+    input that could be functionalized into a pageable clone."""
+    schema = str(torch.ops.vllm.cots_submit_gemm.default._schema)
+    assert "y_pinned" not in schema, (
+        f"§1c.20: cots_submit_gemm's signature MUST NOT contain "
+        f"y_pinned. The previous schema's `y_pinned` arg with "
+        f"`mutates_args=[..., 'y_pinned']` triggered Inductor's "
+        f"functionalization clone. Schema: {schema}"
+    )
+
+
+def test_cots_sync_then_uva_takes_submit_anchor() -> None:
+    """§1c.20: `cots_sync_then_uva` must take a `submit_anchor`
+    argument (read-only) so torch.compile can chain (submit → sync)
+    via the x_gpu data dependency without y_pinned being in submit's
+    mutates_args. submit_anchor is NOT in mutates_args — only y_gpu
+    and the two gpu anchors are."""
+    schema = str(torch.ops.vllm.cots_sync_then_uva.default._schema)
+    assert "submit_anchor" in schema, (
+        f"§1c.20: cots_sync_then_uva must take a `submit_anchor` arg "
+        f"(read-only) so sync stays after submit via the x_gpu read. "
+        f"Schema: {schema}"
+    )
+    mutated = _schema_mutated_args(schema)
+    assert "submit_anchor" not in mutated, (
+        f"submit_anchor must be read-only — mutating it would force "
+        f"y_gpu / gpu_anchors / x_gpu to alias-share with submit's "
+        f"barrier, defeating the design. Schema: {schema}"
     )
 
 
@@ -186,14 +229,18 @@ def test_fx_graph_orders_submit_before_gpu_gemms_before_sync() -> None:
 
     def forward(x, x_pin, y_pin, y_gpu, w_perm, w_pref, dummy_a, dummy_b):
         # Mirror the operator's call sequence (CotsQKVOp.apply core).
+        # §1c.20 schema: submit no longer takes y_pin; sync takes a
+        # `submit_anchor` (= x) read so the (submit → sync) data
+        # dependency is carried by x without y_pin in submit's
+        # mutates_args.
         x_pin.copy_(x, non_blocking=True)
         torch.ops.vllm.cots_submit_gemm(
-            x, x_pin, y_pin, runner_id, 0, x.shape[0]
+            x, x_pin, runner_id, 0, x.shape[0]
         )
         out_perm = torch.nn.functional.linear(x, w_perm)
         out_pref = torch.nn.functional.linear(x, w_pref)
         torch.ops.vllm.cots_sync_then_uva(
-            y_pin, y_gpu, out_perm, out_pref, runner_id
+            y_pin, y_gpu, out_perm, out_pref, x, runner_id
         )
         return out_perm, out_pref, y_gpu
 
@@ -231,7 +278,7 @@ def test_fx_graph_orders_submit_before_gpu_gemms_before_sync() -> None:
             assert i_submit < i_lin, (
                 f"FX graph has cots_submit_gemm AFTER an F.linear "
                 f"(submit at {i_submit}, linear at {i_lin}). The "
-                f"mutates_args=['x_gpu', 'y_pinned'] declaration on "
+                f"mutates_args=['x_gpu'] declaration on "
                 f"cots_submit_gemm must pin it BEFORE every GPU GEMM "
                 f"that reads x_gpu — capture would break overlap and "
                 f"the worker would race the D2H copy."
@@ -276,12 +323,14 @@ def test_fx_graph_export_succeeds_without_graph_break() -> None:
 
     def forward(x, x_pin, y_pin, y_gpu, w_perm, dummy):
         x_pin.copy_(x, non_blocking=True)
+        # §1c.20 schema: submit drops y_pin; sync takes submit_anchor
+        # (= x) for the cross-op data dep.
         torch.ops.vllm.cots_submit_gemm(
-            x, x_pin, y_pin, runner_id, 0, x.shape[0]
+            x, x_pin, runner_id, 0, x.shape[0]
         )
         out_perm = torch.nn.functional.linear(x, w_perm)
         torch.ops.vllm.cots_sync_then_uva(
-            y_pin, y_gpu, out_perm, dummy, runner_id
+            y_pin, y_gpu, out_perm, dummy, x, runner_id
         )
         return out_perm, y_gpu
 
