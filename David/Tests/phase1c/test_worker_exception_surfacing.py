@@ -86,7 +86,7 @@ def test_worker_throw_does_not_hang_sync():
     ci, _keepalive = _force_mlp_scratch_unavailable_error()
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
-    ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr)
+    ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
     ci.sync_on_stream(cuda_stream=stream_ptr)
     # Drive the stream forward. The dispatch host callback fires →
     # worker runs → throws → catch sets has_error_. The sync host
@@ -102,7 +102,7 @@ def test_check_error_raises_runtime_error_with_message():
     ci, _keepalive = _force_mlp_scratch_unavailable_error()
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
-    ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr)
+    ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
     ci.sync_on_stream(cuda_stream=stream_ptr)
     torch.cuda.current_stream().synchronize()
     assert ci.has_error()
@@ -126,20 +126,20 @@ def test_next_submit_call_re_raises_after_worker_failure():
     ci, _keepalive = _force_mlp_scratch_unavailable_error()
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
-    ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr)
+    ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
     ci.sync_on_stream(cuda_stream=stream_ptr)
     torch.cuda.current_stream().synchronize()
 
     # The next submit_on_stream call's check_error() surfaces.
     with pytest.raises(RuntimeError, match="scratch_silu_up_"):
-        ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr)
+        ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
 
 
 def test_take_error_consumes_state():
     ci, _keepalive = _force_mlp_scratch_unavailable_error()
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
-    ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr)
+    ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
     ci.sync_on_stream(cuda_stream=stream_ptr)
     torch.cuda.current_stream().synchronize()
     assert ci.has_error()

@@ -179,16 +179,32 @@ def test_fused_mlp_emits_exactly_one_uva_copy():
 
     import vllm.model_executor.offloader.cots as cots_mod
 
+    # Phase 1c §1c.20 split the UVA helpers: `uva_copy_into_gpu` is the
+    # public eager-path helper (PythonCotsRunner.wait_and_uva); the
+    # native-runner captured path uses `_uva_copy_trusted_host_into_gpu`
+    # (skips the pinned-storage assertion because the slab pointer's
+    # page-locked-ness is an install-time invariant). Patch BOTH and
+    # require the operator to go through exactly one of them.
     counter = {"calls": 0}
-    real = cots_mod.uva_copy_into_gpu
+    real_public = cots_mod.uva_copy_into_gpu
+    real_trusted = cots_mod._uva_copy_trusted_host_into_gpu
 
-    def counting_uva(src, dst):
+    def counting_public(src, dst):
         counter["calls"] += 1
-        return real(src, dst)
+        return real_public(src, dst)
 
-    with patch.object(cots_mod, "uva_copy_into_gpu", counting_uva):
-        # CotsSwiGLUMLPOp.__call__ resolves uva_copy_into_gpu from module
-        # scope on each call, so patch.object reaches it.
+    def counting_trusted(src, dst):
+        counter["calls"] += 1
+        return real_trusted(src, dst)
+
+    with (
+        patch.object(cots_mod, "uva_copy_into_gpu", counting_public),
+        patch.object(
+            cots_mod,
+            "_uva_copy_trusted_host_into_gpu",
+            counting_trusted,
+        ),
+    ):
         _ = layer.mlp(x)
         torch.cuda.synchronize()
 

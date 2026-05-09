@@ -135,7 +135,7 @@ def test_native_runner_strided_down_proj_matches_python():
 
     # Drive through the public host-callback path on a real CUDA stream.
     stream = torch.cuda.current_stream().cuda_stream
-    ci.submit_on_stream(task_id=0, num_tokens=NUM_TOKENS, cuda_stream=stream)
+    ci.submit_on_stream(task_id=0, num_tokens=NUM_TOKENS, cuda_stream=stream, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
     ci.sync_on_stream(cuda_stream=stream)
     torch.cuda.current_stream().synchronize()
     assert not ci.has_error()
@@ -217,9 +217,9 @@ def test_native_runner_strided_down_proj_offset_pointer_is_load_bearing():
     )
 
     stream = torch.cuda.current_stream().cuda_stream
-    ci.submit_on_stream(task_id=0, num_tokens=NUM_TOKENS, cuda_stream=stream)
+    ci.submit_on_stream(task_id=0, num_tokens=NUM_TOKENS, cuda_stream=stream, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
     ci.sync_on_stream(cuda_stream=stream)
-    ci.submit_on_stream(task_id=1, num_tokens=NUM_TOKENS, cuda_stream=stream)
+    ci.submit_on_stream(task_id=1, num_tokens=NUM_TOKENS, cuda_stream=stream, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
     ci.sync_on_stream(cuda_stream=stream)
     torch.cuda.current_stream().synchronize()
     assert not ci.has_error()

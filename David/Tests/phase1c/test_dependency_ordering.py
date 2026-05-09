@@ -2,13 +2,20 @@
 """Stage 5 — `mutates_args` actually prevents compile-time reordering.
 
 The whole correctness story of `cots_ops.py` rests on torch.compile
-honoring the barrier-installing `mutates_args` declarations:
-  * `cots_submit_gemm` mutates `["x_gpu", "y_pinned"]` so the op is
-    pinned BEFORE every GPU GEMM that reads x_gpu (preserves overlap).
+honoring the barrier-installing `mutates_args` declarations. Final
+schemas after the §1c.20 simplification:
+  * `cots_submit_gemm` mutates `["x_gpu"]` (only) — pins this op
+    BEFORE every GPU GEMM that reads x_gpu, AND provides the
+    (submit → sync) ordering edge consumed by sync's
+    `submit_anchor` read. y_pinned and x_pinned are NOT in the op
+    signature; the C++ side owns the pinned-buffer addresses via
+    slab pointers populated at install time.
   * `cots_sync_then_uva` mutates `["y_gpu", "gpu_anchor_a",
     "gpu_anchor_b"]` so the op is pinned AFTER each independent GPU
     GEMM (preserves overlap; both anchors needed for QKV's two
-    independent F.linears).
+    independent F.linears). It also reads `submit_anchor` (==
+    x_gpu) for the cross-op data dep, and resolves the pinned
+    output via `CotsCpuInfer.y_pinned_view(task_id, num_tokens)`.
 
 A weaker version of this test (output parity under torch.compile)
 would pass even if the compiler hoisted `sync_then_uva` ABOVE the
@@ -126,6 +133,35 @@ def test_cots_sync_then_uva_takes_submit_anchor() -> None:
     )
 
 
+def test_cots_sync_then_uva_does_not_take_y_pinned() -> None:
+    """§1c.20: `cots_sync_then_uva`'s signature MUST NOT include
+    `y_pinned`. Inductor's functionalization on captured graphs
+    materializes any CPU tensor arg by allocating a fresh pageable
+    CPU buffer (worst case via a GPU intermediate + blocking
+    GPU→CPU copy that CUDA Graph capture rejects). The sync impl
+    reaches the pinned output via the slab pointer through
+    `CotsCpuInfer.y_pinned_view(task_id, num_tokens)`. The op's
+    Python-visible args are CUDA tensors + scalar ids only."""
+    schema = str(torch.ops.vllm.cots_sync_then_uva.default._schema)
+    assert "y_pinned" not in schema, (
+        f"§1c.20: cots_sync_then_uva's signature MUST NOT contain "
+        f"y_pinned. Inductor would materialize it. Schema: {schema}"
+    )
+
+
+def test_cots_sync_then_uva_mutates_only_gpu_args() -> None:
+    """§1c.20: under the new schema the mutated set is exactly
+    {y_gpu, gpu_anchor_a, gpu_anchor_b} — submit_anchor is read-only,
+    runner_id / task_id / num_tokens are scalars."""
+    schema = str(torch.ops.vllm.cots_sync_then_uva.default._schema)
+    mutated = _schema_mutated_args(schema)
+    expected = {"y_gpu", "gpu_anchor_a", "gpu_anchor_b"}
+    assert set(mutated) == expected, (
+        f"cots_sync_then_uva mutated set is {set(mutated)}; expected "
+        f"{expected}. Schema: {schema}"
+    )
+
+
 def test_cots_sync_then_uva_mutates_y_gpu_and_both_anchors() -> None:
     """`cots_sync_then_uva` must declare `y_gpu` AND both
     `gpu_anchor_a` AND `gpu_anchor_b` as mutated. Two anchors are
@@ -229,18 +265,26 @@ def test_fx_graph_orders_submit_before_gpu_gemms_before_sync() -> None:
 
     def forward(x, x_pin, y_pin, y_gpu, w_perm, w_pref, dummy_a, dummy_b):
         # Mirror the operator's call sequence (CotsQKVOp.apply core).
-        # §1c.20 schema: submit no longer takes y_pin; sync takes a
-        # `submit_anchor` (= x) read so the (submit → sync) data
-        # dependency is carried by x without y_pin in submit's
-        # mutates_args.
-        x_pin.copy_(x, non_blocking=True)
+        # §1c.20 schema: y_pinned is no longer a custom-op arg on
+        # either op. Submit gets x_gpu/x_pinned + ids; sync gets only
+        # CUDA tensors + ids and resolves the pinned view via the
+        # slab pointer in C++ (`y_pinned_view(task_id, num_tokens)`).
+        # §1c.20 final schema: BOTH x_pinned and y_pinned are gone
+        # from the custom op signatures. The C++ side bundles the
+        # x_gpu → slab.x_pinned_ptr D2H into submit_on_stream, and
+        # the sync impl reaches the pinned output via
+        # y_pinned_view(task_id, num_tokens). Both ops take only
+        # CUDA tensors + scalar ids. No CPU view is built in this
+        # forward — Inductor would materialize it into a pageable
+        # buffer otherwise.
+        del x_pin, y_pin
         torch.ops.vllm.cots_submit_gemm(
-            x, x_pin, runner_id, 0, x.shape[0]
+            x, runner_id, 0, x.shape[0]
         )
         out_perm = torch.nn.functional.linear(x, w_perm)
         out_pref = torch.nn.functional.linear(x, w_pref)
         torch.ops.vllm.cots_sync_then_uva(
-            y_pin, y_gpu, out_perm, out_pref, x, runner_id
+            y_gpu, out_perm, out_pref, x, runner_id, 0, x.shape[0]
         )
         return out_perm, out_pref, y_gpu
 
@@ -322,15 +366,14 @@ def test_fx_graph_export_succeeds_without_graph_break() -> None:
     dummy = torch.empty(1, dtype=torch.bfloat16, device="cuda")
 
     def forward(x, x_pin, y_pin, y_gpu, w_perm, dummy):
-        x_pin.copy_(x, non_blocking=True)
-        # §1c.20 schema: submit drops y_pin; sync takes submit_anchor
-        # (= x) for the cross-op data dep.
+        # §1c.20 final schema: both x_pinned and y_pinned dropped.
+        del x_pin, y_pin
         torch.ops.vllm.cots_submit_gemm(
-            x, x_pin, runner_id, 0, x.shape[0]
+            x, runner_id, 0, x.shape[0]
         )
         out_perm = torch.nn.functional.linear(x, w_perm)
         torch.ops.vllm.cots_sync_then_uva(
-            y_pin, y_gpu, out_perm, dummy, x, runner_id
+            y_gpu, out_perm, dummy, x, runner_id, 0, x.shape[0]
         )
         return out_perm, y_gpu
 

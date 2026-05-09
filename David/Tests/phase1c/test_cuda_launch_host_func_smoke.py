@@ -24,7 +24,7 @@ def runner():
     ci = CotsCpuInfer()
     ci.install(n_slabs=4, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
     for i in range(4):
-        ci.populate_slab_dryrun(i)
+        ci.populate_slab_dryrun(i, x_pinned_ptr=0, in_dim=0, y_pinned_ptr=0, cpu_out_dim=0)
     yield ci
 
 
@@ -36,7 +36,7 @@ def test_submit_on_stream_executes(runner):
     """submit_on_stream returns immediately; sync_on_stream blocks the
     stream on the worker. After the stream syncs (host wait) the
     runner has no error."""
-    runner.submit_on_stream(task_id=0, num_tokens=1, cuda_stream=_stream_ptr())
+    runner.submit_on_stream(task_id=0, num_tokens=1, cuda_stream=_stream_ptr(), x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
     runner.sync_on_stream(cuda_stream=_stream_ptr())
     torch.cuda.current_stream().synchronize()
     assert not runner.has_error()
@@ -55,7 +55,7 @@ def test_submit_after_d2h_observes_completed_copy(runner):
     src_gpu = torch.full((1024,), 7.0, dtype=torch.bfloat16, device="cuda")
     pinned = torch.empty(1024, dtype=torch.bfloat16, pin_memory=True)
     pinned.copy_(src_gpu, non_blocking=True)
-    runner.submit_on_stream(task_id=1, num_tokens=1, cuda_stream=_stream_ptr())
+    runner.submit_on_stream(task_id=1, num_tokens=1, cuda_stream=_stream_ptr(), x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
     runner.sync_on_stream(cuda_stream=_stream_ptr())
     torch.cuda.current_stream().synchronize()
     assert not runner.has_error()
@@ -94,7 +94,7 @@ def test_no_deadlock_on_repeat(runner):
     """Repeated submit/sync cycles on the same stream don't deadlock or
     leak."""
     for i in range(20):
-        runner.submit_on_stream(task_id=(i % 4), num_tokens=1, cuda_stream=_stream_ptr())
+        runner.submit_on_stream(task_id=(i % 4), num_tokens=1, cuda_stream=_stream_ptr(), x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
         runner.sync_on_stream(cuda_stream=_stream_ptr())
     torch.cuda.current_stream().synchronize()
     assert not runner.has_error()

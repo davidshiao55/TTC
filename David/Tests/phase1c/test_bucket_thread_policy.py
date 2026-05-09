@@ -33,7 +33,7 @@ def _drive_one_qkv_slab(ci: CotsCpuInfer, num_tokens: int = 1) -> None:
     stream so the worker has finished by the time the test reads
     `last_observed_num_threads()`."""
     stream = torch.cuda.current_stream().cuda_stream
-    ci.submit_on_stream(task_id=0, num_tokens=num_tokens, cuda_stream=stream)
+    ci.submit_on_stream(task_id=0, num_tokens=num_tokens, cuda_stream=stream, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
     ci.sync_on_stream(cuda_stream=stream)
     torch.cuda.current_stream().synchronize()
 
@@ -105,7 +105,7 @@ def test_per_bucket_n_threads_takes_effect() -> None:
     ]
     stream = torch.cuda.current_stream().cuda_stream
     for tid, expected in zip([0, 1, 2], [1, 4, 8]):
-        ci.submit_on_stream(task_id=tid, num_tokens=1, cuda_stream=stream)
+        ci.submit_on_stream(task_id=tid, num_tokens=1, cuda_stream=stream, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
         ci.sync_on_stream(cuda_stream=stream)
         torch.cuda.current_stream().synchronize()
         assert not ci.has_error()

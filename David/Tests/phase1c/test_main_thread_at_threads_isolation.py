@@ -80,7 +80,7 @@ def test_worker_set_num_threads_does_not_leak_to_main_thread() -> None:
     keepalive = _populate_one_qkv_slab(ci, n_threads=worker_n)
 
     stream = torch.cuda.current_stream().cuda_stream
-    ci.submit_on_stream(task_id=0, num_tokens=1, cuda_stream=stream)
+    ci.submit_on_stream(task_id=0, num_tokens=1, cuda_stream=stream, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
     ci.sync_on_stream(cuda_stream=stream)
     torch.cuda.current_stream().synchronize()
     assert not ci.has_error()
@@ -147,7 +147,7 @@ def test_repeated_slab_dispatch_keeps_main_thread_isolated() -> None:
 
     stream = torch.cuda.current_stream().cuda_stream
     for tid in range(n_slabs):
-        ci.submit_on_stream(task_id=tid, num_tokens=1, cuda_stream=stream)
+        ci.submit_on_stream(task_id=tid, num_tokens=1, cuda_stream=stream, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
         ci.sync_on_stream(cuda_stream=stream)
     torch.cuda.current_stream().synchronize()
     assert not ci.has_error()

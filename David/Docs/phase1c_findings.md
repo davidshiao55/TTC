@@ -93,9 +93,14 @@ COTS extension (oneDNN owns the worker's intra-op threading).
 - §1c.19 — Stage 6 follow-up #2: Dynamo guard serialization tries
   to pickle `CotsCpuInfer` (CLOSED — registry split moves the pybind
   handle out of the runner facade)
-- §1c.20 — Stage 6 follow-up #3: Inductor's `reinterpret_tensor`
-  drops `is_pinned()` for pinned-host buffers passed through custom
-  ops (uncovered AFTER §1c.19 was closed)
+- §1c.20 — Stage 6 follow-up #3: Inductor materializes any CPU
+  tensor visible in the captured graph (CLOSED — both ops now
+  CUDA-tensors-and-scalar-ids only; pinned buffers reached via
+  slab pointers in C++)
+- §1c.21 — Open: perf investigation of native+capture vs
+  native+eager (real-model native_capture orch is +0.497 s vs
+  +0.316 s for eager; native_capture_real is wildly slow at
+  119 s/gen — needs nsys diagnosis)
 
 ---
 
@@ -1048,9 +1053,22 @@ than before. The next-uncovered failure is documented in §1c.20.
 
 ---
 
-## 1c.20: Real-model anchor blocker #3 — Inductor `reinterpret_tensor` drops `is_pinned()`
+## 1c.20: Real-model anchor blocker #3 — Inductor materializes any CPU tensor it sees (CLOSED)
 
-**Status: open.** Uncovered AFTER §1c.19 was closed. The smoke run
+**Status: closed.** Resolved by removing BOTH `x_pinned` AND
+`y_pinned` from the custom op signatures and reaching the slab's
+pinned-buffer pointers directly from C++. The captured-graph custom
+ops are now CUDA-tensors-and-scalar-ids only — Inductor has
+nothing CPU-side to materialize. After this fix the
+`cots_005_native_capture_dryrun` arm runs end-to-end on Qwen2.5-7B
+through Inductor + AOT compile + CUDA Graph capture + replay.
+
+The story unfolded over three increasingly-deeper diagnoses; the
+original framing (metadata-only loss) was wrong.
+
+### Original problem (the one we walked into)
+
+Uncovered AFTER §1c.19 was closed. The smoke run
 now reaches the captured forward's runtime execution; the failure
 is in `uva_copy_into_gpu`'s `assert src_pinned.is_pinned()`:
 
@@ -1129,6 +1147,186 @@ The registry split is a strictly-better state regardless of §1c.20
 object graph, which is correct architecture for ANY downstream
 PyTorch caching/serialization layer (today's AOT guard cache,
 tomorrow's cache_size_limit / inductor cache / etc.).
+
+### Diagnosis evolution: the right invariant emerges
+
+Three smoke-run iterations sharpened the diagnosis:
+
+1. **First read**: "Inductor drops the `is_pinned()` metadata bit
+   on `reinterpret_tensor` views." Storage-level check
+   (`untyped_storage().is_pinned()`) was the proposed fix.
+2. **Re-run with the storage check**: still failed. Inspecting the
+   actual Inductor codegen showed `buf9 = empty_strided_cpu(...,
+   bfloat16)` followed by `cpp_fused_as_strided_view_2(buf4, ...,
+   buf9, ...)` — Inductor was allocating a **fresh pageable** CPU
+   buffer and cloning the pinned slice into it after the
+   `cots_submit_gemm` mutation, then handing the clone to
+   `cots_sync_then_uva`. The storage genuinely wasn't pinned;
+   there was nothing to find.
+3. **Schema swap (drop `y_pinned` from `cots_sync_then_uva`)**:
+   moved the failure to the SUBMIT side. The same pattern fired
+   on `x_pinned`: `triton_red_fused_1.run(...) → buf2` (GPU
+   intermediate) → `buf3 = empty_strided_cpu(...)` → `buf3.copy_(
+   buf2, False)` (blocking GPU→CPU copy) — rejected by CUDA Graph
+   capture with `cudaErrorStreamCaptureUnsupported`.
+
+The right invariant — visible only after climbing the diagnostic
+ladder — is **stronger** than "no mutated CPU tensor": **any CPU
+tensor visible to Inductor in the captured graph is suspect**.
+Inductor's functionalization / memory-planning passes will
+materialize CPU views via GPU intermediates + blocking transfers
+whenever it suits the rest of the plan, regardless of mutation
+declarations.
+
+### Resolution shipped
+
+Both custom op signatures now contain ONLY CUDA tensors and scalar
+ids:
+
+```
+cots_submit_gemm(x_gpu, runner_id, task_id, num_tokens) -> None
+  mutates_args=["x_gpu"]
+
+cots_sync_then_uva(y_gpu, gpu_anchor_a, gpu_anchor_b,
+                   submit_anchor, runner_id, task_id, num_tokens)
+                   -> None
+  mutates_args=["y_gpu", "gpu_anchor_a", "gpu_anchor_b"]
+```
+
+C++-side machinery ports the pinned-buffer pointer story:
+
+- **`submit_on_stream`** now takes `(task_id, num_tokens, x_gpu_ptr,
+  x_cols, x_stride0, x_stride1, cuda_stream)` and bundles the
+  x_gpu → slab.x_pinned_ptr D2H WITH the host-callback enqueue,
+  on the supplied stream. Both the copy and the host_fn enqueue
+  are graph-capturable. **Stride-aware**: `x_stride0 == x_cols`
+  → `cudaMemcpyAsync` (1D); otherwise → `cudaMemcpy2DAsync` (2D)
+  walking rows correctly. Real Qwen2 hidden_states tensors can
+  be row-strided when sliced from a wider base; rejecting them
+  would make native COTS brittle. `x_stride1 == 1` is required
+  (transposed layouts rejected with a clear message).
+- **`y_pinned_view(task_id, num_tokens)`** returns an
+  `at::from_blob` CPU view over the slab's pinned output pointer
+  — the sync impl uses this internally to drive the UVA copy
+  without exposing the CPU tensor as a custom-op argument. The
+  trust boundary is install-time: the slab pointer came from
+  `_y_pinned` (a `torch.empty(..., pin_memory=True)` allocation
+  validated there).
+- **`populate_slab_dryrun`** extended to take `(x_pinned_ptr,
+  in_dim, y_pinned_ptr, cpu_out_dim)` so the dryrun arm — which
+  measures orchestration WITHOUT real CPU GEMM — still resolves
+  through both captured-graph paths.
+
+Operator-side branch on `runner.kind` BEFORE constructing CPU
+views (the user's explicit direction during the patch dialog):
+
+```python
+if self._runner.kind == "native":
+    y_dst = offloader._y_gpu[: ...].view(...)
+    self._runner.submit_with_d2h(x, desc)
+else:
+    x_in = offloader._x_pinned[: ...].view(...)
+    y_out = offloader._y_pinned[: ...].view(...)
+    y_dst = offloader._y_gpu[: ...].view(...)
+    self._runner.submit_with_d2h(x, x_in, y_out, desc)
+```
+
+Just dropping `y_pinned` from the runner facade and ignoring it
+inside the runner method body wasn't enough — Dynamo traces the
+operator's bytecode and records the
+`_y_pinned[:N].view(...)` compute path even if the receiver
+discards it. The branch eliminates the compute path entirely on
+the captured side.
+
+### Coverage
+
+- `David/Tests/phase1c/test_strided_x_gpu_d2h.py` (4 tests):
+  contiguous-row D2H (1D path), row-strided D2H (2D path),
+  transposed input rejection, partial-num_tokens correctness.
+- `David/Tests/phase1c/test_y_pinned_view.py` (5 tests): shape /
+  dtype / device, data_ptr matches slab, reads worker writes,
+  out-of-range task_id rejection, partial num_tokens.
+- Schema-test additions in
+  `David/Tests/phase1c/test_dependency_ordering.py`:
+  `test_cots_submit_gemm_does_not_take_y_pinned`,
+  `test_cots_sync_then_uva_does_not_take_y_pinned`,
+  `test_cots_sync_then_uva_takes_submit_anchor`,
+  `test_cots_sync_then_uva_mutates_only_gpu_args`. The
+  load-bearing FX-graph ordering test was updated for the new
+  schema (no x_pinned/y_pinned args; sync takes
+  `submit_anchor`).
+
+Triple suite at §1c.20 closure: phase1a 60, phase1b 80, phase1c
+143 (139 + 4 new strided D2H tests).
+
+### Real-model anchor (the §1.14 number)
+
+`bench_dryrun_vs_native_qwen.py` at B=1, t=16, f=0.05, input=8,
+output=128, 3 iters / 2 warmup on Qwen2.5-7B (RTX 4090 + i9-14900KF):
+
+```
+arm                            avg_latency (s)   orch
+none (eager baseline)              2.0333          —
+none_capture (graph baseline)      2.0323          —
+cots_005_python_eager_dryrun       2.5307         +0.497
+cots_005_native_eager_dryrun       2.3488         +0.316
+cots_005_native_capture_dryrun     2.5294         +0.497   §1.14 ≤ 0.050s: FAIL
+cots_005_native_capture_real     119.3297        cpu_work +116.80
+```
+
+Three findings, all important:
+
+1. **Architecture works end-to-end.** The captured native arm runs
+   the full FastTTS-style decode on Qwen2.5-7B without falling
+   over. No `cudaErrorStreamCaptureUnsupported`, no functionalization
+   crashes, no missing slab pointers. §1c.20's invariant ("no CPU
+   tensors visible to Inductor in the captured graph") holds in
+   the wild.
+2. **Capture mode is not winning over native-eager**: orch +0.497 s
+   (capture) vs +0.316 s (eager). Capture made the orch WORSE by
+   ~57%. Native runner under EAGER mode already gave us a 36%
+   reduction over the python runner; capture undoes that gain.
+3. **`native_capture_real` at 119 s/gen is wildly off** (cpu_work
+   delta +117 s vs the +5–10 s expected from real CPU GEMM at this
+   shape). Something in the captured-graph CPU path is
+   pathologically slow — possibly per-replay torch.compile
+   overhead on the dispatch path, or the cudaMemcpy2DAsync /
+   host_fn pair adding measurable cost per layer per token, or
+   the captured graph forcing extra synchronizations. The §1.14
+   target (≤ 0.05 s/generate) is unreachable until this is
+   diagnosed.
+
+### Why this still closes §1c.20
+
+§1c.20 was scoped as an **architectural blocker** — Inductor was
+rejecting our op shape and the captured forward couldn't even
+init. That's now fixed. The unfavorable orch ratio and the
+pathological real-arm latency are downstream perf questions; they
+need a profiler trace (`nsys`), not another schema redesign. The
+schema changes already shipped are strictly better regardless of
+how that investigation lands: any future fix to the perf path
+requires Inductor not materializing our CPU views, which is
+exactly what the §1c.20 schema swap guarantees.
+
+§1c.21 follow-up (open): perf investigation of native+capture vs
+native+eager. Hypothesis-list to drive the nsys probe:
+
+- **Per-replay Dynamo runtime check function** — every captured
+  forward replay still walks `CheckFunctionManager`'s guard
+  function. If guards include slow Python expressions (e.g., dict
+  lookups on `self._task_id_for`), the per-iteration overhead
+  scales with layer count.
+- **Host-callback round-trip cost under graph mode** — captured
+  `cudaLaunchHostFunc` may have higher per-fire latency than its
+  uncaptured counterpart; needs a microbench.
+- **`cudaMemcpy2DAsync` setup cost** — per-call setup is higher
+  than 1D; if the model's hidden_states are usually contiguous,
+  the dispatch branch should pick the 1D path. The bench should
+  log which branch fires.
+- **Worker thread starvation under capture** — torch.compile's
+  inductor-generated code may be saturating CPU cores the C++
+  worker is supposed to run on; bucket-aware thread policy
+  (§1c.8) interacts with torch.compile's threadpool.
 
 ---
 
