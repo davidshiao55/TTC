@@ -28,14 +28,19 @@ The substrate ships with three end-to-end-verified gates:
    (Stage 5).
 
 The §1.14 absolute orch-collapse target (`orch ≤ 0.05 s/generate` on
-Qwen2.5-7B + FastTTS) is **NOT yet anchored on the real model** — the
-synthetic multi-layer collapse-shape sanity check passes
-(`collapse_ratio = 0.477`, Stage 5), and the real-model harness
-`bench_dryrun_vs_native_qwen.py` is landed and runnable on the `none`
-and python+eager arms, but the native+capture arm hits the
-`fullgraph=True` × pre-hook interaction blocker documented in §1c.18.
-Status: **docs landed, real-model native-capture absolute pending the
-§1c.18 fix**.
+Qwen2.5-7B + FastTTS) is **NOT yet met**. The synthetic
+multi-layer collapse-shape sanity check passes (`collapse_ratio =
+0.477`, Stage 5), and after the §1c.18 / §1c.19 / §1c.20 chain of
+fixes the real-model harness `bench_dryrun_vs_native_qwen.py`
+runs the `cots_005_native_capture_dryrun` and
+`cots_005_native_capture_real` arms end-to-end. The settled
+multi-iter numbers (B=1, t=16, f=0.05; see §1c.20 for the full
+table) reveal that **capture mode is currently WORSE than
+native+eager** — orch +0.497 s vs +0.316 s — and
+`native_capture_real` is wildly slow at 119 s/generate. The
+architectural blockers are closed; the perf shortfall is now a
+diagnostic problem tracked as §1c.21 (perf investigation). Status:
+**runs end-to-end, perf needs nsys diagnosis**.
 
 Hardware: NVIDIA RTX 4090 (24 GB), Intel i9-14900KF (AVX2, no
 AVX512/AMX), DDR5. PyTorch 2.10.0+cu128, MKL enabled, oneDNN BF16,
@@ -98,9 +103,12 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   CUDA-tensors-and-scalar-ids only; pinned buffers reached via
   slab pointers in C++)
 - §1c.21 — Open: perf investigation of native+capture vs
-  native+eager (real-model native_capture orch is +0.497 s vs
-  +0.316 s for eager; native_capture_real is wildly slow at
-  119 s/gen — needs nsys diagnosis)
+  native+eager. Settled multi-iter numbers across t={4,8,16}: orch
+  +0.46–0.47 s under capture vs +0.28–0.31 s under eager;
+  cpu_work +120–190 s under capture vs +0.09–0.28 s under eager
+  (425× per-GEMM amplifier). Thread-gate fix (`torch.set_num_threads`
+  scoped to python runner) ruled out as primary cause. Next step:
+  C++ counters before nsys.
 
 ---
 
@@ -574,46 +582,49 @@ auto-derived `--cots-cpu-runner` /
 `--cots-cpu-num-threads-by-bucket` / `--cots-cpu-worker-affinity`
 CLI flags so `vllm bench latency` accepts the new fields.
 
-Smoke-runs at `--num-iters 1 --num-iters-warmup 1`, B=1, t=16
-(input=8, output=128, f_cpu_store=0.05):
+**Settled multi-iter results (post-§1c.18/§1c.19/§1c.20 fixes)** at
+B=1, t=16 (input=8, output=128, f_cpu_store=0.05, 3 iters / 2
+warmup):
 
 ```
-  arm                                     avg_latency (s)
-  none                                       2.0324    (eager baseline)
-  none_capture                               2.0326    (graph baseline)
-  cots_005_python_eager_dryrun               2.5351    → orch = +0.503s
-  cots_005_native_eager_dryrun               2.3516    → orch = +0.319s
-  cots_005_native_capture_dryrun             —          (BLOCKED, see §1c.18)
-  cots_005_native_capture_real               —          (BLOCKED, see §1c.18)
+  arm                                     avg_latency (s)   orch
+  none                                       2.0333         —
+  none_capture                               2.0323         —
+  cots_005_python_eager_dryrun               2.5307        +0.497 s
+  cots_005_native_eager_dryrun               2.3488        +0.316 s
+  cots_005_native_capture_dryrun             2.5294        +0.497 s
+  cots_005_native_capture_real             119.3297    cpu_work +116.80 s
 ```
 
-These are 1-iter / 1-warmup smoke values, NOT statistically settled
-benchmark numbers. They confirm three things and nothing more:
-- The harness wires through correctly: subprocesses launch, the new
+These are settled multi-iter numbers (NOT 1-iter smoke). They
+confirm five things:
+
+- The harness wires through correctly under the §1c.20 schema:
+  subprocesses launch, `vllm bench latency` accepts the new
   `--cots-cpu-runner` / `--cots-cpu-num-threads-by-bucket` /
-  `--cots-cpu-worker-affinity` flags are accepted, JSON cells
-  populate, summary subtraction uses the right baseline per arm.
-- The §1.14 baseline (python+eager dryrun ≈ 0.45 s/generate on
-  Phase 1a) reproduces in the new harness shape (0.50s here, within
-  smoke variance for a single-iteration run).
-- The native runner under EAGER already shaves ~37% off the python
-  runner at the substrate level (0.319 vs 0.503 s); the additional
-  capture-mode collapse is what would close the rest of the gap to
-  the §1.14 ≤ 0.05 s target — and is exactly what's blocked.
+  `--cots-cpu-worker-affinity` flags, JSON cells populate, summary
+  subtraction uses the right baseline per arm.
+- The §1.14 python-eager baseline (≈ 0.45 s/generate on Phase 1a)
+  reproduces (0.497 s here, within run-to-run variance).
+- The native runner under EAGER reduces orch by 36% over the
+  Python runner (0.316 vs 0.497 s).
+- **Capture mode is currently WORSE than native+eager**: +0.497 s
+  vs +0.316 s. This is the §1c.21 perf regression.
+- **`native_capture_real` is wildly slow** (119 s/gen, vs an
+  expected ~3–5 s extra over dryrun for real CPU GEMM at this
+  shape). Tracked under §1c.21.
 
 Subtraction baseline note: capture-mode arms subtract `none_capture`
 (graph-mode no-offload), NOT eager `none`. Subtracting eager `none`
 would understate COTS orch by however much torch.compile saves on
-the no-offload path. At B=1 + 1-iter smoke the two baselines are
-indistinguishable (2.0324 vs 2.0326) so this is invisible here, but
-the harness uses the correct baseline by construction.
+the no-offload path. At B=1 the two baselines are indistinguishable
+(2.0333 vs 2.0323 — graph capture saves ~10 ms on the no-offload
+path) so the difference is small, but the harness uses the correct
+baseline by construction.
 
-Concretely: Stage 6's job was to land the harness + design doc, NOT
-to lock the real-model absolute end-to-end. The synthetic
-shape-collapse gate (Stage 5) is the in-stage Phase 1c sign-off; the
-real-model anchor is a Stage 6 follow-up that needs the §1c.18 fix
-to unblock the native+capture arms, plus a properly settled
-multi-iter / multi-batch run with statistical noise bars.
+Architectural status: the captured forward runs end-to-end. The
+§1.14 absolute target ≤ 0.05 s/generate is unmet — the next blocker
+is perf, not correctness, and is tracked under §1c.21.
 
 ---
 
@@ -1261,20 +1272,31 @@ Triple suite at §1c.20 closure: phase1a 60, phase1b 80, phase1c
 
 ### Real-model anchor (the §1.14 number)
 
-`bench_dryrun_vs_native_qwen.py` at B=1, t=16, f=0.05, input=8,
-output=128, 3 iters / 2 warmup on Qwen2.5-7B (RTX 4090 + i9-14900KF):
+`bench_dryrun_vs_native_qwen.py` at B=1, f=0.05, input=8, output=128,
+3 iters / 2 warmup on Qwen2.5-7B (RTX 4090 + i9-14900KF). Sweep
+across t={4, 8, 16} after the §1c.21 review-fix that gates
+`torch.set_num_threads` to the python runner only:
 
 ```
-arm                            avg_latency (s)   orch
-none (eager baseline)              2.0333          —
-none_capture (graph baseline)      2.0323          —
-cots_005_python_eager_dryrun       2.5307         +0.497
-cots_005_native_eager_dryrun       2.3488         +0.316
-cots_005_native_capture_dryrun     2.5294         +0.497   §1.14 ≤ 0.050s: FAIL
-cots_005_native_capture_real     119.3297        cpu_work +116.80
+                                 t=4         t=8         t=16
+none                                       2.0333 (t-invariant)
+none_capture                               2.0323 (t-invariant)
+cots_005_python_eager_dryrun     2.4888    2.5415    2.5307
+cots_005_native_eager_dryrun     2.3416    2.3090    2.3233
+cots_005_native_eager_real       2.4314    2.5579    2.6050
+cots_005_native_capture_dryrun   2.5058    2.4944    2.4948
+cots_005_native_capture_real   192.5793  186.4441  123.1685
+
+orch decomposition vs the right baseline:
+                                 t=4         t=8         t=16
+orch_python_eager (eager-eager) +0.4555 s  +0.5082 s  +0.4974 s
+orch_native_eager (eager-eager) +0.3083 s  +0.2757 s  +0.2900 s
+orch_native_capture (cap-cap)   +0.4735 s  +0.4621 s  +0.4626 s
+cpu_work_native_eager           +0.0897 s  +0.2489 s  +0.2817 s
+cpu_work_native_capture       +190.0735 s +183.9497 s +120.6737 s
 ```
 
-Three findings, all important:
+Findings:
 
 1. **Architecture works end-to-end.** The captured native arm runs
    the full FastTTS-style decode on Qwen2.5-7B without falling
@@ -1282,19 +1304,44 @@ Three findings, all important:
    crashes, no missing slab pointers. §1c.20's invariant ("no CPU
    tensors visible to Inductor in the captured graph") holds in
    the wild.
-2. **Capture mode is not winning over native-eager**: orch +0.497 s
-   (capture) vs +0.316 s (eager). Capture made the orch WORSE by
-   ~57%. Native runner under EAGER mode already gave us a 36%
-   reduction over the python runner; capture undoes that gain.
-3. **`native_capture_real` at 119 s/gen is wildly off** (cpu_work
-   delta +117 s vs the +5–10 s expected from real CPU GEMM at this
-   shape). Something in the captured-graph CPU path is
-   pathologically slow — possibly per-replay torch.compile
-   overhead on the dispatch path, or the cudaMemcpy2DAsync /
-   host_fn pair adding measurable cost per layer per token, or
-   the captured graph forcing extra synchronizations. The §1.14
-   target (≤ 0.05 s/generate) is unreachable until this is
-   diagnosed.
+2. **Capture mode is not winning over native-eager**: orch +0.46–
+   0.47 s under capture vs +0.28–0.31 s under eager, **across all
+   thread counts**. Native runner under EAGER mode already gave
+   us a 36% reduction over the python runner; capture undoes that
+   gain. The thread-gate fix
+   (`torch.set_num_threads` no longer applied for native; §1c.21
+   review-fix) **did not move this number** — the capture penalty
+   is structural to the captured-forward dispatch path, not
+   thread-policy contamination.
+3. **CPU work under capture is 400–2000× heavier than under eager
+   on the same workload.** Eager `cpu_work` is +0.09–0.28 s per
+   generate; capture `cpu_work` is +120–190 s. The worker IS
+   running real GEMMs (cpu_work scales with thread count: 190 s
+   at t=4, 121 s at t=16) but each call is inflated by
+   ~17–27 ms. Compared to eager's ~40 μs/GEMM under the same
+   shape this is ~425× per-call slowdown. The §1.14 target
+   (≤ 0.05 s/generate) is unreachable until this is diagnosed.
+
+Concretely: the eager path executes ~7000 CPU GEMMs (28 layers ×
+2 ops/layer × 128 output tokens) in 0.28 s @ t=16 ≈ 40 μs each.
+The capture path takes 17 ms each — somewhere between the
+host_fn enqueue and the at::linear return there is a ~17 ms
+amplifier. Hypotheses (in §1c.21):
+
+- Captured `cudaLaunchHostFunc` blocks the GPU stream synchronously
+  on the worker, serializing CPU and GPU. Eager mode runs
+  `future.result()` on the main thread instead, leaving the GPU
+  free to execute other queued work.
+- Per-replay Dynamo runtime check function (guard introspection)
+  fires on every captured forward replay; if the guard is heavy
+  it bills against every layer.
+- `cudaMemcpy2DAsync` setup cost vs 1D — bench should log which
+  branch fires. Counters proposed in §1c.21.
+
+(2) — that capture orch ≈ python_eager orch (both ≈ +0.47 s) — is
+striking: the §1c.20 schema swap successfully made the
+captured-forward custom ops opaque to Inductor, but did not
+recover the orch reduction native+eager already provided.
 
 ### Why this still closes §1c.20
 
@@ -1309,24 +1356,45 @@ requires Inductor not materializing our CPU views, which is
 exactly what the §1c.20 schema swap guarantees.
 
 §1c.21 follow-up (open): perf investigation of native+capture vs
-native+eager. Hypothesis-list to drive the nsys probe:
+native+eager. Numbers above (multi-iter, t={4,8,16}) localize the
+shape of the regression:
 
-- **Per-replay Dynamo runtime check function** — every captured
-  forward replay still walks `CheckFunctionManager`'s guard
-  function. If guards include slow Python expressions (e.g., dict
-  lookups on `self._task_id_for`), the per-iteration overhead
-  scales with layer count.
-- **Host-callback round-trip cost under graph mode** — captured
-  `cudaLaunchHostFunc` may have higher per-fire latency than its
-  uncaptured counterpart; needs a microbench.
-- **`cudaMemcpy2DAsync` setup cost** — per-call setup is higher
-  than 1D; if the model's hidden_states are usually contiguous,
-  the dispatch branch should pick the 1D path. The bench should
-  log which branch fires.
-- **Worker thread starvation under capture** — torch.compile's
-  inductor-generated code may be saturating CPU cores the C++
-  worker is supposed to run on; bucket-aware thread policy
-  (§1c.8) interacts with torch.compile's threadpool.
+- The capture orch overhead is roughly constant at ~+0.18 s
+  (capture - eager) across thread counts → the per-layer dispatch
+  amplifier scales with ~28 layers × 128 output tokens, not with
+  CPU thread count. Suggests something in the dispatch path
+  (Dynamo guard check, host_fn enqueue, or graph-replay machinery)
+  rather than in oneDNN.
+- The capture cpu_work is 100–200 s for ~7000 GEMMs = 17–27 ms
+  per GEMM. That's 425× the eager per-GEMM cost. CPU work scales
+  inversely with thread count (190 → 121 s as t goes 4 → 16) so
+  oneDNN itself is parallelizing fine; the per-call amplifier is
+  the issue.
+
+Hypothesis-list to drive the nsys probe (recommended order, lowest
+to highest invasiveness):
+
+- **Lightweight C++ counters first.** Before nsys: instrument
+  `submit_on_stream` / `RunSlabOnWorker` / `SyncCallback` with
+  atomic counters (task count by op kind, total worker ns by op
+  kind, sync wait ns, D2H 1D/2D split, num_tokens histogram).
+  These need no capture trace and may explain most of the gap.
+- **Captured `cudaLaunchHostFunc` blocks the GPU stream on the
+  worker.** Eager mode's `future.result()` blocks the main thread
+  and leaves the GPU free; capture's `sync_on_stream` callback
+  blocks the driver thread on `TaskQueue.sync(0)`, which pauses
+  GPU execution until CPU completes. If CPU and GPU were
+  overlapping under eager, capture serializes them — and the
+  serialization shows up as inflated wall-clock per layer.
+- **Per-replay Dynamo runtime check function**. Every captured
+  forward replay walks `CheckFunctionManager`'s guard function.
+  If guards include slow Python expressions (e.g., dict lookups
+  on `self._task_id_for`) the per-iteration overhead scales with
+  layer count.
+- **`cudaMemcpy2DAsync` setup cost vs 1D.** If most calls take
+  the 2D branch (real model's hidden_states being row-strided),
+  per-call setup overhead may be measurable. Counter for
+  1D-vs-2D split would pin this.
 
 ---
 

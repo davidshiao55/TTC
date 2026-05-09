@@ -110,6 +110,18 @@ def arms_for(threads: int) -> dict[str, list[str]]:
         # is no slower than python's executor.submit/future.result.
         "cots_005_native_eager_dryrun": cots_base
         + ["--cots-cpu-runner", "native", "--cots-dry-run"],
+        # §1c.21 isolation arm: native+eager+real. Without this we
+        # can't distinguish "CPU work is slow under native generally"
+        # from "CPU work is slow only under capture". Compare:
+        #   native_eager_real - native_eager_dryrun  (CPU-work cost,
+        #                                              eager dispatch)
+        #   native_capture_real - native_capture_dryrun
+        #                                             (CPU-work cost,
+        #                                              capture dispatch)
+        # Equal cpu_work deltas → CPU path itself is fine; perf
+        # regression is purely capture-side dispatch.
+        "cots_005_native_eager_real": cots_base
+        + ["--cots-cpu-runner", "native"],
         # THE Stage 5 HEADLINE: native+capture+dryrun. Captured graph
         # replay re-issues only host-callback + GPU-kernel nodes; no
         # Python operator-body traversal between forwards. Target:
@@ -130,6 +142,7 @@ _EAGER_ARMS = frozenset({
     "none",
     "cots_005_python_eager_dryrun",
     "cots_005_native_eager_dryrun",
+    "cots_005_native_eager_real",
 })
 
 
@@ -283,6 +296,7 @@ def main() -> None:
     cots_arms = [
         "cots_005_python_eager_dryrun",
         "cots_005_native_eager_dryrun",
+        "cots_005_native_eager_real",
         "cots_005_native_capture_dryrun",
         "cots_005_native_capture_real",
     ]
@@ -321,6 +335,7 @@ def main() -> None:
             none_cap = none_capture_by_b[B]
             py = rows[("cots_005_python_eager_dryrun", t)][B]
             nat_eager = rows[("cots_005_native_eager_dryrun", t)][B]
+            nat_eager_real = rows[("cots_005_native_eager_real", t)][B]
             nat_cap = rows[("cots_005_native_capture_dryrun", t)][B]
             real = rows[("cots_005_native_capture_real", t)][B]
             print(f"  t={t} B={B}:")
@@ -335,6 +350,18 @@ def main() -> None:
                     print(
                         f"    orch_native_eager      = {nat_eager - none:+.4f}s "
                         f"(Stage 2 substrate gate)"
+                    )
+                if nat_eager_real is not None:
+                    print(
+                        f"    total_native_eager_real= "
+                        f"{nat_eager_real - none:+.4f}s (eager dispatch + "
+                        f"real CPU GEMM)"
+                    )
+                if nat_eager is not None and nat_eager_real is not None:
+                    print(
+                        f"    cpu_work_native_eager  = "
+                        f"{nat_eager_real - nat_eager:+.4f}s (real GEMM "
+                        f"time on EAGER path — §1c.21 isolation arm)"
                     )
             # Capture arms: ONLY compute the §1.14 metric when
             # `none_capture` (graph-mode no-offload) is available. Do
