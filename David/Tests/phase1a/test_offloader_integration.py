@@ -320,8 +320,17 @@ def test_mini_decoder_offload_e2e(f_cpu_store):
         torch.testing.assert_close(out_o, ref["o"])
 
 
-def test_post_init_requires_enforce_eager():
-    """Phase 1a hard-rejects graph capture mode."""
+def test_post_init_python_runner_requires_enforce_eager():
+    """Phase 1c Stage 5 update: the `enforce_eager=True` requirement
+    is now CONDITIONAL on `cpu_runner`. The Python runner's
+    ThreadPoolExecutor + future.result() substrate is NOT graph-
+    capturable, so `cpu_runner='python' + enforce_eager=False` is
+    still a hard reject (test name / behavior preserved by passing
+    cpu_runner='python' explicitly). The native runner now SUPPORTS
+    graph capture (Stage 5 production path); that case is covered by
+    `phase1c/test_python_runner_graph_hard_fail.py` and
+    `phase1c/test_graph_capture_e2e.py`.
+    """
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
@@ -329,13 +338,15 @@ def test_post_init_requires_enforce_eager():
     with set_current_vllm_config(vllm_config):
         layer = MiniDecoderLayer().cuda()
         offloader = CotsOffloader(
-            config=CotsOffloadConfig(f_cpu_store=0.1, kv_biased=True)
+            config=CotsOffloadConfig(
+                f_cpu_store=0.1, kv_biased=True, cpu_runner="python"
+            )
         )
         set_offloader(offloader)
         offloader.wrap_modules(iter([layer]))
         _simulate_weight_loading(layer)
 
-        with pytest.raises(RuntimeError, match="enforce_eager=True"):
+        with pytest.raises(RuntimeError, match="cpu_runner='python' requires"):
             offloader.post_init()
 
 

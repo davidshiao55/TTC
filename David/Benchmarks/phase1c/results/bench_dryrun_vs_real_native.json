@@ -1,0 +1,20 @@
+{
+  "args": {
+    "n_layers": 8,
+    "num_tokens": 4,
+    "n_iters": 100,
+    "warmup": 15,
+    "f_cpu_store": 0.1,
+    "results_dir": "/TTC/David/Benchmarks/phase1c/results",
+    "collapse_ratio_threshold": 0.7
+  },
+  "t_none_us": 100.714,
+  "t_eager_us": 627.1595,
+  "t_capture_us": 354.054,
+  "orch_eager_us": 526.4455,
+  "orch_capture_us": 253.33999999999997,
+  "collapse_ratio": 0.4812274015068985,
+  "orch_capture_per_layer_us": 31.667499999999997,
+  "collapse_ratio_threshold": 0.7,
+  "verdict_collapse": "PASS"
+}

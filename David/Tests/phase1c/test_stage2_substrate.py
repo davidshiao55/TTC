@@ -182,14 +182,15 @@ def test_make_runner_factory_rejects_unknown():
 # --- vllm/config/offload.py — cpu_runner field is plumbed -----------------
 
 
-def test_cpu_runner_field_default_is_python():
-    """Stage 2/3/4 default: 'python', so existing Phase 1a/1b workflows
-    are unchanged. Stage 5 will flip the default to 'native' once graph
-    capture is verified."""
+def test_cpu_runner_field_default_is_native():
+    """Stage 5 production default: 'native'. The default was 'python'
+    through Stage 4 to keep Phase 1a/1b workflows unchanged while the
+    native runner was being wired; Stage 5 flipped it once CUDA graph
+    capture was verified end-to-end."""
     from vllm.config.offload import CotsOffloadConfig
 
     cfg = CotsOffloadConfig()
-    assert cfg.cpu_runner == "python"
+    assert cfg.cpu_runner == "native"
 
 
 def test_cpu_runner_field_accepts_native():
@@ -223,19 +224,31 @@ def test_offloader_no_offload_does_not_construct_runner():
     assert off._runner is None
 
 
-def test_offloader_python_runner_default_path():
-    """Default `cpu_runner='python'` constructs ONE PythonCotsRunner."""
+def test_offloader_default_runner_is_native():
+    """Stage 5 default: `cpu_runner='native'` → NativeCotsRunner. The
+    installer-refactor invariant from Stage 2 still holds: ONE runner
+    per offloader, shared across all operator installs."""
     from vllm.config.offload import CotsOffloadConfig
-    from vllm.model_executor.offloader.cots import CotsOffloader, PythonCotsRunner
+    from vllm.model_executor.offloader.cots import CotsOffloader, NativeCotsRunner
 
     cfg = CotsOffloadConfig(f_cpu_store=0.10)
     off = CotsOffloader(config=cfg)
+    try:
+        assert isinstance(off._runner, NativeCotsRunner)
+    finally:
+        if off._runner is not None:
+            off._runner.close()
+
+
+def test_offloader_python_runner_explicit_path():
+    """Explicit `cpu_runner='python'` continues to construct a
+    PythonCotsRunner — the kill-switch path remains valid."""
+    from vllm.config.offload import CotsOffloadConfig
+    from vllm.model_executor.offloader.cots import CotsOffloader, PythonCotsRunner
+
+    cfg = CotsOffloadConfig(f_cpu_store=0.10, cpu_runner="python")
+    off = CotsOffloader(config=cfg)
     assert isinstance(off._runner, PythonCotsRunner)
-    # The legacy code constructed a fresh CpuTaskRunner per op; Stage 2's
-    # invariant is one runner per offloader. We can't probe operator
-    # construction here without a real model, but `off._runner` is the
-    # singleton operators must use (Stage 3 flips them via the uniform
-    # facade; Stage 2's _install_*_ops asserts on this same field).
 
 
 def test_offloader_native_runner_constructs_post_stage_3():
