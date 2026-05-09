@@ -119,15 +119,20 @@ def _build_qkv_offloader(
 
 
 def test_two_runners_have_distinct_runner_ids() -> None:
-    """Trivial registry sanity: each NativeCotsRunner gets a unique id."""
+    """Trivial registry sanity: each NativeCotsRunner gets a unique id,
+    and each id resolves to a distinct `CotsCpuInfer` in the registry
+    (§1c.19: registry now holds infers, not runners)."""
     from vllm.model_executor.offloader import cots
 
     r1 = cots.NativeCotsRunner(dry_run=False)
     r2 = cots.NativeCotsRunner(dry_run=False)
     try:
         assert r1._runner_id != r2._runner_id
-        assert cots_ops._COTS_RUNNERS.get(r1._runner_id) is r1
-        assert cots_ops._COTS_RUNNERS.get(r2._runner_id) is r2
+        infer1 = cots_ops._COTS_INFER.get(r1._runner_id)
+        infer2 = cots_ops._COTS_INFER.get(r2._runner_id)
+        assert infer1 is not None
+        assert infer2 is not None
+        assert infer1 is not infer2
     finally:
         r1.close()
         r2.close()
@@ -142,12 +147,13 @@ def test_close_one_runner_does_not_affect_other() -> None:
     r2 = cots.NativeCotsRunner(dry_run=False)
     try:
         rid1, rid2 = r1._runner_id, r2._runner_id
-        assert cots_ops._COTS_RUNNERS.get(rid1) is r1
-        assert cots_ops._COTS_RUNNERS.get(rid2) is r2
+        assert cots_ops._COTS_INFER.get(rid1) is not None
+        infer2 = cots_ops._COTS_INFER.get(rid2)
+        assert infer2 is not None
 
         r1.close()
-        assert cots_ops._COTS_RUNNERS.get(rid1) is None
-        assert cots_ops._COTS_RUNNERS.get(rid2) is r2
+        assert cots_ops._COTS_INFER.get(rid1) is None
+        assert cots_ops._COTS_INFER.get(rid2) is infer2
     finally:
         r2.close()
 

@@ -125,7 +125,6 @@ def _make_dryrun_runner() -> cots.NativeCotsRunner:
         slab_specs=[slab],
         scratch_max_tokens=4,
         scratch_max_intermediate_per_half=0,
-        bucket_for_fallback=lambda _n: 0,
     )
     return r
 

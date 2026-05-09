@@ -42,50 +42,55 @@ def test_cots_ops_imports_and_registers_ops():
     assert hasattr(torch.ops.vllm, "cots_sync_then_uva")
 
 
-def test_runner_registry_round_trip():
-    """A registered runner can be looked up by id; unregister drops it."""
+def test_infer_registry_round_trip():
+    """A registered infer can be looked up by id; unregister drops it.
+
+    §1c.19 split: the registry holds `CotsCpuInfer` instances (the
+    pybind handles), NOT `NativeCotsRunner` facades. The runner only
+    knows its `runner_id`."""
     from vllm.model_executor.offloader import cots_ops
 
-    class _Stub:
+    class _StubInfer:
         pass
 
-    runner = _Stub()
-    rid = cots_ops._register_runner(runner)
+    infer = _StubInfer()
+    rid = cots_ops._register_infer(infer)
     assert isinstance(rid, int)
-    assert cots_ops._COTS_RUNNERS.get(rid) is runner
+    assert cots_ops._COTS_INFER.get(rid) is infer
 
-    cots_ops._unregister_runner(rid)
-    assert cots_ops._COTS_RUNNERS.get(rid) is None
+    cots_ops._unregister_infer(rid)
+    assert cots_ops._COTS_INFER.get(rid) is None
     # Idempotent:
-    cots_ops._unregister_runner(rid)
+    cots_ops._unregister_infer(rid)
 
 
-def test_runner_registry_is_weak_value_dict():
-    """The registry must hold weak refs so a runner that's been GC'd
-    auto-clears — otherwise we'd leak NativeCotsRunner instances.
-    """
+def test_infer_registry_is_strong_ref():
+    """§1c.19: the registry holds STRONG refs to `CotsCpuInfer` (was a
+    WeakValueDictionary in the original Stage 2 design). The runner
+    facade no longer holds the pybind handle, so the registry entry is
+    the sole owner — explicit `_unregister_infer` (or the runner's
+    `close()` / `__del__`) is what drops it."""
     from vllm.model_executor.offloader import cots_ops
 
-    class _Stub:
+    class _StubInfer:
         pass
 
-    rid = cots_ops._register_runner(_Stub())  # no Python-side reference
-    # `_Stub()` had no remaining strong references after _register_runner;
-    # WeakValueDictionary collects it on the first GC sweep that touches
-    # the entry. Force a sweep by accessing.
+    rid = cots_ops._register_infer(_StubInfer())  # no local strong ref
     import gc
 
     gc.collect()
-    assert cots_ops._COTS_RUNNERS.get(rid) is None
+    # Strong ref → still present after GC.
+    assert cots_ops._COTS_INFER.get(rid) is not None
+    cots_ops._unregister_infer(rid)
 
 
-def test_lookup_runner_raises_clear_error_when_missing():
+def test_lookup_infer_raises_clear_error_when_missing():
     """Calling the op impl with a stale runner_id surfaces a clear
     RuntimeError with the registry contents — not a silent NoneType."""
     from vllm.model_executor.offloader import cots_ops
 
     with pytest.raises(RuntimeError, match="not in registry"):
-        cots_ops._lookup_runner(99999, "test_op")
+        cots_ops._lookup_infer(99999, "test_op")
 
 
 # --- cots.py — runner classes + factory + backwards-compat alias ----------
@@ -127,14 +132,16 @@ def test_native_cots_runner_construct_install_close():
 
 def test_native_runner_unregisters_on_close():
     """close() drops the registry entry so subsequent op calls with the
-    same runner_id raise cleanly."""
+    same runner_id raise cleanly. §1c.19: the registry now holds the
+    `CotsCpuInfer` instance, not the runner — but the lifetime story
+    from the runner facade's perspective is unchanged."""
     from vllm.model_executor.offloader import cots, cots_ops
 
     r = cots.NativeCotsRunner(dry_run=False)
     rid = r._runner_id
-    assert cots_ops._COTS_RUNNERS.get(rid) is r
+    assert cots_ops._COTS_INFER.get(rid) is not None
     r.close()
-    assert cots_ops._COTS_RUNNERS.get(rid) is None
+    assert cots_ops._COTS_INFER.get(rid) is None
 
 
 def test_cputaskrunner_alias_for_backwards_compat():

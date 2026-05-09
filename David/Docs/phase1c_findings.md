@@ -91,7 +91,11 @@ COTS extension (oneDNN owns the worker's intra-op threading).
 - §1c.18 — Stage 6 follow-up: pre-hook × torch.compile fullgraph
   interaction (CLOSED — `_bucket_for` now Dynamo-traceable)
 - §1c.19 — Stage 6 follow-up #2: Dynamo guard serialization tries
-  to pickle `CotsCpuInfer` (uncovered AFTER §1c.18 was closed)
+  to pickle `CotsCpuInfer` (CLOSED — registry split moves the pybind
+  handle out of the runner facade)
+- §1c.20 — Stage 6 follow-up #3: Inductor's `reinterpret_tensor`
+  drops `is_pinned()` for pinned-host buffers passed through custom
+  ops (uncovered AFTER §1c.19 was closed)
 
 ---
 
@@ -870,9 +874,18 @@ Coverage: `David/Tests/phase1c/test_bucket_for_dynamo.py` (19 tests):
 
 ---
 
-## 1c.19: Real-model anchor blocker #2 — Dynamo guard pickling vs `CotsCpuInfer`
+## 1c.19: Real-model anchor blocker #2 — Dynamo guard pickling vs `CotsCpuInfer` (CLOSED)
 
-**Status: open.** Uncovered AFTER §1c.18 was closed. The
+**Status: closed.** Resolved via the registry split landed alongside
+§1c.18. The compile-visible `NativeCotsRunner` facade no longer
+holds a `CotsCpuInfer` reference; the pybind handle lives in the
+`cots_ops._COTS_INFER` registry, keyed by `runner_id`. Custom op
+impls and offloader install/teardown helpers all dereference the
+registry instead of `runner._infer`.
+
+### Original problem
+
+Uncovered AFTER §1c.18 was closed. The
 `cots_005_native_capture_dryrun` smoke now gets past Dynamo's
 fullgraph capture and falls into AOT compile's guard-serialization
 step, which tries to pickle a `vllm._cots_C.CotsCpuInfer` instance
@@ -944,6 +957,148 @@ under fullgraph capture, regardless of caching), and it unifies
 §1c.19 was unobservable until §1c.18 was fixed because the older
 crash short-circuited engine init before AOT compile reached the
 guard-serialization step.
+
+### Resolution shipped (registry split)
+
+Patch sites:
+
+- `cots_ops.py` — `_COTS_RUNNERS` (a `WeakValueDictionary` of
+  runners) replaced with `_COTS_INFER: dict[int, CotsCpuInfer]`
+  (strong refs, keyed by `runner_id`). The registry IS the storage
+  for the pybind handle; the runner only holds the integer id.
+  Helper functions `install_infer`, `populate_slab_via_spec`,
+  `set_worker_affinity`, `sync_blocking` provide install-time and
+  teardown-time access without ever exposing `CotsCpuInfer` on the
+  runner's `__dict__`.
+- `cots.py:NativeCotsRunner.__init__` — creates `CotsCpuInfer()`
+  and immediately hands it to `cots_ops._register_infer(...)`.
+  The local variable goes out of scope; nothing in `self.__dict__`
+  references the handle. Fields are now `_runner_id`,
+  `_task_id_for`, `_dry_run`, `_installed` — all picklable.
+- `cots.py:NativeCotsRunner.install` — drops the
+  `bucket_for_fallback` parameter. Operators are required to
+  resolve `op_descriptor[1]` to a non-None int before calling the
+  runner. (Same change applied to `PythonCotsRunner.install` for
+  parity, even though that runner is eager-only and Dynamo never
+  sees it.)
+- `cots.py:CotsQKVOp.apply` and `CotsSwiGLUMLPOp.__call__` —
+  resolve `b = offloader._current_bucket or
+  offloader._bucket_for(num_tokens)` up-front, before the
+  per-bucket data lookups. Eliminates the `int | None` ambiguity
+  that the runner's lazy fallback used to handle.
+- `cots.py:CotsOffloader._install_runner` —
+  `runner._infer.set_worker_affinity(mask)` becomes
+  `cots_ops.set_worker_affinity(runner._runner_id, mask)`.
+
+Coverage: `David/Tests/phase1c/test_runner_picklable.py` (4 tests):
+- `pickle.dumps(NativeCotsRunner)` succeeds (the AOT-cache
+  serialization path).
+- The runner's `__dict__` contains no `CotsCpuInfer` instance
+  under any name (defensive — Dynamo's guard walker uses
+  `__dict__`).
+- The serialized byte stream contains no `CotsCpuInfer` class
+  reference (catches a future regression where someone gives the
+  pybind class a permissive `__reduce__`).
+- After a pickle round-trip, the unpickled facade still names the
+  same registry slot — i.e., the runner facade is "a tagged
+  pointer into `cots_ops._COTS_INFER`."
+
+Plus seven existing tests rewritten for the new registry surface
+(`test_stage2_substrate.test_infer_registry_*`,
+`test_multi_engine.test_two_runners_have_distinct_runner_ids`,
+`test_multi_engine.test_close_one_runner_does_not_affect_other`,
+`test_dependency_ordering.test_fx_graph_*`).
+
+### Smoke result
+
+`cots_005_native_capture_dryrun` now gets PAST AOT compile and
+graph capture — runtime entry, custom op dispatch, the
+`mutates_args` ordering — all good. Engine init proceeds further
+than before. The next-uncovered failure is documented in §1c.20.
+
+---
+
+## 1c.20: Real-model anchor blocker #3 — Inductor `reinterpret_tensor` drops `is_pinned()`
+
+**Status: open.** Uncovered AFTER §1c.19 was closed. The smoke run
+now reaches the captured forward's runtime execution; the failure
+is in `uva_copy_into_gpu`'s `assert src_pinned.is_pinned()`:
+
+```
+torch._inductor.utils.run → model(new_inputs)
+  /tmp/torchinductor_root/.../output_code.py:2027 in call
+    torch.ops.vllm.cots_sync_then_uva.default(
+        reinterpret_tensor(buf9, (s72, 3584), (3584, 1), 0),  # y_pinned
+        reinterpret_tensor(buf13, (s72, 3584), (3584, 1), 0), # y_gpu
+        buf12, arg11_1, 1)
+  cots_ops.py:193 _cots_sync_then_uva_impl
+    uva_copy_into_gpu(y_pinned, y_gpu)
+  cots.py:125 uva_copy_into_gpu
+    assert src_pinned.is_pinned(), "src must be pinned host memory"
+AssertionError: src must be pinned host memory
+```
+
+### What's happening
+
+Inductor's lowering pass traces through the operator's
+`__call__`. It sees:
+
+```python
+y_out = offloader._y_pinned[: num_tokens * n_cpu].view(num_tokens, n_cpu)
+self._runner.submit_with_d2h(x, x_in, y_out, op_desc)
+...
+self._runner.wait_and_uva(y_out, y_dst, gpu_a, gpu_b)
+```
+
+`offloader._y_pinned` is a `torch.empty(..., pin_memory=True)`
+allocation. Inductor emits a `reinterpret_tensor(buf9, ...)` node
+representing the slice/view; in the generated runtime,
+`reinterpret_tensor` produces a tensor whose `is_pinned()` flag
+is False even though the underlying storage IS pinned.
+
+The Triton UVA kernel itself doesn't actually need the
+`is_pinned()` flag to be True at the Python level — it needs the
+underlying CUDA host pointer to be page-locked, which the
+storage still is. So this is a type-system mismatch: the runtime
+storage is fine; only the metadata bit is missing on the
+reinterpret view.
+
+### Resolution paths
+
+(a) **Relax the `uva_copy_into_gpu` assertion to a runtime check
+on the storage, not the view.** `is_pinned()` walks the tensor's
+storage class; we can drop down to
+`src_pinned.untyped_storage().is_pinned()` or check the device
+type explicitly. The simplest patch is to remove the `is_pinned()`
+assertion and rely on the storage-level check that the Triton
+kernel itself performs. Risk: silently accepts non-pinned input
+and Triton can read garbage; mitigate by adding a one-time check
+at install/wrap_modules time and trusting the post-compile path.
+
+(b) **Pre-pin the Inductor-allocated buffer.** Mark the operator's
+`y_out` as a graph-output-style buffer that Inductor must respect
+the pinned-ness of. This requires Inductor knobs that may not
+exist (custom-op return type doesn't currently carry pinned-ness).
+
+(c) **Bypass `uva_copy_into_gpu` entirely from inside the captured
+graph.** Move the H2D copy back to a regular `dst_gpu.copy_(
+src_pinned, non_blocking=True)` and let CUDA Runtime do it. The
+UVA kernel was an optimization to share the PCIe link with
+concurrent CE0 traffic; under graph capture the alternative may
+or may not be measurably worse — would need a follow-up
+microbench.
+
+Path (a) is probably the right immediate fix (with the storage-level
+check kept as the safety belt). Path (c) is a Stage 7-adjacent
+investigation that affects the bandwidth ceiling.
+
+### Why §1c.19 fix still ships independently
+
+The registry split is a strictly-better state regardless of §1c.20
+— it removes a non-pickleable handle from the compile-visible
+object graph, which is correct architecture for ANY downstream
+PyTorch caching/serialization layer (today's AOT guard cache,
+tomorrow's cache_size_limit / inductor cache / etc.).
 
 ---
 
