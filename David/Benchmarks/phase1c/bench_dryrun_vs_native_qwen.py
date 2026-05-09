@@ -14,10 +14,15 @@ The thesis-locked absolute orch number. Phase 1a's
 §1.14 absolute target on Qwen2.5-7B BF16 decode-heavy
 (input=8, output=128):
 
-    orch_python_eager = T(cots_005_python_eager_dryrun) − T(none)
-                      ≈ 0.45 s/generate  (Phase 1a baseline)
-    orch_native_capture = T(cots_005_native_capture_dryrun) − T(none)
-                      target ≤ 0.05 s/generate  (Stage 5 collapse)
+    orch_python_eager   = T(cots_005_python_eager_dryrun) − T(none)
+                        ≈ 0.45 s/generate  (Phase 1a baseline)
+    orch_native_capture = T(cots_005_native_capture_dryrun) − T(none_capture)
+                        target ≤ 0.05 s/generate  (Stage 5 collapse)
+
+Capture-mode arms subtract `none_capture` (graph-mode no-offload)
+rather than eager `none`, so the metric isolates COTS overhead under
+graph capture instead of conflating it with the capture-vs-eager
+delta on the no-offload path.
 
 The synthetic shape-collapse bench
 (`bench_dryrun_vs_real_native.py`) confirmed the SHAPE on a stub
@@ -108,7 +113,7 @@ def arms_for(threads: int) -> dict[str, list[str]]:
         # THE Stage 5 HEADLINE: native+capture+dryrun. Captured graph
         # replay re-issues only host-callback + GPU-kernel nodes; no
         # Python operator-body traversal between forwards. Target:
-        # T(this) − T(none) ≤ 0.05 s/generate.
+        # T(this) − T(none_capture) ≤ 0.05 s/generate.
         "cots_005_native_capture_dryrun": cots_base
         + ["--cots-cpu-runner", "native", "--cots-dry-run"],
         # Production path: native+capture, real CPU GEMM. Where
