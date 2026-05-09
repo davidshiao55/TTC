@@ -54,6 +54,7 @@ def _populate_qkv_slab(
     ci.populate_slab_qkv(
         task_id=task_id,
         n_threads=n_threads,
+        bucket_capacity_tokens=1,
         x_pinned_ptr=x_pinned.data_ptr(),
         in_dim=in_dim,
         y_pinned_ptr=y_pinned.data_ptr(),

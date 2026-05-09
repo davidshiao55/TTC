@@ -30,7 +30,7 @@ def test_install_some_slabs_then_dryrun():
     ci = CotsCpuInfer()
     ci.install(n_slabs=8, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
     for i in range(8):
-        ci.populate_slab_dryrun(i, x_pinned_ptr=0, in_dim=0, y_pinned_ptr=0, cpu_out_dim=0)
+        ci.populate_slab_dryrun(i, bucket_capacity_tokens=0, x_pinned_ptr=0, in_dim=0, y_pinned_ptr=0, cpu_out_dim=0)
     # Just confirms the no-CUDA path works (TaskQueue alone, no host callback).
     ci.submit_dryrun_burst(16)
     ci.sync_blocking()

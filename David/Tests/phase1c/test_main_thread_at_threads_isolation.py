@@ -39,6 +39,7 @@ def _populate_one_qkv_slab(
     ci.populate_slab_qkv(
         task_id=0,
         n_threads=n_threads,
+        bucket_capacity_tokens=1,
         x_pinned_ptr=x_pinned.data_ptr(),
         in_dim=in_dim,
         y_pinned_ptr=y_pinned.data_ptr(),
@@ -136,6 +137,7 @@ def test_repeated_slab_dispatch_keeps_main_thread_isolated() -> None:
         ci.populate_slab_qkv(
             task_id=i,
             n_threads=n,
+            bucket_capacity_tokens=1,
             x_pinned_ptr=x_pinned.data_ptr(),
             in_dim=64,
             y_pinned_ptr=y_pinned.data_ptr(),

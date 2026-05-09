@@ -110,13 +110,18 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   captured graph shape stays at the bucket. native_capture_real at
   output_len=128 collapsed from 119.33 s → 2.76 s (43× speedup),
   matching native_eager_real (~2.60 s).
-- §1c.22 — **Open follow-up**: bucket-sized D2H + UVA copies. The
-  captured `cudaMemcpyAsync` byte counts and the captured Triton
-  UVA grid are still bucket-sized (~99.6% PCIe waste at B=1
-  steady-state per call). Counter pass at output_len=128 shows
-  16.4 GB captured input D2H vs 10.0 GB live worker input bytes
-  — measured material waste in the over-transfer. May explain a
-  meaningful chunk of the residual ~+0.5 s capture-mode orch.
+- §1c.22 — **ACTIVE** (controlled diagnostic complete; live-masked
+  transfer prototype justified). Default-cap capture-mode COTS
+  delta (`native_capture_real − none_capture` at matched cap
+  sizes) is **+0.990 s/generate**; capping at `[1, 8]` reduces it
+  to **+0.752 s** — a **~0.24 s/generate improvement**. This
+  proves bucket-size-related work is partly on the critical path,
+  contradicting an earlier uncontrolled reading. The split between
+  D2H byte cost, UVA byte cost, and other graph-shape effects
+  still needs prototype/nsys attribution. See §1c.22 below for
+  the controlled experiment, the counter-attribution fix
+  (immutable `bucket_capacity_tokens`), and the §1c.23 prototype
+  scope.
 
 ---
 
@@ -1451,44 +1456,147 @@ mechanism makes the WORKER ignore that bucket and process only
 
 Triple suite: phase1a 60, phase1b 80, phase1c 147 (143 + 4 new).
 
-### What's still open: §1c.22 (PCIe waste from bucket-sized copies)
+### §1c.22 (PCIe waste from bucket-sized copies) — ACTIVE; live-masked transfer prototype justified
 
-The captured `cudaMemcpyAsync` byte count and the captured Triton
-UVA grid are still bucket-sized — only the worker's CPU-side
-arithmetic shrinks to live tokens. Byte-accounting smoke at
-output_len=128 (dryrun arm, B=1, t=16, f=0.05, 1 warmup + 1 iter):
+Captured `cudaMemcpyAsync` byte count AND the captured Triton UVA
+grid are still bucket-sized — only the worker's CPU-side
+arithmetic shrinks to live tokens (§1c.21 fix). The §1c.22 plan
+called for investigation BEFORE any code change.
 
-```
-d2h_1d_bytes (captured input D2H):    16.4 GB
-worker_input_bytes_used (live read):  10.0 GB
-   ⇒ over-transfer:                    6.4 GB (39% waste at this scope)
+#### Controlled comparison
 
-worker_output_bytes_used (live write): 5.4 GB
-```
+Earlier rounds compared bucket-cap-1 vs default capture sizes by
+raw wall-clock and read it as "transfer waste is not on the
+critical path." That reading was wrong: the bucket-cap experiment
+changes vLLM's graph regime (fewer captured graphs, more
+PIECEWISE/eager fallback), which changes the **baseline** too.
+The right framing is the COTS delta against a matching
+`none_capture` baseline at the same cap-size config.
 
-For steady-state B=1 decode (excluding engine-init capture
-forwards): each cudaMemcpyAsync transfers `bucket × in_dim × 2`
-bytes (e.g., 256 × 3584 × 2 = 1.8 MB), worker reads
-`1 × 3584 × 2 = 7 KB` → **99.6% per-call PCIe waste**. UVA copy
-back is symmetric. Plausibly explains a meaningful chunk of the
-residual `+0.5 s` capture-mode orch.
+B=1, input_len=8, output_len=128, Qwen2.5-7B BF16, f=0.05.
+Post-cudagraph-capture counter reset gated by
+`VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE=1` (hook lives
+in `gpu_model_runner.py` after the "Graph capturing finished" log
+line):
 
-§1c.22 fix candidates (open):
-- D2H: the captured cudaMemcpyAsync byte count is frozen at
-  capture time. To shrink at replay, the host_fn callback would
-  need to issue a NEW cudaMemcpyAsync from inside the callback
-  — but host_fn callbacks can't issue CUDA work. Possible
-  workaround: separate "replay-time copy" stream where the byte
-  count is dynamic. Non-trivial.
-- UVA: the captured Triton kernel has a static grid sized for
-  the bucket. A "trusted dynamic-copy path" (separate Triton
-  kernel that takes runtime n via a CUDA-readable side channel)
-  is plausible.
-- Both fixes are §1c.22 territory; not on §1c.21's critical
-  path. The §1.14 thesis target accounting must remain honest:
-  remaining +0.73 s/gen is no longer wasted CPU GEMM, but it is
-  still graph-mode overhead + small real CPU work + bucket-sized
-  copy waste — not pure orchestration.
+| capture-size config | `none_capture` | `native_capture_real` | **COTS delta** |
+|---|---|---|---|
+| default (51 sizes: [1, 2, 4, 8, 16, …, 512]) | 2.042 s | 3.032 s | **+0.990 s** |
+| `[1, 8]` (2 sizes) | 2.301 s | 3.053 s | **+0.752 s** |
+| eager comparison: `native_eager_real` 2.60 s − `none` 2.03 s | | | +0.57 s |
+
+**Limiting captured buckets reduces the COTS delta by ~0.24
+s/generate.** This is not visible in raw wall-clock (3.03 vs
+3.05) because the matched `none_capture` ALSO got slower
+(2.04 → 2.30) under the smaller bucket set — vLLM falls back to
+PIECEWISE more often, slowing both arms equally. Without the
+matched baseline, the bucket-related component would have
+remained invisible.
+
+Per the §1c.22 plan's decision gate ("if limited bucket reduces
+the COTS delta, transfer waste is at least partly critical path
+and live-masked transfer remains worth prototyping") — the
+delta improved, so the prototype is justified.
+
+**Attribution between D2H byte cost, UVA byte cost, and other
+graph-shape effects is still open.** The matched-delta
+experiment proves bucket-sized work is on the critical path; it
+does not separate D2H from UVA from any other captured work
+that scales with bucket size. The §1c.23 prototype is the right
+way to attribute that, not more bucket-size hacks.
+
+#### Counter-attribution fix (review-fix)
+
+The first replay-bucket counters incremented from
+`bucket_n = slab->num_tokens` inside `RunSlabOnWorker`. That was
+incorrect: `slab.num_tokens` is mutable submit/capture state and
+can be overwritten across captures or by PIECEWISE Python
+re-execution; replay-time bucket counters must be tied to the
+**descriptor bucket**, not to whatever happens to be in
+`slab.num_tokens` at fire time. Symptom: byte-for-byte identical
+counters across the two cap-size configs above (impossible if
+the counter measured what it claimed to).
+
+Fix: `TaskSlab` now carries an immutable `bucket_capacity_tokens`
+populated at `populate_slab_*` time from the
+`(layer, bucket, op_kind)` descriptor's bucket value. The replay
+counters in `RunSlabOnWorker` read this field; the mutable
+`num_tokens` is left alone for submit-time bookkeeping.
+
+`David/Tests/phase1c/test_bucket_capacity_immutable.py`
+codifies the invariant — `set_runtime_num_tokens` and
+`submit_on_stream` calls do NOT change `bucket_capacity_tokens`.
+Three tests, all green.
+
+This still **estimates** the captured cudaXxxAsync byte cost.
+The only authoritative value would come from inspecting the
+recorded cuGraphNode parameters at capture time; absent that
+graph-introspection plumbing, the descriptor bucket is the
+closest stable proxy. Future revisits (hardware with slower
+PCIe, larger bucket distributions) may need the graph-node
+attribution.
+
+#### §1c.23 prototype scope
+
+Live-masked transfer behind a `CotsOffloadConfig` flag (default
+off). Captured `cudaMemcpyAsync` (input D2H) and Triton UVA
+(output H2D) effective byte traffic must track the live
+`num_tokens` (plumbed via `set_runtime_num_tokens`), not the
+captured bucket.
+
+The work has to become replay-dynamic; **a custom-op impl that
+"issues an async copy itself" is NOT replay-dynamic** because
+graph capture freezes whatever the impl recorded into the
+captured graph nodes. Replays just re-fire those nodes; the impl
+is not re-entered. Two realistic mechanisms:
+
+1. **Graph-exec memcpy/kernel parameter patching before
+   replay.** Walk the captured `cudaGraphExec` and rewrite the
+   memcpy byte count (and any Triton grid sizes that scale with
+   bucket) to the live token count between replays via
+   `cudaGraphExec*Node*Params`. Touches the graph executor; vLLM
+   may not currently plumb a hook between dispatch and replay
+   that we can update from. Most direct, but risky if vLLM holds
+   the executor opaquely.
+2. **Captured static-grid kernels with a replay-time `live_n`
+   side channel.** Record the kernel at full bucket size so the
+   captured grid is fixed, but have the kernel read a
+   host-resident or device-resident `int32 live_n` and mask
+   memory traffic — bail on rows ≥ live_n. The DMA engine still
+   walks the recorded byte count for any captured memcpy nodes,
+   so this works cleanly for the UVA Triton kernel (it owns its
+   masking) but does NOT help captured `cudaMemcpyAsync` byte
+   cost. For the D2H side either (a) replace the captured
+   memcpy with a captured custom kernel that reads `live_n` and
+   does the actual byte traffic itself, or (b) accept the
+   asymmetry and let UVA carry the prototype's signal.
+
+Recommended starting point: **mechanism 2 on the UVA side
+first**. Triton UVA kernel already owns its grid; adding a
+`live_n` arg + masking is mechanically smaller than touching
+vLLM's graph-executor hook surface, and isolates whether
+output-side masking moves wall-clock at all. If positive,
+mechanism 1 (graph-exec patching) for the input D2H is the
+follow-up.
+
+A/B (one number per cell, matched cap-size config — re-measure
+all four because the §1c.22 numbers were taken with mutable-
+bucket counter attribution that has since been corrected):
+* default cap, `live_masked=off` (re-measure to lock the
+  baseline under fixed counter attribution; expected ~+0.990 s
+  delta)
+* default cap, `live_masked=on`
+* matching `none_capture` at default cap (re-measure to lock
+  baseline under same conditions)
+
+Decision gate (calibrated to the measured bucket-sensitive
+component, NOT the full COTS delta): prototype must close at
+least **50% of the ~0.24 s/generate bucket-sensitive delta**
+(i.e., ≥ ~0.12 s/gen improvement on `native_capture_real`)
+relative to the re-measured `live_masked=off` arm, with no
+correctness regression and no `none_capture` regression. Below
+that, document as "tried, not enough to land" and move to nsys
+attribution of the residual graph-shape effects.
 
 ---
 

@@ -47,6 +47,7 @@ def _new_runner_with_qkv_slab(
     infer.populate_slab_qkv(
         task_id=0,
         n_threads=1,
+        bucket_capacity_tokens=bucket_size,
         x_pinned_ptr=x_pin.data_ptr(),
         in_dim=in_dim,
         y_pinned_ptr=y_pin.data_ptr(),

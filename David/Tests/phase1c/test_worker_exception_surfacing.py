@@ -57,6 +57,7 @@ def _force_mlp_scratch_unavailable_error():
     ci.populate_slab_mlp(
         task_id=0,
         n_threads=1,
+        bucket_capacity_tokens=1,
         x_pinned_ptr=x_pin.data_ptr(),
         in_dim=in_dim,
         y_pinned_ptr=y_pin.data_ptr(),

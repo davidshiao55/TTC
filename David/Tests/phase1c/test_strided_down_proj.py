@@ -116,6 +116,7 @@ def test_native_runner_strided_down_proj_matches_python():
     ci.populate_slab_mlp(
         task_id=0,
         n_threads=1,
+        bucket_capacity_tokens=NUM_TOKENS,
         x_pinned_ptr=x_for_mlp.data_ptr(),
         in_dim=HIDDEN,
         y_pinned_ptr=y_pinned.data_ptr(),
@@ -179,6 +180,7 @@ def test_native_runner_strided_down_proj_offset_pointer_is_load_bearing():
     y_wrong = _alloc_pinned(NUM_TOKENS, HIDDEN)
 
     common_kwargs = dict(
+        bucket_capacity_tokens=NUM_TOKENS,
         x_pinned_ptr=x_for_mlp.data_ptr(),
         in_dim=HIDDEN,
         cpu_out_dim=HIDDEN,

@@ -57,6 +57,7 @@ def _populate_qkv_slab_directly(
     infer.populate_slab_qkv(
         task_id=task_id,
         n_threads=1,
+        bucket_capacity_tokens=int(x_pin.shape[0]),
         x_pinned_ptr=x_pin.data_ptr(),
         in_dim=int(x_pin.shape[1]),
         y_pinned_ptr=y_pin.data_ptr(),
