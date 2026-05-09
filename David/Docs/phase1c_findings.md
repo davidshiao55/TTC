@@ -89,7 +89,9 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   unification
 - §1c.17 — `__del__` drain forward risk (registered, not yet exercised)
 - §1c.18 — Stage 6 follow-up: pre-hook × torch.compile fullgraph
-  interaction blocks the real-model native+capture absolute
+  interaction (CLOSED — `_bucket_for` now Dynamo-traceable)
+- §1c.19 — Stage 6 follow-up #2: Dynamo guard serialization tries
+  to pickle `CotsCpuInfer` (uncovered AFTER §1c.18 was closed)
 
 ---
 
@@ -714,7 +716,16 @@ follow-up.
 
 ---
 
-## 1c.18: Real-model anchor blocker — pre-hook × torch.compile fullgraph
+## 1c.18: Real-model anchor blocker #1 — pre-hook × torch.compile fullgraph (CLOSED)
+
+**Status: closed.** `_bucket_for` is Dynamo-traceable as of the
+post-Stage-6 §1c.18 fix commit. Re-running the
+`cots_005_native_capture_dryrun` smoke no longer hits the
+`bisect_left` failure mode; engine init proceeds past Dynamo's
+fullgraph capture step. (Engine init still fails further down the
+line — see §1c.19, the next-uncovered blocker.)
+
+### Original problem
 
 Stage 6's smoke-run of `bench_dryrun_vs_native_qwen.py` on Qwen2.5-7B
 surfaced an interaction between Phase 1c's first-decoder pre-hook
@@ -824,6 +835,115 @@ The synthetic shape-collapse gate (Stage 5, ratio 0.477) is in-stage
 proof that the substrate works. The real-model absolute is a
 follow-up that should land path (a) or (b) before re-running the
 harness.
+
+### Resolution shipped
+
+Path (a) was selected. Patch sites:
+
+- `cots.py:_bucket_for` — replaced `bisect_left` with a linear scan
+  over `_capture_buckets`. Dynamo specializes the tuple as a
+  constant and unrolls the loop at trace time. Repeat-runs of the
+  for-loop carry no per-bucket overhead vs `bisect_left` because N
+  is the number of capture buckets (typically O(10)) and the
+  function runs once per forward boundary, not per-GEMM.
+- `cots.py:_resolve_capture_buckets` — `_capture_buckets` is now
+  `tuple[int, ...]` (was `list[int]`). Tuples are hashable + treated
+  as constant containers by Dynamo, which the linear scan needs.
+- `cots.py:lookup_dispatch` — refactored to reuse `_bucket_for`
+  instead of carrying its own `bisect_left`. Single source of truth
+  for the rounding semantics; both paths trace identically.
+
+Coverage: `David/Tests/phase1c/test_bucket_for_dynamo.py` (19 tests):
+- 17 parity assertions vs the original `bisect_left` oracle across
+  five interesting input classes (below first, exact match, between
+  buckets, equal to largest, above largest) on four bucket-tuple
+  shapes.
+- A positive Dynamo gate: a tiny `nn.Module` with a forward pre-hook
+  that mirrors `_first_decoder_pre_hook`'s structural shape compiles
+  cleanly under `torch.compile(fullgraph=True)`.
+- A negative regression gate: the same module, but with
+  `bisect_left` reinstated, raises under `fullgraph=True`. Locks in
+  the §1c.18 root cause so a future Dynamo update silently
+  upgrading `bisect_left` to traceable doesn't make this fix look
+  redundant — and so a regression to `bisect_left` in production
+  code would be caught.
+
+---
+
+## 1c.19: Real-model anchor blocker #2 — Dynamo guard pickling vs `CotsCpuInfer`
+
+**Status: open.** Uncovered AFTER §1c.18 was closed. The
+`cots_005_native_capture_dryrun` smoke now gets past Dynamo's
+fullgraph capture and falls into AOT compile's guard-serialization
+step, which tries to pickle a `vllm._cots_C.CotsCpuInfer` instance
+and fails:
+
+```
+File ".../torch/_dynamo/aot_compile.py", line 257, in aot_compile_fullgraph
+    check_fn = graph_capture_output.build_guards(...)
+File ".../torch/_dynamo/convert_frame.py", line 1001, in build_guards
+    return CheckFunctionManager(...)
+File ".../torch/_dynamo/guards.py", line 3766, in __init__
+    self.guards_state = self.serialize_guards(...)
+File ".../torch/_dynamo/guards.py", line 3926, in serialize_guards
+    return pickle_guards_state(guards_state, builder.guard_tree_values)
+File ".../torch/_dynamo/guards.py", line 3552, in pickle_guards_state
+    pickler.dump(state)
+TypeError: cannot pickle 'vllm._cots_C.CotsCpuInfer' object
+```
+
+### Why Dynamo needs to pickle it
+
+vLLM uses PyTorch's AOT compile cache (`vllm/compilation/wrapper.py:176`
+calls `_compiled_callable.aot_compile`). AOT compile builds a guard
+function and serializes it for cache reuse — so guards' closure
+values must be picklable. The COTS operator's `__call__` reads
+`self._runner._task_id_for[desc]` and `self._runner._runner_id`;
+when Dynamo traces those reads, it builds guards on `self._runner`,
+walks its attributes for guard construction, and finds
+`self._runner._infer: CotsCpuInfer`, which is a stateful pybind11
+class with no `__reduce__` / `__getstate__`.
+
+### Resolution paths (open work)
+
+(a) **Add pickle support to `CotsCpuInfer` via pybind11.** Cheapest
+in code volume — define `__getstate__` / `__setstate__` (or
+`pybind11::pickle`) returning a no-op state. Risks: (i) the C++
+extension needs a rebuild; (ii) "pickle to None and reconstruct"
+isn't semantically valid for a stateful inference engine, so guard
+deserialization later would produce a broken handle (acceptable
+ONLY if the AOT cache is never actually used — the file gets
+written, never read).
+
+(b) **Decouple traced operator code from `_runner`.** Stash
+`runner_id` and a frozen view of `_task_id_for` directly on the
+operator at install time (so the operator's `__call__` reads only
+plain ints / a plain dict — no `_runner` deref). Dynamo's guard
+walker stops at the operator; `CotsCpuInfer` stays out of the guard
+graph. Larger change, no rebuild needed.
+
+(c) **Disable AOT compile guard serialization for the offloader
+path.** Investigate vLLM's `compilation_config` for a knob that
+turns off `aot_compile`'s cache. Cheapest if the knob exists;
+sidesteps the picklability question entirely. Workaround quality
+depends on whether disabling the cache costs measurable startup
+time.
+
+The §1c.18 closure already buys the architectural cleanup needed
+for path (b) (`_bucket_for` and dispatch are unified at the
+offloader level). Path (b) is probably the right answer; path (a)
+is a one-hour patch if cache reuse turns out to be a no-op for
+this workload anyway.
+
+### Why §1c.18 fix still ships independently
+
+The §1c.18 fix is a strictly-better state regardless of §1c.19's
+resolution: it removes a Dynamo-traced builtin call (always wrong
+under fullgraph capture, regardless of caching), and it unifies
+`_bucket_for` / `lookup_dispatch` to share a single rounding rule.
+§1c.19 was unobservable until §1c.18 was fixed because the older
+crash short-circuited engine init before AOT compile reached the
+guard-serialization step.
 
 ---
 
