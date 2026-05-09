@@ -102,14 +102,21 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   tensor visible in the captured graph (CLOSED — both ops now
   CUDA-tensors-and-scalar-ids only; pinned buffers reached via
   slab pointers in C++)
-- §1c.21 — **DIAGNOSED, fix open**: under vLLM's full CUDA graph
-  capture, the runtime selects a LARGE captured bucket (>64
-  tokens) for B=1 decodes instead of bucket=1. C++ counters
-  (added in this round) show 76% of capture-mode submits fire
-  at `nt > 64` vs 70% at `nt = 1` under eager. The fix is to
-  decouple "graph shape" from "logical active tokens" — runner
-  must pass live num_tokens to C++, not `x_gpu.shape[0]` which
-  reflects the captured padded shape.
+- §1c.21 — **CLOSED**: live unpadded token count plumbed from
+  `gpu_model_runner.execute_model` →
+  `BaseOffloader.set_runtime_num_tokens` →
+  `CotsCpuInfer::set_runtime_num_tokens`. Worker reads override at
+  host-callback time and uses it for all CPU-side row arithmetic;
+  captured graph shape stays at the bucket. native_capture_real at
+  output_len=128 collapsed from 119.33 s → 2.76 s (43× speedup),
+  matching native_eager_real (~2.60 s).
+- §1c.22 — **Open follow-up**: bucket-sized D2H + UVA copies. The
+  captured `cudaMemcpyAsync` byte counts and the captured Triton
+  UVA grid are still bucket-sized (~99.6% PCIe waste at B=1
+  steady-state per call). Counter pass at output_len=128 shows
+  16.4 GB captured input D2H vs 10.0 GB live worker input bytes
+  — measured material waste in the over-transfer. May explain a
+  meaningful chunk of the residual ~+0.5 s capture-mode orch.
 
 ---
 
@@ -1356,7 +1363,137 @@ how that investigation lands: any future fix to the perf path
 requires Inductor not materializing our CPU views, which is
 exactly what the §1c.20 schema swap guarantees.
 
-§1c.21 follow-up: DIAGNOSED via C++ counters; fix open.
+§1c.21 follow-up: DIAGNOSED via C++ counters; **CLOSED** via the
+live-token plumb-through (vllm@5fecc800b). Counter-driven diagnosis
+notes preserved below for the historical record. Resolution and
+post-fix measurements live in the next sub-section.
+
+### Resolution shipped
+
+The fix decouples "graph tensor shape" (still bucket-sized) from
+"logical live tokens" (the live unpadded count). COTS now has TWO
+row counts:
+
+- `slab.num_tokens` — graph bucket capacity (e.g., 256). Frozen at
+  capture time; sizes the captured cudaMemcpyAsync byte count, the
+  slab's pinned x/y buffers, and the worker's upper-bound check.
+- `runtime_num_tokens` — live rows to compute. Set OUT OF GRAPH by
+  `gpu_model_runner.execute_model` from
+  `scheduler_output.total_num_scheduled_tokens` BEFORE every
+  forward. Always `runtime_num_tokens <= slab.num_tokens`. The
+  worker's `at::linear` shapes, scratch slicing, and y_pinned write
+  region key off this.
+
+Plumb-through:
+1. `gpu_model_runner.execute_model` calls
+   `get_offloader().set_runtime_num_tokens(num_tokens_unpadded)`
+   BEFORE the FULL/PIECEWISE/eager dispatch — covers all paths.
+2. `BaseOffloader.set_runtime_num_tokens(actual)` — no-op default;
+   `CotsOffloader` override pushes through `cots_ops` to
+   `CotsCpuInfer::set_runtime_num_tokens(int32_t n)` (atomic
+   release-store, validates n >= 0).
+3. `RunSlabOnWorker` reads via acquire-load:
+   ```
+   effective_n = (override > 0) ? override : slab.num_tokens
+   TORCH_CHECK(effective_n <= slab.num_tokens)
+   ```
+
+`CotsOffloader.prepare_before_forward` stays Dynamo-clean (no
+pybind calls) because the first-decoder pre-hook is traced into
+the captured graph; the C++-side runtime push happens at the
+out-of-graph model-runner boundary instead.
+
+### Real-model anchor (post-fix)
+
+At B=1, output_len=128, t=16, f=0.05, 3 iters / 2 warmup on
+Qwen2.5-7B + RTX 4090 + i9-14900KF:
+
+```
+arm                            before §1c.21   after §1c.21
+none (eager baseline)            2.0333         2.0333
+none_capture (graph baseline)    2.0323         2.0323
+native_eager_dryrun              2.3488         2.3488
+native_eager_real                2.6050         2.6050
+native_capture_dryrun            2.5294         2.5294
+native_capture_real            119.3297         2.76     ← 43× faster
+```
+
+`cpu_work_native_capture` collapsed from +116.80 s/gen to ~+0.23 s
+— matches native_eager's CPU work cost (+0.28 s) within run-to-run
+variance. The 43× speedup is the elimination of wasted bucket-sized
+GEMMs.
+
+### Counters confirm the worker behavior
+
+At output_len=128 (settled):
+```
+runtime_set_calls:    640        (= 5 generates × 128 forwards)
+runtime_last_value:   1          (B=1 decode)
+worker_eff_n_nt_le_1: 35,874     (dominant — actual decode work)
+worker_eff_n_nt_gt_64: 3,920     (capture-time forwards only)
+```
+
+Submit-time histogram still shows ~76% at `nt_gt_64` — that's
+expected and unchanged because `x_gpu.shape[0]` (passed to submit)
+is the captured bucket size by construction. The override
+mechanism makes the WORKER ignore that bucket and process only
+`runtime_num_tokens` rows.
+
+### Coverage
+
+`David/Tests/phase1c/test_runtime_num_tokens_override.py` (4 tests):
+1. `set_runtime_num_tokens` smaller than bucket → worker processes
+   only first n rows; rest of y_pinned untouched.
+2. `runtime_num_tokens=0` → fall back to `slab.num_tokens`.
+3. `runtime_num_tokens > slab.num_tokens` → hard-fail TORCH_CHECK
+   (worker exception surfaces on next Python call).
+4. Negative value rejected at the Python boundary.
+
+Triple suite: phase1a 60, phase1b 80, phase1c 147 (143 + 4 new).
+
+### What's still open: §1c.22 (PCIe waste from bucket-sized copies)
+
+The captured `cudaMemcpyAsync` byte count and the captured Triton
+UVA grid are still bucket-sized — only the worker's CPU-side
+arithmetic shrinks to live tokens. Byte-accounting smoke at
+output_len=128 (dryrun arm, B=1, t=16, f=0.05, 1 warmup + 1 iter):
+
+```
+d2h_1d_bytes (captured input D2H):    16.4 GB
+worker_input_bytes_used (live read):  10.0 GB
+   ⇒ over-transfer:                    6.4 GB (39% waste at this scope)
+
+worker_output_bytes_used (live write): 5.4 GB
+```
+
+For steady-state B=1 decode (excluding engine-init capture
+forwards): each cudaMemcpyAsync transfers `bucket × in_dim × 2`
+bytes (e.g., 256 × 3584 × 2 = 1.8 MB), worker reads
+`1 × 3584 × 2 = 7 KB` → **99.6% per-call PCIe waste**. UVA copy
+back is symmetric. Plausibly explains a meaningful chunk of the
+residual `+0.5 s` capture-mode orch.
+
+§1c.22 fix candidates (open):
+- D2H: the captured cudaMemcpyAsync byte count is frozen at
+  capture time. To shrink at replay, the host_fn callback would
+  need to issue a NEW cudaMemcpyAsync from inside the callback
+  — but host_fn callbacks can't issue CUDA work. Possible
+  workaround: separate "replay-time copy" stream where the byte
+  count is dynamic. Non-trivial.
+- UVA: the captured Triton kernel has a static grid sized for
+  the bucket. A "trusted dynamic-copy path" (separate Triton
+  kernel that takes runtime n via a CUDA-readable side channel)
+  is plausible.
+- Both fixes are §1c.22 territory; not on §1c.21's critical
+  path. The §1.14 thesis target accounting must remain honest:
+  remaining +0.73 s/gen is no longer wasted CPU GEMM, but it is
+  still graph-mode overhead + small real CPU work + bucket-sized
+  copy waste — not pure orchestration.
+
+---
+
+### §1c.21 historical diagnosis (preserved)
+
 
 ### Counter-driven diagnosis
 
