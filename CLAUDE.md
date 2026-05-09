@@ -196,19 +196,20 @@ These are the existing building blocks in vLLM relevant to the thesis:
 
 ## Implementation Phases
 
-See `David/Docs/implementation_roadmap.md` for the full plan. Summary:
+See `David/Docs/implementation_roadmap.md` for the full plan. Summary (current numbering, post-Phase-1c):
 
-0. **Pre-Implementation Benchmarking** — Validate CPU GEMM throughput, GPU layer timing, PCIe bandwidth, CPU attention latency. Gates all subsequent phases.
-1. **Resident Hybrid Weight Split (all sub-modules)** — Unified column-parallel split for WQKV, WO, MLP1, MLP2. WQKV uses K/V-biased column assignment. Python `CpuComputeDispatcher` prototype + `enforce_eager=True`. Planner emits `f_cpu_store` only (single-entry dispatch). Frees ~1.2 GB (7B) at the phase0-observed ~9% split.
-2. **Attention Offloading** — CPU suffix attention + online softmax merge. Requires CPU attention kernel with per-head LSE. Two-pool KV allocated by Planner (`KV_gpu_bytes`, `KV_cpu_bytes`).
-3. **Tensor-Granularity Prefetch** — Per-sub-module three-way dispatch (permanent/prefetch/cpu) with sub-layer pipeline. Planner gains `f_prefetch_compute` axis per `BatchDescriptor`. Enables 14B+.
-4. **End-to-End Benchmarking** — RTX 4090: 7B / 14B across all configurations.
-5. **CUDA Graph Integration** — Port KTransformers `CPUInfer` + `cudaLaunchHostFunc` pattern. Swap `CpuComputeDispatcher` internals; forward pass unchanged.
+0. **Pre-Implementation Benchmarking** [DONE] — Validate CPU GEMM throughput, GPU layer timing, PCIe bandwidth, CPU attention latency. Gates all subsequent phases. See `phase0_findings.md`.
+1. **Collaborative Weight Offload** [DONE]
+   - **1a** [DONE]: Static col/row split (no prefetch), Python `CpuTaskRunner`, `enforce_eager=True`. See `phase1a_findings.md`.
+   - **1b** [DONE]: Layer-ahead prefetch (three-way dispatch), `f_prefetch` axis per bucket. See `phase1b_findings.md`.
+   - **1c** [DONE]: Native CPU runner — `cudaLaunchHostFunc` + C++ `TaskQueue` worker replaces Python `ThreadPoolExecutor`; `enforce_eager=False` supported (CUDA Graph capture). Bucket-aware thread policy + worker affinity. See `phase1c_findings.md`.
+2. **Attention Offloading** — CPU suffix attention + online softmax merge. Requires CPU attention kernel with per-head LSE. Two-pool KV allocated by Planner (`KV_gpu_bytes`, `KV_cpu_bytes`). Runs on the Phase 1c native-runner substrate.
+3. **End-to-End Benchmarking** — RTX 4090: 7B / 14B across all configurations.
 
 ### Engineering Gaps (not yet in vLLM)
-- Column-parallel weight split + CPU matmul + partial result concat at tensor granularity
-- CPU attention kernel returning per-head LSE values
-- `cudaLaunchHostFunc` glue for CUDA Graph + CPU task co-scheduling (Phase 5)
+- ~~Column-parallel weight split + CPU matmul + partial result concat at tensor granularity~~ [LANDED in Phase 1a/1b]
+- ~~`cudaLaunchHostFunc` glue for CUDA Graph + CPU task co-scheduling~~ [LANDED in Phase 1c]
+- CPU attention kernel returning per-head LSE values (Phase 2)
 
 ## Key Technical Constraints
 
@@ -216,7 +217,7 @@ See `David/Docs/implementation_roadmap.md` for the full plan. Summary:
 - Placement fractions are Planner outputs, not universal constants. `f_cpu_store` is per-model (load-time); `f_cpu_compute` is per-`BatchDescriptor` (per-bucket). `~9%` is the observed optimum at B=1 decode on RTX 4090 + Qwen2.5-7B BF16; see `David/Docs/phase0_findings.md`.
 - Column-parallel weight splits are mathematically exact — verify with unit tests.
 - All PCIe H2D bandwidth goes to weight prefetch; no KV prefetch (see `David/Docs/pcie_bandwidth_allocation_design.md`).
-- CUDA Graph compatibility via `cudaLaunchHostFunc` is deferred to Phase 5; prototype with `enforce_eager=True`. `CpuComputeDispatcher` abstraction ensures the retrofit is localized.
+- CUDA Graph compatibility lands via `cudaLaunchHostFunc` (Phase 1c). Native runner is the post-Phase-1c default (`CotsOffloadConfig.cpu_runner = "native"`); supports `enforce_eager=False`. Python runner kept as kill-switch under `enforce_eager=True` for A/B diagnostics; deprecation one quarter post-Phase-1c.
 
 ## Design Documents
 
@@ -233,3 +234,6 @@ Detailed analysis lives in `David/Docs/`:
 | `attention_offload_design.md` | Two-pool KV, CPU suffix attention, batch size tradeoff |
 | `pcie_bandwidth_allocation_design.md` | Why all PCIe goes to weight prefetch |
 | `phase0_findings.md` | First-iteration Profiler output on RTX 4090 + Qwen2.5-7B |
+| `phase1a_findings.md` | Phase 1a (static col/row split) implementation + measurements |
+| `phase1b_findings.md` | Phase 1b (layer-ahead prefetch + three-way dispatch) implementation + measurements |
+| `phase1c_findings.md` | Phase 1c (native CPU runner + CUDA Graph capture) implementation + measurements |

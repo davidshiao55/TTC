@@ -34,8 +34,11 @@ Workload: synthetic multi-layer QKV stub.
         callbacks; Python operator bodies are NOT traversed.
   * (c) eager no-offload — baseline.
 
-Stage 6 reruns this comparison on Qwen2.5-7B with FastTTS to anchor
-the absolute §1.14 0.05 s/generate target.
+Real-model anchor (Qwen2.5-7B + FastTTS) lives at
+`bench_dryrun_vs_native_qwen.py`. Stage 6 landed that harness;
+locking the §1.14 absolute there is pending the resolution of the
+pre-hook × torch.compile fullgraph blocker documented in
+`David/Docs/phase1c_findings.md §1c.18`.
 
 Run:
     /opt/conda/envs/thesis/bin/python bench_dryrun_vs_real_native.py
@@ -392,8 +395,8 @@ def main() -> int:
     print("  per-layer μs / per-forward μs absolutes here do NOT translate to")
     print("  Qwen2.5-7B's per-generate budget — HIDDEN=256 here vs 3584 on")
     print("  Qwen2.5-7B, smaller layer count, and no attention/MLP between")
-    print("  QKV calls. Stage 6 anchors the §1.14 absolute 0.05 s/generate")
-    print("  target on the real model + FastTTS workload.")
+    print("  QKV calls. Real-model anchor lives in bench_dryrun_vs_native_qwen.py")
+    print("  (harness landed at Stage 6; absolute pending §1c.18 resolution).")
 
     args.results_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.results_dir / "bench_dryrun_vs_real_native.json"

@@ -208,7 +208,12 @@ Prototype uses `ThreadPoolExecutor` + `enforce_eager=True`. Production swaps int
 
 ---
 
-## Phase 1c — Native CPU Runner
+## Phase 1c — Native CPU Runner [LANDED]
+
+**Status:** Stages 1-5 landed; Stage 6 (this section + `phase1c_findings.md`)
+documents the implementation and locks the gates. Stage 7 (transposed-storage
+unification) is optional and deferred. See `phase1c_findings.md` for the full
+design + measured numbers.
 
 Replace the Python `CpuTaskRunner` (Python `ThreadPoolExecutor` + `future.result`)
 with a `cudaLaunchHostFunc`-based handoff backed by a native CPU worker. Phase
@@ -244,25 +249,27 @@ would conflate the runtime gap with the attention numbers.
 | Component | Source | Lines | Notes |
 |---|---|---|---|
 | `CPUInfer` class | `kt-kernel/cpu_backend/cpuinfer.h` | ~80 | `submit_with_cuda_stream`, `sync_with_cuda_stream` |
-| `TaskQueue` | `kt-kernel/cpu_backend/task_queue.{h,cpp}` | ~85 | Lock-free SPSC queue, direct port |
+| `TaskQueue` | `kt-kernel/cpu_backend/task_queue.{h,cpp}` | ~85 | Michael-Scott MPSC queue + condvar sync; one worker thread; direct port |
 | Python bindings | `kt-kernel/ext_bindings.cpp` | ~30 | pybind11 wrapper |
 
 ### What We Skip
 
 | Component | Why |
 |---|---|
-| `WorkerPool` (~500 lines) | MKL manages its own threads for BLAS |
+| `WorkerPool` (~500 lines) | oneDNN manages its own threads for BF16 GEMM |
 | NUMA awareness (~200 lines) | Single-socket consumer system |
-| MoE task wrappers (~300 lines) | Replace with single `cblas_gemm_bf16bf16f32` call |
+| MoE task wrappers (~300 lines) | Replaced with `at::linear` per-op (qkv / mlp_block / dryrun_noop) |
 
-### What We Write
+### What We Wrote (as landed)
 
-| Component | Lines | Notes |
+| Component | LOC (actual) | Notes |
 |---|---|---|
-| CPU matmul task (C++) | ~50 | Wrapper calling MKL `cblas_gemm_bf16bf16f32` |
-| Pre-allocated buffer manager | ~80 | Pinned I/O buffers indexed by `cuda_graph_idx` |
-| Build integration | ~30 | CMake for the C++ extension |
-| Bucket-aware thread policy | ~40 | Per-`BatchDescriptor` `cpu_num_threads` lookup; replaces fixed `cpu_num_threads=16` (`phase1a_findings.md §1.13b`) |
+| CPU matmul task (C++ slab dispatcher) | ~210 (`cots_cpu_infer.cpp`) | `at::linear` (NOT `cblas_gemm_bf16bf16f32` — phase0 §0.3.2 shows oneDNN BF16 hits the AVX2 fast path while MKL `cblas_gemm_bf16bf16f32` requires AVX512_BF16 and falls to the scalar path on i9-14900KF; Stage 1 hard-gate microbench confirmed parity with Python `F.linear`) |
+| Slab pool + worker-local scratch | included above | `unique_ptr<TaskSlab[]>`, NOT `std::vector` (`std::atomic<int32_t>` makes TaskSlab non-MoveConstructible). One shared `scratch_silu_up_` tensor sized at install. |
+| Custom-op registration (Python) | ~120 (`cots_ops.py`) | `vllm.cots_submit_gemm` and `vllm.cots_sync_then_uva`; barrier-installing `mutates_args` declarations + module-private weak runner registry for multi-engine safety |
+| Build integration | ~30 (`CMakeLists.txt`) | `_cots_C` extension gated on `VLLM_GPU_LANG STREQUAL "CUDA"`; LANGUAGE CXX (no CUDA kernels — only Runtime API for `cudaLaunchHostFunc`); standard Python ABI; `torch_python` linked for `at::Tensor` pybind type caster |
+| Bucket-aware thread policy | ~80 (in `cots.py` `_n_threads_for` + `_validate_thread_policy`) | Per-`BatchDescriptor` `cpu_num_threads` via slab field; cache-guarded worker-side `at::set_num_threads`; main-thread `at::get_num_threads` isolation confirmed (omp pragma contingency NOT needed) |
+| Worker affinity | ~40 (in `cots_cpu_infer.cpp::set_worker_affinity`) | `uint64_t` mask intersected with `sched_getaffinity`; warns-and-skips on empty intersection |
 
 ### CUDA Graph Compatible Forward Pass
 
@@ -285,14 +292,43 @@ with `cudaLaunchHostFunc` callbacks is the precondition for capturing the
 forward pass into a graph. `enforce_eager=True` (Phase 1a/1b prototype mode) is
 no longer required.
 
-### What to Measure
+### Stage 1-5 Gates [as landed]
 
-Re-run on the new substrate and compare to the Phase 1a numbers:
-- `phase1a_findings.md §1.12` (cots-vs-prefetch decode + prefill grids)
-- `phase1a_findings.md §1.13b` thread × f × batch sweep
-- `phase1a_findings.md §1.14` per-layer gap (target: shrink to ≲ 2× pure CPU GEMM time, removing the ~30 µs/op Python tax)
+Every stage gated on green tests + a measured invariant before the next started:
 
-**Total new/ported code:** ~400 lines for full CUDA Graph compatibility + ~40 for thread policy.
+| Stage | Gate | Result |
+|---|---|---|
+| 1 | C++ `at::linear` parity vs Python `F.linear` (BF16, B ∈ {1, 4, 16, 32}, contiguous + strided down-proj) | All within 5%; oneDNN BF16 fast path on AVX2; no scalar-fallback regression |
+| 2 | Substrate: native runner round-trip ≤ python runner round-trip (eager, dry_run=True) | ratio 0.974 (native is 3% faster) |
+| 3 | Native-vs-python parity: bit-equivalent QKV + MLP outputs at f_prefetch ∈ {0, 0.10, 0.15, 0.20, 0.25} | All parity assertions pass; FX-positional ordering preserved |
+| 4 | Bucket-aware n_threads observed by worker; main-thread `at::get_num_threads` isolation | All assertions pass; risk #3 GREEN (omp pragma contingency unused) |
+| 5 | CUDA graph capture + 50× replay deterministic + parity; collapse ratio capture/eager < 0.7; FX-positional submit < GEMMs < sync via `torch._dynamo.export` | Collapse ratio 0.477 PASS; FX ordering proven; risk #4 GREEN |
+
+§1.14 ABSOLUTE on Qwen2.5-7B + FastTTS (the thesis-locked number)
+status as of Stage 6:
+
+- **Harness landed**: `David/Benchmarks/phase1c/bench_dryrun_vs_native_qwen.py`
+  ports Phase 1a's `bench_cots_dryrun_vs_none.py` with five arms covering
+  python/native × eager/capture × dryrun/real. The auto-derived CLI flags
+  `--cots-cpu-runner`, `--cots-cpu-num-threads-by-bucket`, and
+  `--cots-cpu-worker-affinity` are now plumbed through `EngineArgs` so
+  `vllm bench latency` accepts them.
+- **`none`, `python_eager_dryrun`, `native_eager_dryrun` arms run** end-to-end
+  on Qwen2.5-7B (smoke confirmed at 1 iter / 1 warmup; baseline 2.03 s/gen).
+- **`native_capture_dryrun` / `native_capture_real` arms BLOCKED** by a
+  pre-hook × `torch.compile(fullgraph=True)` interaction surfaced during
+  Stage 6 smoke. See `phase1c_findings.md §1c.18` for the root cause and
+  three resolution paths (preferred: make `_bucket_for` Dynamo-traceable
+  by replacing `bisect_left` with a tuple-iteration over a constant
+  `_capture_buckets`; lowest-friction).
+- The synthetic `bench_dryrun_vs_real_native.py` collapse-shape gate
+  (Stage 5, ratio 0.477) is the in-stage Phase 1c sign-off; locking the
+  real-model absolute is a Stage 6 follow-up that needs §1c.18 fixed
+  first.
+
+**Total code (as landed):** ~440 LOC C++ (csrc/cots/) + ~120 LOC Python
+(cots_ops.py) + ~600 LOC Python additions/modifications in cots.py + 95 tests
++ 3 benchmark scripts.
 
 ---
 

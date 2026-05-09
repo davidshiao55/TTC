@@ -1,0 +1,30 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "input_len": 8,
+  "output_len": 128,
+  "f": 0.05,
+  "batches": [
+    1
+  ],
+  "threads": [
+    16
+  ],
+  "num_iters": 1,
+  "none": {
+    "1": 2.0324109829962254
+  },
+  "cots": {
+    "cots_005_python_eager_dryrun_t16": {
+      "1": null
+    },
+    "cots_005_native_eager_dryrun_t16": {
+      "1": null
+    },
+    "cots_005_native_capture_dryrun_t16": {
+      "1": null
+    },
+    "cots_005_native_capture_real_t16": {
+      "1": null
+    }
+  }
+}
