@@ -13,12 +13,15 @@
   "none": {
     "1": 2.0324109829962254
   },
+  "none_capture": {
+    "1": 2.0325841339945327
+  },
   "cots": {
     "cots_005_python_eager_dryrun_t16": {
-      "1": null
+      "1": 2.5351286020013504
     },
     "cots_005_native_eager_dryrun_t16": {
-      "1": null
+      "1": 2.3515761429880513
     },
     "cots_005_native_capture_dryrun_t16": {
       "1": null

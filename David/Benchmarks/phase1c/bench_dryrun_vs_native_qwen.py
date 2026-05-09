@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 import time
@@ -80,9 +81,17 @@ def arms_for(threads: int) -> dict[str, list[str]]:
     if threads != DEFAULT_THREADS:
         cots_base += ["--cots-cpu-num-threads", str(threads)]
     return {
-        # No-offload baseline. Eager — the offloader doesn't construct
-        # so the runner choice is moot; matches phase1a's `none`.
+        # Eager no-offload baseline. The offloader doesn't construct
+        # so the runner choice is moot; matches phase1a's `none`. This
+        # is the correct baseline for python-eager and native-eager
+        # dryrun arms (apples-to-apples, both run torch eagerly).
         "none": [],
+        # Graph-capture no-offload baseline. Subtracted from native+
+        # capture arms so the §1.14 metric isolates COTS orch overhead
+        # from torch.compile's own latency contribution. Without this,
+        # native_capture_dryrun − none (eager) understates the COTS
+        # orch by however much capture saves on the no-offload path.
+        "none_capture": [],
         # Phase 1a baseline orch: python runner, eager, dryrun. The
         # 0.45 s/generate §1.14 reference number.
         "cots_005_python_eager_dryrun": cots_base
@@ -116,7 +125,7 @@ _EAGER_ARMS = frozenset({
 
 
 def cell_path(arm: str, batch: int, threads: int) -> Path:
-    if arm == "none" or threads == DEFAULT_THREADS:
+    if arm in ("none", "none_capture") or threads == DEFAULT_THREADS:
         return RESULTS_DIR / f"{arm}_b{batch}.json"
     return RESULTS_DIR / f"{arm}_b{batch}_t{threads}.json"
 
@@ -159,7 +168,7 @@ def run_cell(
         "--output-json",
         str(out_json),
         *flags,
-        *extra_flags,
+        *extra_flags,  # already shlex-split by main()
     ]
     if arm in _EAGER_ARMS:
         cmd.append("--enforce-eager")
@@ -206,10 +215,14 @@ def main() -> None:
         "--extra-flag",
         action="append",
         default=[],
-        help="Pass-through flag to `vllm bench latency` (e.g., "
-        "--max-model-len 1024). Repeatable.",
+        help="Pass-through flag string to `vllm bench latency`; tokenized "
+        "via shlex.split so each occurrence may carry value flags "
+        "(e.g., --extra-flag='--max-model-len 1024'). Repeatable.",
     )
     args = ap.parse_args()
+    # shlex.split each --extra-flag so a single occurrence carrying a
+    # value flag (e.g., '--max-model-len 1024') becomes two argv tokens.
+    args.extra_flag = [tok for s in args.extra_flag for tok in shlex.split(s)]
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     print(
@@ -224,9 +237,11 @@ def main() -> None:
             arms if not args.only_arms
             else {n: arms[n] for n in args.only_arms if n in arms}
         )
-        # `none` is t-invariant — run only at the first t.
-        if t != args.threads[0] and "none" in run_arms:
-            del run_arms["none"]
+        # `none` and `none_capture` are t-invariant — run only at the first t.
+        if t != args.threads[0]:
+            for k in ("none", "none_capture"):
+                if k in run_arms:
+                    del run_arms[k]
         print(f"\n[t={t}] arms={list(run_arms)}")
         for arm, flags in run_arms.items():
             for B in args.batches:
@@ -251,6 +266,10 @@ def main() -> None:
         B: parse_avg(cell_path("none", B, args.threads[0]))
         for B in args.batches
     }
+    none_capture_by_b = {
+        B: parse_avg(cell_path("none_capture", B, args.threads[0]))
+        for B in args.batches
+    }
     cots_arms = [
         "cots_005_python_eager_dryrun",
         "cots_005_native_eager_dryrun",
@@ -272,6 +291,12 @@ def main() -> None:
         for B in args.batches
     )
     print(f"{'none':<36} {'-':>3}  {cells}")
+    cells = "  ".join(
+        f"{none_capture_by_b[B]:>11.4f}"
+        if none_capture_by_b[B] is not None else f"{'—':>11}"
+        for B in args.batches
+    )
+    print(f"{'none_capture':<36} {'-':>3}  {cells}")
     print("=" * 88)
 
     print("\n=== §1.14 orch decomposition (s, per generate) ===")
@@ -283,11 +308,13 @@ def main() -> None:
     for t in args.threads:
         for B in args.batches:
             none = none_by_b[B]
+            none_cap = none_capture_by_b[B]
             py = rows[("cots_005_python_eager_dryrun", t)][B]
             nat_eager = rows[("cots_005_native_eager_dryrun", t)][B]
             nat_cap = rows[("cots_005_native_capture_dryrun", t)][B]
             real = rows[("cots_005_native_capture_real", t)][B]
             print(f"  t={t} B={B}:")
+            # Eager arms: subtract eager `none` (apples-to-apples).
             if none is not None:
                 if py is not None:
                     print(
@@ -299,12 +326,23 @@ def main() -> None:
                         f"    orch_native_eager      = {nat_eager - none:+.4f}s "
                         f"(Stage 2 substrate gate)"
                     )
+            # Capture arms: subtract `none_capture` so the metric
+            # isolates COTS orch overhead under graph capture, not the
+            # capture-vs-eager delta on the no-offload path. Falling
+            # back to eager `none` would understate COTS orch by
+            # however much capture saves on `none`.
+            baseline_cap = none_cap if none_cap is not None else none
+            baseline_label = (
+                "vs none_capture" if none_cap is not None
+                else "vs eager none — UPPER BOUND, none_capture missing"
+            )
+            if baseline_cap is not None:
                 if nat_cap is not None:
-                    delta = nat_cap - none
+                    delta = nat_cap - baseline_cap
                     target = "PASS" if delta <= 0.05 else "FAIL"
                     print(
                         f"    orch_native_capture    = {delta:+.4f}s   "
-                        f"§1.14 target ≤ 0.050s: {target}"
+                        f"§1.14 target ≤ 0.050s: {target}  ({baseline_label})"
                     )
                 if real is not None and nat_cap is not None:
                     print(
@@ -325,6 +363,9 @@ def main() -> None:
                 "threads": args.threads,
                 "num_iters": args.num_iters,
                 "none": {str(B): v for B, v in none_by_b.items()},
+                "none_capture": {
+                    str(B): v for B, v in none_capture_by_b.items()
+                },
                 "cots": {
                     f"{arm}_t{t}": {str(B): v for B, v in rows[(arm, t)].items()}
                     for (arm, t) in rows

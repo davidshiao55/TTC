@@ -561,18 +561,46 @@ landed the harness AND the auto-derived `--cots-cpu-runner` /
 `--cots-cpu-num-threads-by-bucket` / `--cots-cpu-worker-affinity`
 CLI flags so `vllm bench latency` accepts the new fields.
 
-Smoke-runs at `--num-iters 1 --num-iters-warmup 1` confirm:
-- `none` arm completes (2.03 s/generate baseline on Qwen2.5-7B at
-  input=8, output=128, B=1).
-- `cots_005_native_capture_dryrun` arm currently FAILS at engine
-  initialization due to the §1c.18 pre-hook × torch.compile
-  interaction. The python+eager and native+eager arms DO work
-  (their pre-hook fires in eager mode where `bisect_left` is fine).
+Smoke-runs at `--num-iters 1 --num-iters-warmup 1`, B=1, t=16
+(input=8, output=128, f_cpu_store=0.05):
+
+```
+  arm                                     avg_latency (s)
+  none                                       2.0324    (eager baseline)
+  none_capture                               2.0326    (graph baseline)
+  cots_005_python_eager_dryrun               2.5351    → orch = +0.503s
+  cots_005_native_eager_dryrun               2.3516    → orch = +0.319s
+  cots_005_native_capture_dryrun             —          (BLOCKED, see §1c.18)
+  cots_005_native_capture_real               —          (BLOCKED, see §1c.18)
+```
+
+These are 1-iter / 1-warmup smoke values, NOT statistically settled
+benchmark numbers. They confirm three things and nothing more:
+- The harness wires through correctly: subprocesses launch, the new
+  `--cots-cpu-runner` / `--cots-cpu-num-threads-by-bucket` /
+  `--cots-cpu-worker-affinity` flags are accepted, JSON cells
+  populate, summary subtraction uses the right baseline per arm.
+- The §1.14 baseline (python+eager dryrun ≈ 0.45 s/generate on
+  Phase 1a) reproduces in the new harness shape (0.50s here, within
+  smoke variance for a single-iteration run).
+- The native runner under EAGER already shaves ~37% off the python
+  runner at the substrate level (0.319 vs 0.503 s); the additional
+  capture-mode collapse is what would close the rest of the gap to
+  the §1.14 ≤ 0.05 s target — and is exactly what's blocked.
+
+Subtraction baseline note: capture-mode arms subtract `none_capture`
+(graph-mode no-offload), NOT eager `none`. Subtracting eager `none`
+would understate COTS orch by however much torch.compile saves on
+the no-offload path. At B=1 + 1-iter smoke the two baselines are
+indistinguishable (2.0324 vs 2.0326) so this is invisible here, but
+the harness uses the correct baseline by construction.
 
 Concretely: Stage 6's job was to land the harness + design doc, NOT
 to lock the real-model absolute end-to-end. The synthetic
 shape-collapse gate (Stage 5) is the in-stage Phase 1c sign-off; the
-real-model anchor is a Stage 6 follow-up that needs the §1c.18 fix.
+real-model anchor is a Stage 6 follow-up that needs the §1c.18 fix
+to unblock the native+capture arms, plus a properly settled
+multi-iter / multi-batch run with statistical noise bars.
 
 ---
 
@@ -693,22 +721,40 @@ surfaced an interaction between Phase 1c's first-decoder pre-hook
 default `torch.compile(fullgraph=True)` model wrapping.
 
 Repro: `cots_005_native_capture_dryrun` arm at `--num-iters 1
---num-iters-warmup 1` fails at engine initialization with:
+--num-iters-warmup 1` fails at engine initialization. Captured stack
+from the current commit's smoke run (no `@torch._dynamo.disable`
+decorator on the pre-hook — see "Decorator note" below):
 
 ```
-torch._dynamo.exc.Unsupported: Skip calling `torch.compiler.disable()`d function
-   from user code:
-     vllm/model_executor/models/qwen2.py:444 layer(positions, hidden_states, residual)
-     nn/modules/module.py:1809 inner   # forward pre-hook dispatch
-     vllm/model_executor/offloader/cots.py _first_decoder_pre_hook
-       prepare_before_forward → _bucket_for → bisect_left   ← Dynamo can't trace
+torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped
+  Explanation: Dynamo does not know how to trace the builtin
+              `_bisect.bisect_left.` This function is either a Python
+              builtin (e.g. _warnings.warn) or a third-party C/C++
+              Python extension (perhaps created with pybind).
+  Hint: ...wrap it into a PyTorch-understood custom operator... or,
+        if it is traceable, use `torch.compiler.allow_in_graph`.
+  Developer debug context: module: _bisect, qualname: bisect_left,
+                           skip reason: <missing reason>
+
+from user code:
+  vllm/model_executor/models/qwen2.py:444 layer(positions, hidden_states, residual)
+  nn/modules/module.py:1809 inner       # forward pre-hook dispatch
+  vllm/model_executor/offloader/cots.py:2774 _first_decoder_pre_hook
+    self.prepare_before_forward(anchor.shape[0])
+  cots.py:2801 prepare_before_forward
+    self._current_bucket = self._bucket_for(num_tokens)
+  cots.py:2782 _bucket_for
+    i = bisect_left(self._capture_buckets, num_tokens)   ← Dynamo can't trace
 ```
+
+Full log:
+`David/Benchmarks/phase1c/results/dryrun_vs_native_qwen/cots_005_native_capture_dryrun_b1.log`.
 
 Two interacting facts:
 1. vLLM's compiled-model setup uses `fullgraph=True` (one captured
    graph per `BatchDescriptor`).
 2. `nn.Module._call_impl` traces forward pre-hooks INTO the captured
-   graph (Dynamo's standard nn.Module handling).
+   graph (Dynamo's standard nn.Module handling, line 1809).
 
 Phase 1c's pre-hook is supposed to run OUTSIDE the captured region
 (its job is to set `_current_bucket` BEFORE the forward starts; the
@@ -716,9 +762,15 @@ captured region's slab dispatch only reads `_current_bucket`).
 `cudagraph_utils.py:267` already calls `prepare_before_forward` at
 the FULL graph boundary outside compile's view — which is correct —
 but the duplicate forward-pre-hook registration ALSO fires inside
-compile's view and tries to traverse `bisect_left`. Dynamo can't
-trace `bisect_left`; under fullgraph=True the alternative
-`@torch._dynamo.disable` decorator also raises.
+compile's view and tries to traverse `bisect_left`.
+
+**Decorator note:** an earlier Stage 6 attempt added
+`@torch._dynamo.disable` to `_first_decoder_pre_hook`. Under
+`fullgraph=True` Dynamo raises a different error (`Skip calling
+torch.compiler.disable()'d function`, gb0098) instead of tracing
+through. The decorator was reverted in this commit; the stack above
+is from the current (no-decorator) code. Either way the pre-hook
+cannot stay both registered AND opaque under fullgraph capture.
 
 **Resolution paths (Stage 6 follow-up):**
 

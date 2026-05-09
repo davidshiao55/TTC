@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage 5 — Synthetic orch-collapse sanity check (§1.14 absolute
-locked at Stage 6 on the real model).
+"""Stage 5 — Synthetic orch-collapse sanity check (§1.14 real-model
+absolute is a Stage 6 follow-up, blocked by `phase1c_findings.md
+§1c.18`).
 
 The §1.14 finding measured `orch = T(dry_run=True) - T(no offload)`
 ≈ 0.45 s/generate on Phase 1a's Python runner under eager mode. That
@@ -11,8 +12,11 @@ GPU operations.
 
 Stage 5's named target is **`orch ≤ 0.05 s/generate`** on Qwen2.5-7B
 under `cpu_runner='native', enforce_eager=False`. THAT
-absolute-budget gate is reserved for Stage 6 — it requires the real
-model + the FastTTS workload, not a synthetic stub.
+absolute-budget gate is a Stage 6 follow-up — it requires the real
+model + the FastTTS workload, not a synthetic stub. The harness
+landed (`bench_dryrun_vs_native_qwen.py`); locking the absolute is
+blocked by the pre-hook × torch.compile fullgraph interaction
+documented in `phase1c_findings.md §1c.18`.
 
 What THIS bench gates: the SHAPE of the collapse. Graph capture must
 materially reduce the per-forward orch overhead vs eager on the same
@@ -294,9 +298,10 @@ def main() -> int:
         help=(
             "Stage 5 sanity threshold: orch_capture / orch_eager must be "
             "<= this value (default 0.7 — capture must reduce orch by at "
-            "least 30%). The §1.14 absolute generate-equivalent budget is "
-            "Stage 6 work on the real Qwen2.5-7B; this bench only proves "
-            "the SHAPE of the collapse on a synthetic stub."
+            "least 30%). The §1.14 absolute generate-equivalent budget is a "
+            "Stage 6 follow-up on the real Qwen2.5-7B (blocked by §1c.18); "
+            "this bench only proves the SHAPE of the collapse on a "
+            "synthetic stub."
         ),
     )
     args = parser.parse_args()

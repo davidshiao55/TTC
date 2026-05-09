@@ -313,14 +313,21 @@ status as of Stage 6:
   `--cots-cpu-runner`, `--cots-cpu-num-threads-by-bucket`, and
   `--cots-cpu-worker-affinity` are now plumbed through `EngineArgs` so
   `vllm bench latency` accepts them.
-- **`none`, `python_eager_dryrun`, `native_eager_dryrun` arms run** end-to-end
-  on Qwen2.5-7B (smoke confirmed at 1 iter / 1 warmup; baseline 2.03 s/gen).
+- **Smoke results committed** (1 iter / 1 warmup, B=1, t=16, f=0.05;
+  see `David/Benchmarks/phase1c/results/dryrun_vs_native_qwen/summary.json`):
+  - `none` (eager baseline)              2.0324 s/gen
+  - `none_capture` (graph baseline)      2.0326 s/gen
+  - `cots_005_python_eager_dryrun`       2.5351 s/gen → orch +0.503 s
+  - `cots_005_native_eager_dryrun`       2.3516 s/gen → orch +0.319 s
+  These are smoke values, NOT settled benchmark numbers; they confirm
+  the harness wiring + reproduce the §1.14 baseline shape.
 - **`native_capture_dryrun` / `native_capture_real` arms BLOCKED** by a
-  pre-hook × `torch.compile(fullgraph=True)` interaction surfaced during
-  Stage 6 smoke. See `phase1c_findings.md §1c.18` for the root cause and
-  three resolution paths (preferred: make `_bucket_for` Dynamo-traceable
-  by replacing `bisect_left` with a tuple-iteration over a constant
-  `_capture_buckets`; lowest-friction).
+  pre-hook × `torch.compile(fullgraph=True)` interaction. The Dynamo
+  error at engine init points at `_bucket_for → bisect_left` (Dynamo
+  can't trace `_bisect.bisect_left`). See `phase1c_findings.md §1c.18`
+  for the captured stack and three resolution paths (preferred: make
+  `_bucket_for` Dynamo-traceable by replacing `bisect_left` with a
+  tuple-iteration over a constant `_capture_buckets`; lowest-friction).
 - The synthetic `bench_dryrun_vs_real_native.py` collapse-shape gate
   (Stage 5, ratio 0.477) is the in-stage Phase 1c sign-off; locking the
   real-model absolute is a Stage 6 follow-up that needs §1c.18 fixed
