@@ -308,8 +308,10 @@ Every stage gated on green tests + a measured invariant before the next started:
 status as of Stage 6:
 
 - **Harness landed**: `David/Benchmarks/phase1c/bench_dryrun_vs_native_qwen.py`
-  ports Phase 1a's `bench_cots_dryrun_vs_none.py` with five arms covering
-  python/native × eager/capture × dryrun/real. The auto-derived CLI flags
+  ports Phase 1a's `bench_cots_dryrun_vs_none.py` with six arms — two
+  no-offload baselines (`none` eager + `none_capture` graph-mode) and
+  four COTS arms covering python/native × eager/capture × dryrun/real.
+  The auto-derived CLI flags
   `--cots-cpu-runner`, `--cots-cpu-num-threads-by-bucket`, and
   `--cots-cpu-worker-affinity` are now plumbed through `EngineArgs` so
   `vllm bench latency` accepts them.

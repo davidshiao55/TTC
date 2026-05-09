@@ -26,17 +26,19 @@ model — different layer count (28 vs 8), different HIDDEN (3584 vs
 256), real attention + MLP between QKV calls.
 
 Outputs go to `David/Benchmarks/phase1c/results/dryrun_vs_native_qwen/`.
-First-run cells take ~30s each; the full grid (5 arms × default 2
-batches) is ~5 minutes. Set `--only-arms` to subset; previously-saved
+First-run cells take ~30s each; the full grid (six arms = two
+baselines [`none`, `none_capture`] + four COTS arms × default 2
+batches) is ~6 minutes. Set `--only-arms` to subset; previously-saved
 JSON cells are skipped.
 
 Run examples:
     # full grid, default batches [1, 4]
     /opt/conda/envs/thesis/bin/python bench_dryrun_vs_native_qwen.py
 
-    # just the §1.14 collapse comparison
+    # just the §1.14 collapse comparison (capture-mode metric needs
+    # none_capture as the baseline; eager-arm metric needs eager none)
     /opt/conda/envs/thesis/bin/python bench_dryrun_vs_native_qwen.py \\
-        --only-arms none cots_005_python_eager_dryrun \\
+        --only-arms none none_capture cots_005_python_eager_dryrun \\
         cots_005_native_capture_dryrun
 
     # check a smaller grid first
@@ -65,12 +67,14 @@ DEFAULT_F = 0.05
 DEFAULT_THREADS = 16
 
 
-# Five arms. `none` is the no-offload baseline (eager). The four cots
-# arms span (runner ∈ {python, native}) × (eager-vs-graph) × (dryrun
-# vs real). Capture mode is only legal under cpu_runner=native (Phase
-# 1c Stage 5 conditional check); python+graph would hard-fail at
-# post_init. The "real" cells under native+capture are the production
-# Phase 1c path; "dryrun" cells under that path measure pure orch.
+# Six arms = two no-offload baselines (`none` eager + `none_capture`
+# graph-mode) + four COTS arms spanning (runner ∈ {python, native}) ×
+# (eager-vs-graph) × (dryrun vs real). Capture mode is only legal
+# under cpu_runner=native (Phase 1c Stage 5 conditional check);
+# python+graph would hard-fail at post_init. The "real" cell under
+# native+capture is the production Phase 1c path; "dryrun" cells
+# under that path measure pure orch. Capture-mode arms subtract
+# `none_capture`; eager arms subtract eager `none`.
 def arms_for(threads: int) -> dict[str, list[str]]:
     cots_base = [
         "--offload-backend",
@@ -207,7 +211,8 @@ def main() -> None:
         "--only-arms",
         nargs="*",
         default=None,
-        help="Subset of arms to run; default = all 5",
+        help="Subset of arms to run; default = all 6 "
+        "(two baselines + four COTS arms)",
     )
     ap.add_argument("--num-iters", type=int, default=3)
     ap.add_argument("--num-iters-warmup", type=int, default=2)
@@ -326,23 +331,22 @@ def main() -> None:
                         f"    orch_native_eager      = {nat_eager - none:+.4f}s "
                         f"(Stage 2 substrate gate)"
                     )
-            # Capture arms: subtract `none_capture` so the metric
-            # isolates COTS orch overhead under graph capture, not the
-            # capture-vs-eager delta on the no-offload path. Falling
-            # back to eager `none` would understate COTS orch by
-            # however much capture saves on `none`.
-            baseline_cap = none_cap if none_cap is not None else none
-            baseline_label = (
-                "vs none_capture" if none_cap is not None
-                else "vs eager none — UPPER BOUND, none_capture missing"
-            )
-            if baseline_cap is not None:
+            # Capture arms: ONLY compute the §1.14 metric when
+            # `none_capture` (graph-mode no-offload) is available. Do
+            # NOT fall back to eager `none`: subtracting eager `none`
+            # yields a SMALLER delta than the true capture-mode orch
+            # (because T(eager_none) ≥ T(graph_none) in general —
+            # capture also saves time on the no-offload path), so the
+            # value is a LOWER BOUND on the true COTS orch, not a
+            # §1.14-comparable number. Refuse to issue PASS/FAIL when
+            # the right baseline is missing.
+            if none_cap is not None:
                 if nat_cap is not None:
-                    delta = nat_cap - baseline_cap
+                    delta = nat_cap - none_cap
                     target = "PASS" if delta <= 0.05 else "FAIL"
                     print(
                         f"    orch_native_capture    = {delta:+.4f}s   "
-                        f"§1.14 target ≤ 0.050s: {target}  ({baseline_label})"
+                        f"§1.14 target ≤ 0.050s: {target}  (vs none_capture)"
                     )
                 if real is not None and nat_cap is not None:
                     print(
@@ -350,6 +354,13 @@ def main() -> None:
                         f"{real - nat_cap:+.4f}s (real GEMM time on "
                         f"capture path)"
                     )
+            elif nat_cap is not None or real is not None:
+                print(
+                    "    orch_native_capture    = NOT COMPUTED "
+                    "(none_capture missing — required for the §1.14 "
+                    "capture-mode metric; rerun including the "
+                    "`none_capture` arm to enable PASS/FAIL)"
+                )
 
     summary_path = RESULTS_DIR / "summary.json"
     summary_path.write_text(

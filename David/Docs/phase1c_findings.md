@@ -555,9 +555,11 @@ load-bearing for Phase 1c sign-off.
 absolute number requires running on Qwen2.5-7B + FastTTS (or
 equivalent decode-heavy workload). The harness for the real-model
 run lives at `David/Benchmarks/phase1c/bench_dryrun_vs_native_qwen.py`
-(ported from Phase 1a's `bench_cots_dryrun_vs_none.py` with five
-arms covering python/native × eager/capture × dryrun/real). Stage 6
-landed the harness AND the auto-derived `--cots-cpu-runner` /
+(ported from Phase 1a's `bench_cots_dryrun_vs_none.py` with six
+arms: two no-offload baselines [`none` eager + `none_capture`
+graph-mode] plus four COTS arms covering python/native ×
+eager/capture × dryrun/real). Stage 6 landed the harness AND the
+auto-derived `--cots-cpu-runner` /
 `--cots-cpu-num-threads-by-bucket` / `--cots-cpu-worker-affinity`
 CLI flags so `vllm bench latency` accepts the new fields.
 
@@ -747,8 +749,18 @@ from user code:
     i = bisect_left(self._capture_buckets, num_tokens)   ← Dynamo can't trace
 ```
 
-Full log:
-`David/Benchmarks/phase1c/results/dryrun_vs_native_qwen/cots_005_native_capture_dryrun_b1.log`.
+The full subprocess log is a locally-generated artifact (the
+results directory's `*.log` files are repo-gitignored; only the
+`*.json` cells + `summary.json` are tracked). Reproduce with:
+
+```bash
+cd David/Benchmarks/phase1c
+/opt/conda/envs/thesis/bin/python bench_dryrun_vs_native_qwen.py \
+    --only-arms cots_005_native_capture_dryrun \
+    --batches 1 --num-iters 1 --num-iters-warmup 1
+# log lands at:
+# results/dryrun_vs_native_qwen/cots_005_native_capture_dryrun_b1.log
+```
 
 Two interacting facts:
 1. vLLM's compiled-model setup uses `fullgraph=True` (one captured
