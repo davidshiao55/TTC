@@ -1,10 +1,17 @@
 """Phase 1a §3-4 — CPU-side GEMM split correctness for col & row parallel.
 
-Exercises the CPU compute path directly via `CpuTaskRunner` +
-`_cpu_gemm_into_after_event` (the worker function the QKV op uses) on
-synthetic shapes — no Linear modules involved. Verifies the assembled
-output matches the unsplit reference within BF16 tolerance, mirroring
+Exercises the CPU compute path directly via `CpuTaskRunner` /
+`PythonCotsRunner` (Phase 1c renamed; alias preserved) on synthetic
+shapes — no Linear modules involved. Verifies the assembled output
+matches the unsplit reference within BF16 tolerance, mirroring
 `phase0/bench_split_correctness.py §A` and §C.
+
+Phase 1c Stage 3 changed the runner facade: `submit_with_d2h` now takes
+`(x_gpu, x_pinned, y_pinned, op_descriptor)` and the per-(layer, bucket,
+op_kind) GEMM closures live in the runner's install table. The helper
+below builds a one-shot install per call so this isolation test
+continues to exercise just the runner without spinning up a full
+offloader / `CotsLinearHandle`.
 
 Storage allocation is done manually here (no `CotsLinearHandle.install`
 because there's no Linear); the test owns the buffers it submits.
@@ -16,7 +23,6 @@ import torch.nn.functional as F
 
 from vllm.model_executor.offloader.cots import (
     CpuTaskRunner,
-    _cpu_gemm_into_after_event,
     uva_copy_into_gpu,
 )
 
@@ -49,11 +55,31 @@ def _run_cpu_gemm(
     y_pinned_view: torch.Tensor,
     y_gpu_view: torch.Tensor,
 ) -> torch.Tensor:
-    """Submit + wait + UVA copy. Mirrors the QKV op's inner sequence."""
-    runner.submit_with_d2h(x_gpu, x_pinned_view, _cpu_gemm_into_after_event,
-                           w_cpu, y_pinned_view)
-    runner.wait()
-    uva_copy_into_gpu(y_pinned_view, y_gpu_view)
+    """Submit + wait + UVA copy via the Phase 1c uniform facade.
+
+    Builds a one-shot install on the runner with a single closure that
+    captures `w_cpu`, then dispatches via op_descriptor=(0, 0, "qkv").
+    Mirrors the QKV operator's inner sequence end-to-end without
+    needing a real `CotsLinearHandle` / offloader install pipeline.
+    `wait_and_uva` performs the UVA copy internally so the helper no
+    longer issues a separate `uva_copy_into_gpu` call. The two
+    `gpu_anchor_*` arguments are accepted for API symmetry; under the
+    Python runner they're unused (eager-only).
+    """
+    op_descriptor = (0, 0, "qkv")
+
+    def _cb(
+        event: torch.cuda.Event,
+        x_pinned: torch.Tensor,
+        y_pinned: torch.Tensor,
+    ) -> None:
+        event.synchronize()
+        y_pinned.copy_(F.linear(x_pinned, w_cpu))
+
+    runner.install({op_descriptor: _cb}, bucket_for_fallback=lambda _n: 0)
+    dummy_anchor = torch.empty(1, dtype=torch.bfloat16, device="cuda")
+    runner.submit_with_d2h(x_gpu, x_pinned_view, y_pinned_view, op_descriptor)
+    runner.wait_and_uva(y_pinned_view, y_gpu_view, dummy_anchor, dummy_anchor)
     return y_gpu_view
 
 

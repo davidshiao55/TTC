@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# Phase 1c test fixtures. Mirrors the Phase 1b / 1a layout so the three
-# suites can run side-by-side.
+"""Shared pytest fixtures for Phase 1c tests.
+
+Mirrors phase1a/phase1b conftests: brings up a single-rank tensor
+parallel group at session scope so vLLM's `QKVParallelLinear` /
+`MergedColumnParallelLinear` / `RowParallelLinear` constructors (used
+by parity tests) find the TP group at init time. Idempotent — skips
+re-init if a prior session-scoped fixture already initialized.
+"""
+
+from __future__ import annotations
 
 import os
 
@@ -9,16 +17,40 @@ import torch
 
 
 @pytest.fixture(scope="session", autouse=True)
-def init_distributed_session():
-    """Phase 1a/1b tests use a TP-1 gloo init; Phase 1c follows the same
-    pattern so the offloader's wrap_modules / TP-1 invariants exercise
-    correctly. Single-rank, single-process — no real distribution."""
-    if torch.distributed.is_available() and not torch.distributed.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29501")  # different from phase1b
-        os.environ.setdefault("WORLD_SIZE", "1")
-        os.environ.setdefault("RANK", "0")
-        torch.distributed.init_process_group("gloo", world_size=1, rank=0)
+def _init_vllm_distributed():
+    """Initialize a single-rank TP group; no-op if already initialized."""
+    if not torch.cuda.is_available():
+        yield
+        return
+
+    from vllm.distributed.parallel_state import (
+        init_distributed_environment,
+        initialize_model_parallel,
+        model_parallel_is_initialized,
+    )
+
+    if model_parallel_is_initialized():
+        yield
+        return
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29501")  # distinct from phase1a/1b
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method="env://",
+            backend="gloo",
+        )
+        initialize_model_parallel(tensor_model_parallel_size=1)
+
     yield
 
 

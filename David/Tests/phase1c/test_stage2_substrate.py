@@ -1,19 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """Stage 2 substrate tests.
 
-Stage 2 lands the NativeCotsRunner / PythonCotsRunner split, the
-`cots_ops.py` custom-op registration + runner registry, the
-`cpu_runner` config flag, and the installer refactor that constructs
-ONE runner per offloader.
+Originally landed alongside Stage 2's substrate-only deliverable:
+NativeCotsRunner / PythonCotsRunner split, `cots_ops.py` custom-op
+registration + runner registry, `cpu_runner` config flag, and the
+installer refactor that constructs ONE runner per offloader.
 
-Stage 2 does NOT yet wire NativeCotsRunner into operators (operators
-still use the PythonCotsRunner legacy `submit_with_d2h(fn, *args)`
-shape; Stage 3 flips them). So:
+Stage 3 then wired the native runner end-to-end (operator facade
+flipped to `submit_with_d2h(x, x_pinned, y_pinned, op_descriptor)` +
+`wait_and_uva(...)`, slab population in `_install_runner`, dummy CUDA
+anchors). The Stage-2-era native rejection in `CotsOffloader.__init__`
+was DROPPED in Stage 3, so:
+
   * `cpu_runner='python'` is the default through Stage 2/3/4 — Phase
     1a/1b workflows are unchanged.
-  * `cpu_runner='native'` is reserved; constructing a CotsOffloader
-    with `f_cpu_store > 0` and `cpu_runner='native'` raises a clear
-    NotImplementedError until Stage 3 lands.
+  * `cpu_runner='native'` constructs a real, end-to-end runnable
+    NativeCotsRunner post-Stage-3 (was a NotImplementedError under
+    Stage 2). Stage 5 will flip the default to `"native"` once graph
+    capture is verified.
+
+These tests still gate the Stage-2 substrate invariants (registry,
+factory, alias, installer refactor) — they survive Stage 3 because the
+substrate didn't change shape, only what gets wired on top of it.
 """
 
 from __future__ import annotations
@@ -93,16 +101,27 @@ def test_python_cots_runner_construct_and_close():
 
 
 def test_native_cots_runner_construct_install_close():
+    """Stage 3 install signature: takes a list of NativeSlabSpec records
+    (ordering = task_id) plus scratch sizes. The empty-list /
+    zero-scratch case is the degenerate-but-valid path covering an
+    offloader with no fused MLP blocks (or just a smoke test)."""
     from vllm.model_executor.offloader import cots
 
     r = cots.NativeCotsRunner(dry_run=True)
     assert r.kind == "native"
     assert isinstance(r._runner_id, int)
-    # install with zero slabs is the degenerate-but-valid path.
-    r.install(n_slabs=0, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+    r.install(
+        slab_specs=[],
+        scratch_max_tokens=0,
+        scratch_max_intermediate_per_half=0,
+    )
     # Re-install raises.
     with pytest.raises(RuntimeError, match="install\\(\\) called twice"):
-        r.install(n_slabs=0, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+        r.install(
+            slab_specs=[],
+            scratch_max_tokens=0,
+            scratch_max_intermediate_per_half=0,
+        )
     r.close()
 
 
@@ -219,39 +238,19 @@ def test_offloader_python_runner_default_path():
     # facade; Stage 2's _install_*_ops asserts on this same field).
 
 
-def test_offloader_native_runner_blocked_until_stage_3():
-    """Selecting `cpu_runner='native'` with f_cpu_store > 0 raises a
-    clear NotImplementedError pointing at Stage 3 — not a silent
-    fall-through to broken operator code."""
+def test_offloader_native_runner_constructs_post_stage_3():
+    """Stage 3 dropped the Stage-2 NotImplementedError barrier:
+    `cpu_runner='native'` + `f_cpu_store > 0` now constructs a real
+    NativeCotsRunner. The runner is shared across operator install (no
+    fresh runner per op). Slab population happens later in `post_init`
+    so this just exercises construction, not a forward pass."""
     from vllm.config.offload import CotsOffloadConfig
-    from vllm.model_executor.offloader.cots import CotsOffloader
+    from vllm.model_executor.offloader.cots import CotsOffloader, NativeCotsRunner
 
     cfg = CotsOffloadConfig(f_cpu_store=0.10, cpu_runner="native")
-    with pytest.raises(NotImplementedError, match="Stage 3"):
-        CotsOffloader(config=cfg)
-
-
-def test_offloader_native_rejection_does_not_construct_runner():
-    """Review finding #1: the rejection must fire BEFORE _make_runner
-    runs, otherwise a NativeCotsRunner is briefly registered + a C++
-    worker thread spawned + (on non-CUDA builds) `_cots_C` import
-    masks the intended Stage-3 message. Confirms the registry is
-    untouched on the exception path.
-    """
-    from vllm.config.offload import CotsOffloadConfig
-    from vllm.model_executor.offloader import cots_ops
-    from vllm.model_executor.offloader.cots import CotsOffloader
-
-    before = dict(cots_ops._COTS_RUNNERS)
-    cfg = CotsOffloadConfig(f_cpu_store=0.10, cpu_runner="native")
-    with pytest.raises(NotImplementedError, match="Stage 3"):
-        CotsOffloader(config=cfg)
-    after = dict(cots_ops._COTS_RUNNERS)
-    # Registry contents are unchanged: no NativeCotsRunner was constructed.
-    assert before == after, (
-        f"Stage-2 native rejection leaked a runner into the registry. "
-        f"Before: {before!r}, after: {after!r}"
-    )
+    off = CotsOffloader(config=cfg)
+    assert isinstance(off._runner, NativeCotsRunner)
+    off._runner.close()
 
 
 def test_make_runner_default_fallback_is_python():

@@ -1,0 +1,30 @@
+{
+  "args": {
+    "n_iters": 200,
+    "dim": 512,
+    "results_dir": "/TTC/David/Benchmarks/phase1c/results",
+    "threshold_ratio": 1.05
+  },
+  "results": {
+    "python": {
+      "runner": "python",
+      "n_iters": 200,
+      "dim": 512,
+      "median_us": 72.5565,
+      "p90_us": 76.4297,
+      "min_us": 70.762,
+      "max_us": 257.597
+    },
+    "native": {
+      "runner": "native",
+      "n_iters": 200,
+      "dim": 512,
+      "median_us": 70.6675,
+      "p90_us": 71.0712,
+      "min_us": 64.891,
+      "max_us": 80.209
+    }
+  },
+  "ratio_native_over_python": 0.9739651168399799,
+  "verdict": "PASS"
+}
