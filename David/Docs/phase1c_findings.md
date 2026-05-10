@@ -3387,6 +3387,42 @@ acceptance. The flag stays `cots_m3_wait_kernel=False` until the
 Qwen2.5-7B real-model anchor delivers the wall-clock win against
 the revised gate.
 
+Real-model A/B (Qwen2.5-7B BF16, decode 8→128, B=1, t=16, f=0.05,
+2 warmup + 3 iters; harness `bench_m3_qwen.py`; artifacts under
+`David/Benchmarks/phase1c/results/m3_qwen/`):
+
+| Arm | s/gen | Δ vs off | Counters (M3 on) |
+|---|---:|---:|---|
+| dryrun M3 off | 2.5327 | — | sync_cb_count=… |
+| dryrun M3 on  | 2.3884 | **+144.2 ms** | imm/lag=…/… |
+| real   M3 off | 2.7826 | — | sync_cb_wait=92.86 s |
+| real   M3 on  | 2.6961 | **+86.5 ms** | imm=158, lag=40834 (99.6 %), spin=9.15 e7 |
+
+Acceptance check:
+* Real wall delta **+86.5 ms/generate ≥ +50 ms** → **PASS** (gate 1).
+* Spin estimate `9.15 e7 × ~100 ns = ~9.15 s` against
+  `92.86 s` recovered sync_cb wait = **9.9 % ≤ 10 %** → **PASS at
+  the estimate level** (gate 2). The margin is at the boundary;
+  the 100 ns figure is the PTX hint, not a measured ns. An nsys
+  trace of the wait kernel would confirm whether the actual
+  wall-time per iteration is below or above the hint. Wall-clock
+  (gate 1) is the load-bearing signal and is comfortably positive.
+* Parity test green (gate 3): see `test_m3_parity_with_baseline.py`.
+
+Diag canary at 7B scale: 99.6 % lagging — the GPU window
+essentially never covers a full transformer-layer worth of CPU
+GEMM at this model size. M3 still wins because each lagging fire
+spins for ~2240 iters on average (90.4 e6 / 40834), and the
+nanosleep-based spin remains cheap relative to the displaced
+host_fn driver-thread block.
+
+This is a real-model PASS at the synthetic-stub-confirmed gate
+shape. **Default still `cots_m3_wait_kernel=False`** — the win
+is real but the spin budget is on the boundary; flipping the
+default would require either an nsys-measured spin time inside
+budget OR a wider margin on a longer-decode workload (e.g.,
+output_len=256, B=4) that re-establishes a comfortable cushion.
+
 #### Design warning: SM occupancy from spin-wait
 
 The wait kernel busy-spins (with PTX `nanosleep` between

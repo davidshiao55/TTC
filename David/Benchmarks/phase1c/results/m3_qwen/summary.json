@@ -1,0 +1,27 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "input_len": 8,
+  "output_len": 128,
+  "f": 0.05,
+  "batches": [
+    1
+  ],
+  "threads": [
+    16
+  ],
+  "num_iters": 3,
+  "rows": {
+    "cots_m3_off_capture_dryrun_t16": {
+      "1": 2.5326712026677947
+    },
+    "cots_m3_on_capture_dryrun_t16": {
+      "1": 2.3884298436654112
+    },
+    "cots_m3_off_capture_real_t16": {
+      "1": 2.782600652334319
+    },
+    "cots_m3_on_capture_real_t16": {
+      "1": 2.696144383662613
+    }
+  }
+}
