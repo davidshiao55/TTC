@@ -299,6 +299,27 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   vLLM prototype regresses despite the smoke result, fall
   back to `native_eager` as Phase 1c landing path. See
   §1c.28 below.
+- §1c.29 (M3 vLLM prototype design, doc only) — **Design
+  drafted; no code yet.** Feature flag
+  `cots_m3_wait_kernel: bool = False`, honored only with
+  `cpu_runner='native'` AND `enforce_eager=False` (hard-fail
+  on misuse, four gates). Per-slab state: host-mapped pinned
+  `req_slot` / `done_slot` + CPU monotonic `next_seq` + diag
+  per-seq timestamp ring (only when VLLM_COTS_DIAG=1).
+  Per-runner diag counters: `m3_wait_spin_iters`,
+  `m3_immediate_resume_count`, `m3_lagging_wait_count`.
+  Ordering: `dispatch_cb` advances seq, publishes
+  req_slot=seq, enqueues worker task tagged with seq;
+  worker writes done_slot=seq AFTER filling y_pinned;
+  captured graph replaces `cudaLaunchHostFunc(sync_cb)` with
+  `m3_wait_kernel` before UVA. Old sync host_fn path stays
+  as fallback. Validation: 3 unit tests (smoke, install
+  gates, parity) + dryrun A/B + real A/B. Acceptance: real
+  wall ≥ +50 ms/generate AND lagging_wait < 50% of fires.
+  Design warning called out: wait kernel busy-spins on a
+  single block; if CPU lags often, could occupy SM time —
+  diag counters must surface this. NO code in this
+  section. See §1c.29 below.
 
 ---
 
@@ -3060,6 +3081,266 @@ wait-side. Requirements:
   in dryrun, where there is no CPU GEMM tail to leak. In real
   mode, removing host_fns may unmask CPU-GEMM completion as a
   serial dependency. The validation gates account for this.
+
+---
+
+### §1c.29 — M3 vLLM prototype design (doc only, no code)
+
+The §1c.28 production-shaped smoke is green
+(`David/Tests/phase1c/smoke_value_signal/m3_submit_hostfn_wait_kernel_smoke.cu`):
+1,000 replay × 56 task captured graph fires
+`cudaLaunchHostFunc(submit_cb) → optional GPU delay → custom
+m3_wait_kernel`, with submit-to-worker p50 = 145-160 ns
+across all configs, no stale/drop/dup/deadlock. CPU GEMM
+start latency is preserved at the existing host_fn pattern's
+level. This section drafts the vLLM integration design;
+**no code in this section**.
+
+#### Feature flag
+
+```python
+class CotsOffloadConfig:
+    cots_m3_wait_kernel: bool = Field(default=False)
+    """§1c.29 prototype: replace cudaLaunchHostFunc(sync_cb)
+    with a custom GPU wait kernel that spins on a worker-
+    written done counter. Submit side stays as the existing
+    cudaLaunchHostFunc(dispatch_cb) — CPU GEMM still starts
+    early. Honored only when cpu_runner='native' AND
+    enforce_eager=False (graph capture mode). Default off
+    until real-mode A/B validates the wall-clock win
+    estimated at ~+179 ms/generate (upper bound). See
+    David/Docs/phase1c_findings.md §1c.29."""
+```
+
+Hard-fail at `CotsOffloader.post_init` if the flag is set
+under any other config combination, matching the §1c.26
+pattern: `RuntimeError` with a message naming the failed
+gate (cpu_runner / enforce_eager). Silent fallback would
+let a misconfigured run measure the wrong path.
+
+#### State ownership
+
+**Per slab (one per `(layer_idx, bucket, op_kind)` triple,
+already address-stable at install per §1c.5):**
+
+```cpp
+struct TaskSlab {
+    // ... existing fields ...
+
+    // §1c.29: host-mapped pinned signaling slots. Allocated
+    // once at install via cudaHostAlloc(cudaHostAllocMapped)
+    // and kept stable for the slab's lifetime so captured
+    // graphs can record the device pointer.
+    //   host_*_ptr is the CPU-visible address (worker reads/
+    //   writes); dev_*_ptr is the GPU-visible address
+    //   (m3_wait_kernel reads).
+    void* host_req_slot;     // uint32_t cell
+    void* dev_req_slot;
+    void* host_done_slot;    // uint32_t cell
+    void* dev_done_slot;
+    uint64_t next_seq;       // CPU-side, ++ in dispatch_cb
+    // Optional per-seq timestamp ring for diag mode (mirrors
+    // smoke design); allocated only when VLLM_COTS_DIAG=1 to
+    // avoid memory cost in production.
+    int64_t* submit_ts_ring; // size TS_RING_SIZE; nullptr if !diag
+};
+```
+
+**Per runner (CotsCpuInfer):**
+
+```cpp
+class CotsCpuInfer {
+    // ... existing fields ...
+
+    // §1c.29 diag counters (incremented when DIAG=1; relaxed
+    // atomic; observational only).
+    std::atomic<int64_t> m3_wait_spin_iters_{0};
+    std::atomic<int64_t> m3_wait_total_ns_{0};
+    std::atomic<int64_t> m3_immediate_resume_count_{0};
+    std::atomic<int64_t> m3_lagging_wait_count_{0};
+};
+```
+
+`m3_immediate_resume_count` increments when the wait kernel
+finds `done_slot >= req_slot` on its first read (CPU finished
+before GPU asked). `m3_lagging_wait_count` increments when
+the kernel had to spin at all. Together they tell us how
+often the GPU window covered CPU work versus how often the
+wait actually serializes.
+
+#### Ordering / sequencing
+
+**`dispatch_cb` (existing, slightly extended):**
+
+```text
+dispatch_cb(slab):
+    1. seq = ++slab.next_seq
+    2. (if diag) slab.submit_ts_ring[(seq - 1) & MASK] = now_ns()
+    3. atomic_thread_fence(release)
+    4. *slab.host_req_slot = seq
+    5. atomic_thread_fence(release)
+    6. task_queue.enqueue(WorkerTask{slab, seq})
+```
+
+The seq travels with the worker task so the worker knows
+which seq value to write to `done_slot` after finishing. Order
+of (3-5) matches the smoke's per-seq timestamp-ring fix.
+
+**Worker:**
+
+```text
+worker.run(WorkerTask t):
+    1. perform CPU GEMM (existing code path: at::linear into
+       y_pinned, etc.)
+    2. atomic_thread_fence(release)  // y_pinned writes visible
+                                     // to GPU before done publish
+    3. *t.slab.host_done_slot = t.seq
+```
+
+**Captured graph** for a single COTS op (when `cots_m3_wait_kernel=True`):
+
+```text
+   cudaMemcpyAsync(D2H, x_gpu → x_pinned)             // unchanged
+   cudaLaunchHostFunc(stream, dispatch_cb, &slab)     // unchanged
+   F.linear(perm)                                     // unchanged
+   F.linear(pref)                                     // unchanged
+-  cudaLaunchHostFunc(stream, sync_cb, ...)           // REMOVED
++  m3_wait_kernel<<<1,1,0,stream>>>(slab.dev_req_slot, slab.dev_done_slot)
+   uva_copy_into_gpu(y_pinned, y_gpu)                 // unchanged
+   index_copy_(out, ...)                              // unchanged
+```
+
+#### Wait kernel
+
+```cuda
+__global__ void m3_wait_kernel(
+    volatile unsigned int* req_slot,
+    volatile unsigned int* done_slot,
+    /* §1c.29 diag */ int64_t* spin_iters_acc,
+    int64_t* lagging_count_acc,
+    int64_t* immediate_count_acc) {
+    unsigned int expected = *req_slot;
+    unsigned int done = *done_slot;
+    if (done >= expected) {
+        if (immediate_count_acc) atomicAdd((unsigned long long*)immediate_count_acc, 1ull);
+        return;
+    }
+    if (lagging_count_acc) atomicAdd((unsigned long long*)lagging_count_acc, 1ull);
+    int64_t iters = 0;
+    do {
+        asm volatile("nanosleep.u32 100;" ::: "memory");
+        done = *done_slot;
+        ++iters;
+    } while (done < expected);
+    if (spin_iters_acc) atomicAdd((unsigned long long*)spin_iters_acc, (unsigned long long)iters);
+}
+```
+
+(Diag-counter pointers are nullable; production-default mode
+passes null and the kernel skips the atomicAdds. The kernel
+stays a single-thread single-block launch — minimal SM
+footprint.)
+
+#### Safety gates (hard-fail at install)
+
+1. `cots_m3_wait_kernel=True` AND `cpu_runner != "native"` →
+   `RuntimeError("M3 wait kernel requires cpu_runner='native'")`.
+2. `cots_m3_wait_kernel=True` AND `enforce_eager=True` →
+   `RuntimeError("M3 wait kernel requires enforce_eager=False
+   (graph capture mode); the wait kernel is meaningful only
+   under captured replay")`.
+3. `cudaHostAlloc(cudaHostAllocMapped)` failure for any slab's
+   req/done slot → `RuntimeError("M3 wait kernel: host-mapped
+   pinned allocation failed; falling back is unsafe under graph
+   capture, refuse to install")`. We do NOT silently fall back
+   to the host_fn path because mid-install fallback can leave
+   different slabs on different mechanisms.
+4. `cudaHostGetDevicePointer` failure → same hard-fail.
+
+The existing `cudaLaunchHostFunc(sync_cb)` path stays in the
+codebase as the default (flag = False) and as the fall-back
+when the prototype is found inadequate. No code path is
+deleted in §1c.29.
+
+#### Validation plan
+
+Tests added in `David/Tests/phase1c/`:
+
+| Test | What it validates |
+|---|---|
+| `test_m3_wait_kernel_smoke.py` | Mirror of the standalone CUDA smoke, run via pybind: 100× captured graph replay with M3 enabled; assert no stale/drop/dup, deterministic checksum across replays. |
+| `test_m3_install_safety_gates.py` | Each of the four hard-fail gates above raises `RuntimeError` with the right message. Mirrors `test_ablation_gate_hard_fail.py` (§1c.26) structure. |
+| `test_m3_parity_with_baseline.py` | Bit-exact output at `temperature=0, seed=0` between `cots_m3_wait_kernel=True` and `=False`, on a Qwen2.5-7B 32-token sample. Headline correctness gate. |
+
+Bench A/B (in `David/Benchmarks/phase1c/`):
+
+| Arm | Compare against | Metric |
+|---|---|---|
+| `native_capture_dryrun_m3_on` | `native_capture_dryrun` (M3 off) | dryrun wall delta — should be in the ballpark of §1c.27 `no_sync_hostfn` bound (−273 ms cgl, −126 ms wall) minus the wait-kernel's own per-fire cost. |
+| `native_capture_real_m3_on` | `native_capture_real` (M3 off) | real wall delta — the gate target. Upper-bound estimate from smoke arithmetic: ~+179 ms/generate. Real-mode upside likely smaller (overlap matters). |
+| Same arms, but with VLLM_COTS_DIAG=1 | — | Capture `m3_wait_spin_iters_total`, `m3_immediate_resume_count`, `m3_lagging_wait_count` to characterize spin behavior. |
+
+Acceptance:
+
+* All three tests green.
+* Real-mode wall delta ≥ +50 ms/generate (a third of the
+  upper-bound) AND `m3_lagging_wait_count` < 50% of total
+  fires (i.e., GPU window covers CPU work most of the time).
+* No correctness regression on phase1a/1b/1c suites.
+
+If real-mode wall delta is < +50 ms/generate OR lagging_wait
+count is high, the prototype is rejected and `native_eager`
+becomes the practical Phase 1c landing path (per §1c.28's
+fall-back).
+
+#### Design warning: SM occupancy from spin-wait
+
+The wait kernel busy-spins (with PTX `nanosleep` between
+iterations) until `done >= req`. This burns a tiny amount
+of SM time:
+
+* **If CPU finishes before GPU asks** (`m3_immediate_resume_count`
+  increments): zero spin iterations — kernel returns immediately.
+  This is the desired case.
+* **If CPU lags GPU** (`m3_lagging_wait_count` increments): the
+  kernel can spin for tens to hundreds of microseconds while
+  occupying a single block of SM. With 56 sync points per
+  forward at B=1, lagging waits could collectively occupy up
+  to a few ms of SM time per generate.
+
+Acceptable for the prototype because the alternative
+(host_fn(sync_cb)) blocks the entire CUDA stream during the
+same wait window — net effect on the CPU/GPU overlap is
+similar, but with M3 the GPU SMs are at least nominally
+"running" (the kernel is launched), which matters for SM
+scheduler / profiler reporting.
+
+The diag counters MUST tell us how often the kernel spins
+versus returns immediately. If spin time becomes a real
+cost (e.g., on workloads where CPU GEMM significantly
+exceeds GPU compute), §1c.30 would be a stream-priority
+or multi-stream redesign that lets compute work proceed on
+another stream while the wait kernel idles.
+
+#### What §1c.29 does NOT include
+
+* M2 kernel-counter submit replacement (rejected by §1c.28
+  Step 1 latency floor).
+* Whole-forward batching (rejected by dependency analysis).
+* Same-layer QKV+MLP fusion (rejected by intra-layer
+  dependency analysis).
+* D2H or UVA byte-traffic optimization (§1c.26 / §1c.27
+  showed these are not the bottleneck).
+* Worker-thread redesign (multi-threaded, lock-free queue
+  redesign, etc.) — out of scope; the existing single-thread
+  TaskQueue is fine for §1c.29.
+
+#### Status
+
+Design only, doc-only commit. No production code changes.
+The vLLM prototype implementation is the next discrete unit
+of work and should be a separate commit (or set of commits)
+gated on this design's review.
 
 ---
 
