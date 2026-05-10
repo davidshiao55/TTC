@@ -134,12 +134,27 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   REVERTED from the thesis branch and preserved on the
   `phase1c23-live-masked-uva-experiment` branch in the vllm
   submodule for future revisits if the input-D2H side is
-  patched. Implication: the bucket-sensitive component is not
-  output-bytes-bound; remaining attribution (input D2H byte
-  cost, host-callback overhead, Triton dispatch cost, Dynamo
-  guard overhead) needs nsys to separate before further
-  prototyping (§1c.24 candidate would patch the captured
-  cudaMemcpyAsync via `cudaGraphExec*Node*Params`).
+  patched.
+- §1c.24 (nsys attribution) — **PARTIAL. The COTS hot path is
+  NOT the bottleneck.** Marker-filtered nsys (NVTX `cots:bench_iter`
+  range around the timed iter only, queried by start/end inside
+  the marker, env-gated by `VLLM_COTS_DIAG=1`) shows that with
+  exactly 7,168 fires per generate inside the marker on both
+  arms, capture is **faster** per-fire than eager on every
+  C++ COTS hot path: `cots:sync_cb_wait` p50 23.0 → 18.2 μs,
+  `cots:worker_mlp` 483.8 → 474.7 μs, `cots:worker_qkv` 66.5 →
+  57.0 μs (capture FASTER on each). An earlier, retracted
+  reading reported a +20 μs/fire `sync_cb_wait` increase under
+  capture — that was an artifact of using the all-events median
+  (capture trace had 12,320 events including ~5,000
+  capture/setup/PIECEWISE-Python events that biased the
+  median). Implication: the +0.14 s/generate eager→capture gap
+  comes from outside the COTS C++ hot path — likely vLLM graph
+  dispatch / PIECEWISE Python re-execution / non-COTS GPU work
+  (attention, scatter, index_copy_). Next-step instrumentation
+  should extend NVTX coverage to model-forward boundaries,
+  attention, and the scatter path before any optimization
+  attempt. See §1c.24 below for the controlled tables.
 
 ---
 
@@ -1682,6 +1697,178 @@ into D2H bytes vs host_fn vs Triton dispatch vs PIECEWISE
 Python overhead. Future mechanism choices (§1c.24+) should
 be motivated by that breakdown, not by extending the UVA
 mask.
+
+### §1c.24 — nsys attribution: COTS hot path is NOT the bottleneck
+
+#### Retracted v1 finding
+
+A previous version of this section reported "median per-fire
+`cots:sync_cb_wait` 24 → 44 μs (+20 μs)" and attributed +143 ms
+of the eager→capture gap to that. **That conclusion is
+withdrawn.** The +20 μs delta was an artifact of the all-event
+median: the capture trace contained 12,320 `sync_cb_wait`
+events while a 128-token decode at 56 ops/forward = 7,168
+events. The extra ~5,000 events were engine-init,
+graph-capture warmup, and PIECEWISE Python re-execution
+fires; their longer durations dragged the median up. Tail-
+sliced p50 on the last 7,168 events showed capture at **18.15
+μs** — actually FASTER than eager's 23.5 μs. The reviewer
+caught this and demanded marker-filtering before any
+conclusion.
+
+#### v2 instrumentation (env-gated; default off)
+
+Added (gated by `VLLM_COTS_DIAG=1` so the production hot path
+is unaffected):
+
+* C++ NVTX scopes (header `nvtx3/nvToolsExt.h`, scoped via a
+  `NvtxScope` RAII helper) around `submit_on_stream` /
+  `d2h_record` / `launch_dispatch_cb` / `dispatch_cb` /
+  `sync_on_stream` / `sync_cb_wait` / `worker_qkv` /
+  `worker_mlp` / `worker_dryrun`. Static `diag_enabled()`
+  reads the env once at first call.
+* Python NVTX ranges around `cots:py_submit_gemm`,
+  `cots:py_sync_then_uva`, `cots:py_uva_copy` (gated by a
+  module-level `_COTS_DIAG_ENABLED` constant).
+* **Iteration-level marker** `cots:bench_iter` pushed in
+  `vllm/benchmarks/latency.py:run_to_completion` around the
+  timed wall-clock measurement only. Lets nsys post-processing
+  filter NVTX events to those that fall inside the marker
+  window, dropping engine-init / capture / warmup activity.
+* C++ wall-clock counters (steady_clock, ns):
+  `dispatch_cb_count`, `sync_cb_count`, `sync_cb_wait_total_ns`,
+  `worker_run_count`, `worker_busy_total_ns`,
+  `worker_queue_wait_total_ns`, plus per-slab
+  `enqueue_time_ns` for queue-wait attribution distinct from
+  sync-cb blocking.
+
+#### Setup
+
+B=1, input_len=8, output_len=128, Qwen2.5-7B BF16,
+f_cpu_store=0.05, t=16. **`--num-iters-warmup 1 --num-iters 1`**
+on every arm — warmup absorbs vLLM's lazy capture/Python-init
+quirks; the marker covers the measured iter only. nsys:
+`--trace=cuda,nvtx,osrt --trace-fork-before-exec=true
+--cuda-graph-trace=node --sample=none`. Counter dumps via
+`VLLM_COTS_DUMP_COUNTERS=1` (atexit). Same configuration on
+every arm.
+
+#### Wall-clock landscape
+
+| arm | wall-clock | Δ vs `none_capture` |
+|---|---|---|
+| `none_capture` (no offload) | 2.033 s | — |
+| `native_dryrun_real` (capture, no CPU GEMM) | 2.613 s | +0.580 s |
+| `native_eager_real` | 2.727 s | +0.694 s |
+| `native_capture_real` | 2.868 s | +0.835 s |
+
+Two decompositions:
+
+* **`native_capture_real − native_eager_real` = +0.141 s.** The
+  §1.14 capture-vs-eager gap.
+* **`native_capture_real − none_capture` = +0.835 s.** Absolute
+  COTS overhead. Of that, +0.580 s is dryrun (graph machinery,
+  custom ops, captured cudaMemcpyAsync, captured Triton UVA,
+  index_copy_) — independent of CPU GEMM cost. The remaining
+  +0.255 s is the CPU-GEMM critical-path leak past the GPU
+  compute window in capture mode.
+
+#### Marker-filtered NVTX (cots:bench_iter window)
+
+Each arm has exactly **7,168 fires** for `cots:sync_cb_wait`
+(= 128 forwards × 56 ops) and 3,584 for each of `worker_qkv` /
+`worker_mlp` (= 128 forwards × 28 layers × 1 op) inside the
+marker window — confirming the marker scope is correct and the
+all-event contamination is gone.
+
+| NVTX range | n | eager p50 | capture p50 | Δ p50 | sum eager | sum capture |
+|---|---|---|---|---|---|---|
+| `cots:sync_cb_wait` | 7168 | 23.0 μs | **18.2 μs** | **−4.8 μs (capture FASTER)** | 264 ms | 202 ms |
+| `cots:worker_mlp` | 3584 | 483.8 μs | 474.7 μs | −9.1 μs | 1803 ms | 1753 ms |
+| `cots:worker_qkv` | 3584 | 66.5 μs | 57.0 μs | −9.5 μs | 238 ms | 226 ms |
+| `cots:dispatch_cb` | 7168 | 1.45 μs | 1.35 μs | −0.10 μs | 11 ms | 11 ms |
+
+Python-side ranges (`cots:py_*`, `cots:d2h_record`,
+`cots:launch_dispatch_cb`, `cots:sync_on_stream`,
+`cots:submit_on_stream`) have **0 fires inside the capture
+marker** because the captured graph replays only the
+cudaXxxAsync / cudaLaunchHostFunc nodes — Python custom-op
+impls don't re-execute on cudaGraphLaunch. Eager has 7,168
+fires of each on those ranges totaling ~1.4 s of cumulative
+Python-side activity, all of which capture eliminates.
+
+#### Critical-path conclusion
+
+**The COTS C++ hot path is faster per-fire under capture than
+under eager on every measured range.** Sum of per-fire deltas:
+capture is ~63 ms FASTER than eager on the COTS hot path
+(`sync_cb_wait` −62 ms + `worker_mlp` −33 ms + `worker_qkv`
+−12 ms + `dispatch_cb` −1 ms ≈ −108 ms cumulative across
+threads; clamping to per-driver-thread serial impact is
+smaller but still favors capture).
+
+The +0.141 s/generate eager→capture wall-clock gap therefore
+comes from **outside the COTS hot path**. Candidates the
+current instrumentation does NOT cover:
+
+* vLLM cudaGraphLaunch dispatch overhead per forward.
+* PIECEWISE Python re-execution for the prefill (the prefill
+  size 8 falls into PIECEWISE bucket; PIECEWISE re-runs
+  Python custom ops per replay, including non-COTS ops).
+* `index_copy_` / scatter at the end of each operator
+  (downstream consumer of `y_gpu`).
+* Attention forward (cascade attention setup, KV cache writes).
+* Model-level boundaries — final norm, sampling, scheduler
+  round-trip per token.
+
+#### Hard limit on what this trace proves
+
+* COTS hot path is NOT the bottleneck.
+* The reviewer-flagged contamination explanation is now
+  fixed: 7,168 fires per arm, marker-bounded, identical
+  conditions.
+* Beyond that, this trace **cannot pin where the +141 ms goes**
+  — only that it isn't in the COTS C++ hot path.
+
+#### Decision per the §1c.24 gate
+
+> Do not implement another optimization until the timeline
+> proves the bottleneck.
+
+We do NOT have a bottleneck identified. **No optimization
+should be attempted yet.** Next required instrumentation step:
+extend NVTX coverage to the non-COTS regions listed above
+(model forward boundary, attention, scatter/index_copy,
+cudaGraphLaunch entry/exit). Re-run marker-filtered nsys.
+THEN decide.
+
+#### Artifacts
+
+* `David/Benchmarks/phase1c/results/diag_nsys_1c24_v2_warm/` —
+  `*.nsys-rep` traces (with the `cots:bench_iter` marker) and
+  `*.log` with C++ counter dumps. Reproducible via:
+  ```
+  VLLM_COTS_DIAG=1 VLLM_WORKER_MULTIPROC_METHOD=spawn nsys profile \
+    --trace=cuda,nvtx,osrt --trace-fork-before-exec=true \
+    --cuda-graph-trace=node --force-overwrite=true --sample=none \
+    -o <out> python -m vllm.entrypoints.cli.main bench latency \
+      --num-iters-warmup 1 --num-iters 1 ...
+  ```
+* `David/Benchmarks/phase1c/results/diag_nsys_1c24_v1_RETRACTED/`
+  is the original v1 trace dir (renamed from `diag_nsys_1c24/`)
+  preserved as evidence of the contamination.
+* SQLite filter for marker-bounded analysis:
+  ```sql
+  SELECT (end - start) AS dur FROM NVTX_EVENTS
+  WHERE text = '<range>'
+    AND start >= (SELECT start FROM NVTX_EVENTS
+                  WHERE text='cots:bench_iter'
+                  ORDER BY start DESC LIMIT 1)
+    AND end   <= (SELECT end   FROM NVTX_EVENTS
+                  WHERE text='cots:bench_iter'
+                  ORDER BY start DESC LIMIT 1)
+  ORDER BY start;
+  ```
 
 ---
 
