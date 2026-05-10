@@ -3448,23 +3448,64 @@ on average (90,708,502 / 12,250) ≈ **~740 µs per lag fire**
 sync_cb host_fn driver-thread block — roughly a **10× win per
 fire** on the substrate trade.
 
-This is a real-model PASS at the synthetic-stub-confirmed gate
-shape. **Default stays `cots_m3_wait_kernel=False`.** Reasons
-for not flipping the default yet:
+This is a real-model PASS at the M3-vs-M3-off-baseline gate, but
+**FAILS the broader apples-to-apples gate** demanded by the
+commit-3-real review: M3-on captured is not actually faster
+than running eager mode without graph capture at this workload.
 
-1. Spin budget margin is on the 10 % boundary; the 100 ns
-   figure is a PTX hint not a wall-clock measurement. An
-   nsys-traced wait-kernel duration would either confirm
-   inside-budget OR reveal headroom we don't currently have.
-2. Counter reset hook (`latency.py:_diag_pre` →
-   `cots_ops.reset_all_counters`) runs in the wrong process
-   under multiproc=spawn, so warm+measured arm runs need the
-   isolated `--num-iters 1` workaround to produce clean
-   per-generate counters. Plumbing a reset into EngineCore
-   would close that.
-3. Want a wider-margin run on longer decodes
-   (output_len=256, B=4) before flipping — current data
-   covers only one workload point.
+Apples-to-apples 7-arm grid (same harness/session/build,
+same workload as above; artifacts under
+`David/Benchmarks/phase1c/results/m3_qwen/`):
+
+| Arm | s/gen |
+|---|---:|
+| none_capture                | 2.0323 |
+| cots_native_eager_dryrun    | 2.3528 |
+| **cots_native_eager_real**  | **2.6079** |
+| cots_m3_off_capture_dryrun  | 2.5327 |
+| cots_m3_on_capture_dryrun   | 2.3884 |
+| cots_m3_off_capture_real    | 2.7826 |
+| **cots_m3_on_capture_real** | **2.6961** |
+
+Reviewer's apples-to-apples gate (the production-relevant one):
+
+* `native_eager_real` (2.6079) vs `m3_on_capture_real` (2.6961)
+  → Δ = **−88.3 ms/gen** — M3-on captured is SLOWER than plain
+  eager. **FAIL.**
+* Captured COTS overhead vs none_capture:
+  m3_off +750.3 ms, m3_on +663.9 ms (M3 saved 86.4 ms of that)
+* Eager COTS overhead vs none_capture: +575.6 ms — no captured-
+  graph orchestration overhead.
+
+Reading: at B=1 decode on Qwen2.5-7B with f_cpu_store=0.05,
+graph capture adds ~88 ms of overhead (host_fn dispatch + UVA
+scatter + sync mechanism) that outweighs whatever capture would
+save. M3 closes the captured-vs-eager gap from
+−175 ms (off−eager) to −88 ms (on−eager); it does not flip the
+sign.
+
+**Default stays `cots_m3_wait_kernel=False`.** Updated reasons:
+
+1. **Apples-to-apples FAIL**: the production candidate
+   (m3_on_capture_real) is slower than the no-capture
+   alternative (native_eager_real) at the only workload point
+   measured. M3 makes the captured-graph path competitive but
+   not better. Per the reviewer: a default flip should require
+   M3 to beat `native_eager_real`, not just M3-off-captured.
+2. Spin budget margin is on the 10 % boundary; the 100 ns
+   figure is a PTX hint not a wall-clock measurement.
+3. Counter reset hook runs in the wrong process under
+   multiproc=spawn (front-end vs EngineCore); warm+measured
+   runs need `--num-iters 1` for clean isolated counters.
+4. Workload point may be wrong for capture-mode benefits: at
+   B=1 decode there is little per-iteration Python
+   orchestration for capture to compress, so capture's
+   overhead dominates. Higher batch / longer decode / larger
+   f_cpu_store should change the equation — the reviewer's
+   recommended next step is a wider grid before any
+   default-flip discussion. Until then, the production path
+   for B=1 decode at this f is `enforce_eager=True` +
+   `cots_m3_wait_kernel=False`.
 
 #### Design warning: SM occupancy from spin-wait
 

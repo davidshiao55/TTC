@@ -77,10 +77,23 @@ DEFAULT_THREADS = 16
 
 
 def arms_for(threads: int) -> dict[str, list[str]]:
-    """Return arm name -> CLI flag list. Each arm runs cots+native
-    +capture; the only A/B variable is `--cots-m3-wait-kernel` and
-    `--cots-dry-run`. Native+capture is required because §1c.29 gate
-    2 hard-fails M3 under enforce_eager."""
+    """Return arm name -> CLI flag list.
+
+    Seven-arm grid (apples-to-apples per the commit-3-real review):
+      * `none_capture`              — graph-mode no-offload baseline
+      * `cots_native_eager_dryrun`  — substrate gate, no capture
+      * `cots_native_eager_real`    — substrate + real CPU GEMM, no
+                                      capture; the reference M3 must
+                                      beat to justify a default flip
+      * `cots_m3_off_capture_dryrun`/`_on_*`  — captured, no GEMM
+      * `cots_m3_off_capture_real` / `_on_*` — captured, real GEMM
+
+    Native+capture+M3 is the only path that uses the wait kernel
+    (§1c.29 gate 1 rejects M3 under cpu_runner='python'; gate 2
+    rejects M3 under enforce_eager=True). Eager arms run on the
+    same native substrate without graph capture, providing the
+    "should we just use native_eager_real instead of M3?" reference.
+    """
     cots_base = [
         "--offload-backend",
         "cots",
@@ -92,12 +105,25 @@ def arms_for(threads: int) -> dict[str, list[str]]:
     if threads != DEFAULT_THREADS:
         cots_base += ["--cots-cpu-num-threads", str(threads)]
     return {
+        "none_capture": [],
+        "cots_native_eager_dryrun": cots_base + ["--cots-dry-run"],
+        "cots_native_eager_real": cots_base,
         "cots_m3_off_capture_dryrun": cots_base + ["--cots-dry-run"],
         "cots_m3_on_capture_dryrun": cots_base
         + ["--cots-dry-run", "--cots-m3-wait-kernel"],
         "cots_m3_off_capture_real": cots_base,
         "cots_m3_on_capture_real": cots_base + ["--cots-m3-wait-kernel"],
     }
+
+
+# Arms that need --enforce-eager. Eager arms include the explicit
+# native_eager_{dryrun,real} reference cells; other arms run under
+# graph capture (the M3 path requires it; none_capture explicitly
+# tests it).
+_EAGER_ARMS: frozenset[str] = frozenset({
+    "cots_native_eager_dryrun",
+    "cots_native_eager_real",
+})
 
 
 def cell_path(arm: str, batch: int, threads: int) -> Path:
@@ -146,6 +172,8 @@ def run_cell(
         *flags,
         *extra_flags,
     ]
+    if arm in _EAGER_ARMS:
+        cmd.append("--enforce-eager")
     t0 = time.perf_counter()
     with open(out_log, "w") as fh:
         proc = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, check=False)
@@ -287,21 +315,64 @@ def main() -> None:
     print("\n=== §1c.29 acceptance gate evaluation ===")
     for t in args.threads:
         for B in args.batches:
-            off_dry = rows[("cots_m3_off_capture_dryrun", t)][B]
-            on_dry = rows[("cots_m3_on_capture_dryrun", t)][B]
-            off_real = rows[("cots_m3_off_capture_real", t)][B]
-            on_real = rows[("cots_m3_on_capture_real", t)][B]
+            off_dry = rows.get(("cots_m3_off_capture_dryrun", t), {}).get(B)
+            on_dry = rows.get(("cots_m3_on_capture_dryrun", t), {}).get(B)
+            off_real = rows.get(("cots_m3_off_capture_real", t), {}).get(B)
+            on_real = rows.get(("cots_m3_on_capture_real", t), {}).get(B)
+            none_cap = rows.get(("none_capture", t), {}).get(B)
+            eager_dry = rows.get(("cots_native_eager_dryrun", t), {}).get(B)
+            eager_real = rows.get(("cots_native_eager_real", t), {}).get(B)
             print(f"\n  t={t} B={B}:")
             if off_dry is not None and on_dry is not None:
                 d_dry = (off_dry - on_dry) * 1000  # ms
-                print(f"    dryrun: M3 off {off_dry:.4f}s, on {on_dry:.4f}s  Δ {d_dry:+.1f} ms/gen")
+                print(
+                    f"    dryrun: M3 off {off_dry:.4f}s, on {on_dry:.4f}s  "
+                    f"Δ {d_dry:+.1f} ms/gen"
+                )
             if off_real is not None and on_real is not None:
                 d_real_ms = (off_real - on_real) * 1000
                 target = "PASS" if d_real_ms >= 50.0 else "FAIL"
                 print(
                     f"    real:   M3 off {off_real:.4f}s, on {on_real:.4f}s  "
                     f"Δ {d_real_ms:+.1f} ms/gen   "
-                    f"§1c.29 gate ≥ +50 ms: {target}"
+                    f"§1c.29 gate1 ≥ +50 ms: {target}"
+                )
+            # Reviewer's apples-to-apples gate: native_capture_real
+            # + M3 must beat native_eager_real by a meaningful
+            # margin to justify the captured-graph + wait-kernel
+            # path over plain eager. The +50 ms on M3-off is a
+            # substrate trade; what matters for production is
+            # whether the production candidate (M3 on, captured)
+            # is faster than just running eager.
+            if eager_real is not None and on_real is not None:
+                d_vs_eager_ms = (eager_real - on_real) * 1000
+                target = "PASS" if d_vs_eager_ms > 0 else "FAIL"
+                print(
+                    f"    vs eager: native_eager_real "
+                    f"{eager_real:.4f}s, m3_on_capture_real "
+                    f"{on_real:.4f}s  Δ {d_vs_eager_ms:+.1f} ms/gen   "
+                    f"M3-vs-eager (must be > 0 to justify default flip): "
+                    f"{target}"
+                )
+            # Capture-mode COTS overhead vs none_capture (the §1.14
+            # equivalent for M3-on). Lower is better; informational.
+            if none_cap is not None and on_real is not None:
+                cap_overhead = (on_real - none_cap) * 1000
+                print(
+                    f"    capture overhead: m3_on_real - none_capture = "
+                    f"{cap_overhead:+.1f} ms/gen"
+                )
+            if none_cap is not None and off_real is not None:
+                cap_overhead_off = (off_real - none_cap) * 1000
+                print(
+                    f"                      m3_off_real - none_capture = "
+                    f"{cap_overhead_off:+.1f} ms/gen"
+                )
+            if eager_dry is not None and eager_real is not None:
+                d_eager_cpu = (eager_real - eager_dry) * 1000
+                print(
+                    f"    eager cpu work: native_eager_real - "
+                    f"native_eager_dryrun = {d_eager_cpu:+.1f} ms/gen"
                 )
                 # Spin budget (estimate) — relies on counter dump
                 # being captured in the .log. With DIAG=1 the dump
