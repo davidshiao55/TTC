@@ -137,8 +137,10 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   patched.
 - §1c.24 (nsys attribution) — **PARTIAL. The COTS hot path is
   NOT the bottleneck.** Marker-filtered nsys (NVTX `cots:bench_iter`
-  range around the timed iter only, queried by start/end inside
-  the marker, env-gated by `VLLM_COTS_DIAG=1`) shows that with
+  range emitted on every non-profile run_to_completion — both
+  warmup and measured iters; analysis selects the LAST marker
+  instance per arm, env-gated by `VLLM_COTS_DIAG=1`) shows that
+  with
   exactly 7,168 fires per generate inside the marker on both
   arms, capture is **faster** per-fire than eager on every
   C++ COTS hot path: `cots:sync_cb_wait` p50 23.0 → 18.2 μs,
@@ -155,6 +157,26 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   should extend NVTX coverage to model-forward boundaries,
   attention, and the scatter path before any optimization
   attempt. See §1c.24 below for the controlled tables.
+- §1c.25 (non-COTS attribution) — **DIAGNOSTIC COMPLETE for the
+  dryrun gap; mechanism not yet pinned.** Extended NVTX to
+  `cots:execute_model` / `cots:model_forward[FULL|PIECEWISE|NONE]`
+  (env-gated, fast-path skipped when `VLLM_COTS_DIAG=0`).
+  Marker-bounded decomposition of `native_capture_dryrun −
+  none_capture` (+0.571 s/generate, CPU-GEMM-independent): GPU
+  kernel sum delta +180 ms (~32%), D2H memcpy delta +7 ms (~1%).
+  CUPTI runtime API table inside the marker shows the time
+  concentrates in `cudaGraphLaunch_v10000`: same call count
+  (156) as `none_capture`, but +2,422 ms of CPU time spent
+  inside the call. Per-forward NVTX `cots:model_forward[FULL]`
+  median goes from 199 μs (none) to 19,178 μs (dryrun) on the
+  127 FULL-replay decode forwards — 96× slower, consistent
+  with the cudaGraphLaunch finding. The captured-node-count
+  hypothesis (56 host_fn + 28 D2H + 28 UVA per forward × 128 =
+  ~14,300 extra captured node fires/generate) is *consistent*
+  with the +2,422 ms CUPTI delta but **not directly measured by
+  it** — would need per-graph-node attribution to confirm. DO
+  NOT implement another optimization until that is closed. See
+  §1c.25 below.
 
 ---
 
@@ -1731,10 +1753,15 @@ is unaffected):
   `cots:py_sync_then_uva`, `cots:py_uva_copy` (gated by a
   module-level `_COTS_DIAG_ENABLED` constant).
 * **Iteration-level marker** `cots:bench_iter` pushed in
-  `vllm/benchmarks/latency.py:run_to_completion` around the
-  timed wall-clock measurement only. Lets nsys post-processing
-  filter NVTX events to those that fall inside the marker
-  window, dropping engine-init / capture / warmup activity.
+  `vllm/benchmarks/latency.py:run_to_completion` around EVERY
+  non-profile invocation — that means BOTH warmup and measured
+  iters each emit their own marker pair (a try/finally wraps
+  `llm_generate()` so the pop fires even on error). Analysis
+  MUST select the LAST marker instance per arm (the measured
+  iter; warmup runs strictly before it). The SQLite filter
+  snippet below already does this via
+  `ORDER BY start DESC LIMIT 1`. Querying the first or all
+  markers will conflate warmup with measured.
 * C++ wall-clock counters (steady_clock, ns):
   `dispatch_cb_count`, `sync_cb_count`, `sync_cb_wait_total_ns`,
   `worker_run_count`, `worker_busy_total_ns`,
@@ -1868,6 +1895,289 @@ THEN decide.
                   WHERE text='cots:bench_iter'
                   ORDER BY start DESC LIMIT 1)
   ORDER BY start;
+  ```
+
+---
+
+### §1c.25 — non-COTS attribution: CPU-side driver overhead dominates dryrun gap
+
+#### Setup (extends §1c.24)
+
+Same marker-filtered methodology as §1c.24 v2 (`cots:bench_iter`
+NVTX wrap around `run_to_completion`, 1 warmup + 1 measured iter,
+SQLite filter to events whose `start`/`end` fall inside the LAST
+marker instance per arm), but with new env-gated NVTX scopes added
+to non-COTS regions:
+
+* `cots:execute_model` around `gpu_model_runner.execute_model`
+  (one fire per forward, on the engine driver thread).
+* `cots:model_forward[FULL|PIECEWISE|NONE]` around the
+  `_model_forward → self.model(...)` call (mode tag from
+  `cudagraph_runtime_mode`).
+* `cots:replay_prep_full` and `cots:cudagraph_replay_full` were
+  added in `cudagraph_utils.CudaGraphManager.run_fullgraph`,
+  but DID NOT FIRE in the v1-engine traces — the active
+  runner (`vllm/v1/worker/gpu_model_runner.py:GPUModelRunner`)
+  routes FULL replay through `self.model(...)` rather than
+  through `cudagraph_manager.run_fullgraph`. The scopes stay
+  in place behind the same env gate; they'll fire when the
+  spec-decode / older runner path is exercised.
+* All NVTX gated by `VLLM_COTS_DIAG=1`. New shared helper
+  `vllm/utils/cots_diag.py` provides `nvtx_range` (contextmanager)
+  + `push`/`pop` so each call site does not duplicate the env
+  check.
+
+`_scatter_col_outputs_three_way` is intentionally NOT wrapped:
+under FULL capture, it's inlined into the captured graph at
+trace time and a Python NVTX scope inside it would only fire
+once at trace, not per replay. Per-replay scatter cost is best
+attributed via `nsys stats --report cuda_gpu_kern_sum`
+filtering for `index_copy_` kernels.
+
+#### Wall-clock landscape
+
+Identical run: B=1, input_len=8, output_len=128, Qwen2.5-7B BF16,
+f_cpu_store=0.05, t=16, `--num-iters-warmup 1 --num-iters 1`.
+
+| arm | wall-clock | Δ vs `none_capture` |
+|---|---|---|
+| `none_capture` | 2.038 s | — |
+| `native_dryrun_real` | 2.609 s | +0.571 s |
+| `native_eager_real` | 2.708 s | +0.670 s |
+| `native_capture_real` | 2.872 s | +0.834 s |
+
+The dryrun ↔ none_capture gap is **+0.571 s/generate**. This is
+the §1c.25 target — it is independent of CPU GEMM work (dryrun
+skips the worker compute entirely) and represents pure COTS
+graph-machinery overhead.
+
+#### Per-forward NVTX counts and medians (driver-thread time)
+
+Inside the marker for the measured iter:
+
+* `cots:execute_model` — n=130 instances. With B=1 / output_len=128,
+  exactly 128 of these are the per-token forwards (1 prefill + 127
+  decodes); the remaining 2 are short engine-init / setup
+  invocations of `execute_model` that don't reach the FULL or
+  PIECEWISE dispatch (they don't enter `cots:model_forward[*]`).
+* `cots:model_forward[FULL]` — n=127 instances (the 127 decode
+  forwards that hit FULL replay).
+* `cots:model_forward[PIECEWISE]` — n=1 instance (the input_len=8
+  prefill that falls into PIECEWISE).
+* `cots:model_forward[NONE]` — n=128 in eager only (covers
+  prefill + decodes since enforce_eager skips graph capture).
+
+Medians are taken over the n above for each scope, NOT over a
+common 130-forward population:
+
+| range | none p50 | dryrun p50 | Δ p50 |
+|---|---|---|---|
+| `cots:execute_model` (n=130) | 779 μs | 19,830 μs | **+19,051 μs/forward** |
+| `cots:model_forward[FULL]` (n=127) | 199 μs | 19,178 μs | **+18,979 μs/forward** |
+| `cots:model_forward[PIECEWISE]` (n=1) | 2,674 μs | 3,437 μs | +763 μs |
+
+The `model_forward[FULL]` scope wraps `self.model(...)` which —
+under FULL capture — issues `cudaGraphLaunch` and waits for the
+captured graph to complete. **The +18,979 μs/forward delta on
+the 127 FULL-mode decode forwards is where the COTS dryrun
+overhead concentrates**: inside the captured-graph replay
+window. Per-forward overhead in `execute_model` outside
+`model_forward` is a small residual (~70 μs/forward).
+
+#### Marker-bounded GPU breakdown
+
+`nsys stats` queried with `start>=marker_start AND end<=marker_end`
+for `CUPTI_ACTIVITY_KIND_KERNEL` and `CUPTI_ACTIVITY_KIND_MEMCPY`.
+Critically, **memcpy and kernel sums inside the marker are much
+smaller than the process-wide totals** because most of the
+process-wide D2H/UVA activity happened during graph capture
+(before the marker). Process-wide totals (e.g., D2H 395 ms)
+mislead — only inside-marker sums reflect the measured iter.
+
+| metric (inside marker) | none | dryrun | eager | capture |
+|---|---|---|---|---|
+| wall_clock | 2.038 s | 2.609 s | 2.708 s | 2.872 s |
+| GPU kernel sum (any stream) | 2020.3 ms | 2200.6 ms | 1979.4 ms | 2200.8 ms |
+| GPU kernel count | 41,828 | 66,888 | 63,784 | 66,888 |
+| memcpy_H2D | 1.3 ms | 1.1 ms | 1.1 ms | 1.1 ms |
+| **memcpy_D2H** | **0.1 ms** | **7.2 ms** | 7.5 ms | 7.3 ms |
+| memcpy_D2H count | 128 | 7,296 | 7,296 | 7,296 |
+
+Deltas vs `none_capture`:
+
+| arm | wall_Δ | kern_Δ | D2H_Δ | unexplained_Δ |
+|---|---|---|---|---|
+| `native_dryrun_real` | +571 ms | +180 ms | +7 ms | **+384 ms** |
+| `native_eager_real` | +670 ms | −41 ms | +7 ms | +704 ms |
+| `native_capture_real` | +834 ms | +181 ms | +7 ms | +646 ms |
+
+#### CUPTI runtime API attribution (direct measurement)
+
+Same SQLite filter applied to `CUPTI_ACTIVITY_KIND_RUNTIME` (CUDA
+runtime API call timings, joined with `StringIds.value` for the
+API name):
+
+| API | none (count, ms) | dryrun (count, ms) | dryrun−none Δ |
+|---|---|---|---|
+| `cudaGraphLaunch_v10000` | 156, 25.4 ms | 156, 2447.3 ms | **same count, +2421.9 ms** |
+| `cudaEventSynchronize_v3020` | 258, 2031.0 ms | 258, 2508.4 ms | same count, +477.4 ms |
+| `cudaEventDestroy_v3020` | 256, 0.1 ms | 256, 29.2 ms | same count, +29.1 ms |
+| `cudaLaunchKernel_v7000` | 2232, 7.2 ms | 2232, 9.1 ms | +1.8 ms |
+| `cudaMemcpyAsync_v3020` | 1409, 5.0 ms | 1409, 5.4 ms | +0.4 ms |
+
+(`cudaEventSynchronize` time is dominated by scheduler/output
+gating in the engine subprocess; that the dryrun delta is +477 ms
+suggests the engine waits longer for outputs in dryrun, possibly
+because cudaGraphLaunch already absorbed most of the per-forward
+time.)
+
+#### Critical-path conclusion for §1c.25
+
+The +0.571 s/generate dryrun overhead is **directly attributable
+to extra time spent inside `cudaGraphLaunch`**:
+
+* `cudaGraphLaunch` is called the same number of times in dryrun
+  and none_capture (156 each — 28 capture warmups + 128 measured
+  forwards), but each call returns ~15.5 ms later in dryrun
+  (avg 15.7 ms per call) vs ~0.16 ms in none_capture.
+* The captured graph in dryrun contains 56 cudaLaunchHostFunc
+  nodes per forward (28 dispatch_cb + 28 sync_cb), 28 captured
+  cudaMemcpyAsync (D2H, bucket-sized), 28 captured Triton UVA
+  kernels, plus the GPU GEMMs that none_capture also has.
+* `cudaGraphLaunch` blocks until certain captured nodes finish.
+  cudaLaunchHostFunc nodes pause the stream until the host
+  callback returns; with 56/forward, even fast dryrun host_fns
+  add up. The ~+15.5 ms/call of cudaGraphLaunch time is
+  consistent with that — but the CUPTI table does not directly
+  attribute the time to specific captured-node types.
+
+**Hypothesis** (consistent with the CUPTI signal but not
+directly measured by it): the dominant factor is captured-node
+count — specifically the cudaLaunchHostFunc / cudaMemcpyAsync /
+Triton-UVA fan-out. Order of magnitude:
+
+* 56 cudaLaunchHostFunc × 128 forwards × ~30 μs ≈ 215 ms
+* 28 captured cudaMemcpyAsync × 128 × ~20 μs ≈ 72 ms
+* 28 captured Triton UVA × 128 × ~5 μs ≈ 18 ms
+* cudaGraphLaunch wrapper × 128 × ~80 μs ≈ 10 ms
+
+Sum ≈ 315 ms — close to the wall-clock delta of +571 ms with
+some slack for stream-serialization effects beyond per-node
+dispatch. The hypothesis is *consistent* with both the CUPTI
+runtime delta (+2422 ms in cudaGraphLaunch) and the wall-clock
+delta (+571 ms after async overlap with engine work).
+
+**What the trace cannot prove:** the exact split among the
+captured-node types. To confirm "captured-node count" as the
+mechanism, we'd need either (a) per-graph-node attribution
+(Nsight Systems' captured-graph node timeline view, manually
+inspected), or (b) a controlled prototype that reduces one
+node type and re-measures the cudaGraphLaunch delta. The
+CUPTI runtime table establishes that the time IS spent inside
+cudaGraphLaunch; it does not establish that captured-node
+count is the lever to reduce it.
+
+Marker-bounded GPU-side breakdown (separate from runtime API):
+
+* GPU kernel sum delta: +180 ms (captured Triton UVA + small
+  dummy kernels). ~32% of the +571 ms wall.
+* D2H memcpy delta: +7 ms — small (54 MB at PCIe speeds).
+* H2D memcpy delta: ~0 — weight-prefetch overlaps with compute.
+
+#### What this trace cannot prove
+
+* The exact split between cudaLaunchHostFunc dispatch,
+  cudaMemcpyAsync dispatch, Triton kernel launch, and
+  cudaGraphLaunch wrapper overhead is approximate. Direct
+  per-node attribution would need either (a) NVTX scopes
+  embedded INSIDE the captured graph (via stream-side
+  annotations rather than CPU-side range_push/pop), or (b)
+  Nsight Systems' graph-node detail timeline view manually
+  inspected.
+* The §1c.24 finding that the COTS C++ hot path is not the
+  bottleneck stands; the new NVTX confirms the dominant cost
+  is structural graph-replay overhead, not COTS-specific
+  worker / sync.
+
+#### What §1c.25 establishes (and does not)
+
+The §1c.25 gate target — a decomposition of
+`native_capture_dryrun − none_capture` (+0.571 s/generate,
+CPU-GEMM-independent) — is delivered above. What is firmly
+established:
+
+* The dryrun gap lives **inside the graph replay /
+  `self.model(...)` window**, NOT in the COTS C++ worker /
+  D2H / UVA byte traffic (already established in §1c.24, now
+  cross-confirmed via NVTX `model_forward[FULL]` median).
+* The CUPTI runtime API table shows the time concentrates in
+  `cudaGraphLaunch_v10000` (+2,422 ms over 156 calls vs none).
+  This is a direct measurement of *where* in the CUDA runtime
+  the cost lands.
+* Marker-bounded GPU breakdown rules out byte transfer (D2H
+  +7 ms) and kernel sum (+180 ms) as primary drivers.
+
+What is **NOT** firmly established:
+
+* The exact mechanism inside `cudaGraphLaunch` that adds the
+  ~15.5 ms/call. The captured-node-count hypothesis is
+  *consistent* with the data, not directly measured by it.
+* Whether reducing any specific captured-node type (host_fn,
+  cudaMemcpyAsync, Triton UVA) would actually move
+  cudaGraphLaunch time. That requires either per-node graph
+  attribution (Nsight Systems node-level timeline view) or a
+  controlled prototype.
+
+#### Hypotheses for §1c.26 (do not implement until validated)
+
+Ordered by best-current-hypothesis match to the CUPTI signal:
+
+1. **Captured-node count** (best current hypothesis). Coalesce
+   per-layer captured ops — fewer cudaMemcpyAsync, fewer
+   cudaLaunchHostFunc — and re-measure cudaGraphLaunch wall.
+   If cudaGraphLaunch time drops proportionally, mechanism
+   confirmed.
+2. **Host-callback stream serialization.** cudaLaunchHostFunc
+   pauses the stream until the host_fn returns. Reduce
+   host_fn fires from 56 to ≤4 per forward (one batched
+   submit + one batched sync) and re-measure.
+3. **D2H/UVA on compute stream contention.** Move both off the
+   compute stream onto a dedicated copy stream that's also
+   captured. Larger blast radius; low priority unless 1 and 2
+   miss.
+
+**Recommended next step BEFORE any of the above:** add CUPTI
+graph-node attribution (or open one trace in Nsight Systems'
+GUI and inspect captured-graph node timeline manually) to
+confirm which captured-node type accounts for the bulk of the
+cudaGraphLaunch wall. That keeps the §1c.24 gate rule honored:
+"Do not implement another optimization until the timeline
+proves the bottleneck."
+
+**Status: diagnostic complete with one outstanding question
+(per-node attribution within cudaGraphLaunch). Mechanism
+selection deferred until that is closed.**
+
+#### Artifacts
+
+* `David/Benchmarks/phase1c/results/diag_nsys_1c25/*.json` —
+  bench wall-clock outputs.
+* `*.nsys-rep` traces are gitignored (~80 MB each, regenerable
+  via the bench command in §1c.24).
+* SQLite filter for marker-bounded GPU work (extends the §1c.24
+  NVTX filter):
+  ```sql
+  -- Inside-marker GPU kernel time
+  SELECT COUNT(*), SUM(end-start)/1e6 AS ms FROM CUPTI_ACTIVITY_KIND_KERNEL
+  WHERE start >= (SELECT start FROM NVTX_EVENTS WHERE text='cots:bench_iter'
+                  ORDER BY start DESC LIMIT 1)
+    AND end   <= (SELECT end   FROM NVTX_EVENTS WHERE text='cots:bench_iter'
+                  ORDER BY start DESC LIMIT 1);
+  -- Inside-marker D2H memcpy time
+  SELECT COUNT(*), SUM(end-start)/1e6 AS ms, SUM(bytes) AS bytes
+  FROM CUPTI_ACTIVITY_KIND_MEMCPY
+  WHERE copyKind=2
+    AND start >= (...) AND end <= (...);
   ```
 
 ---
