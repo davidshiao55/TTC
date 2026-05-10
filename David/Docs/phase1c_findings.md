@@ -3567,6 +3567,62 @@ unstable — e.g., longer decodes that mix bucket sizes. A
 B-and-output-len sweep is the next concrete step before any
 default-flip reconsideration.
 
+#### Workload grid — M3 loses at every B=1 grid point, gap
+widens with f and output_len (commit-3-real follow-up)
+
+Per the reviewer's recommended next step. Same harness/session/
+build, t=16 (default), 2 warmup + 3 measured iters, single
+session per (output_len, f) point:
+
+| output_len | f    | none_capture | eager_real | m3_on_real | M3 − eager | Verdict |
+|---:|---:|---:|---:|---:|---:|:---:|
+| 128 | 0.05 | 2.0323 | 2.6079 | 2.6961 | **−88.3 ms** | FAIL |
+| 128 | 0.10 | 2.0317 | 4.1053 | 4.2450 | **−139.8 ms** | FAIL |
+| 256 | 0.05 | 4.0611 | 5.2122 | 5.3835 | **−171.2 ms** | FAIL |
+| 256 | 0.10 | 4.0616 | 8.2342 | 8.5111 | **−276.8 ms** | FAIL |
+
+Reading: **M3-vs-eager FAILS at every workload point, and
+the gap WIDENS as f or output_len grow.** As more work moves
+to CPU (higher f) or as the generate gets longer (more
+decode steps), captured+M3 falls further behind eager.
+
+The reviewer's hypothesis was that longer decodes / wider
+batches might tip the balance. Along the (output_len, f)
+axes at B=1, this doesn't hold — capture's per-op overhead
+scales linearly with operations-per-generate, and there is
+no point in this grid where capture+M3 catches up.
+
+B=4 axis: not measured. Hit a pre-existing eager-path
+slab-sizing bug (`runtime_num_tokens=25 exceeds slab
+capacity (slab.num_tokens=8)`) at B=4 eager — slabs are
+sized from cudagraph_capture_sizes which doesn't cover the
+B=4 prefill demand at input_len=8. Not introduced by §1c.29;
+a separate Phase 1c eager-path issue. The production
+decision metric (M3 vs eager) can't be evaluated at B=4 in
+the current code state without fixing that bug first; out
+of scope here. Ironically capture+M3 succeeds at B=4 (it's
+the eager path that's broken), but the comparison can't be
+made.
+
+**Aggregate decision across all of §1c.29's experiments**:
+captured+M3 wins at exactly one anomalous point (t=8 at
+the original B=1/o=128/f=0.05 config), and loses at every
+other (thread × output_len × f) point measured. The t=8
+"win" is brittle — contingent on eager being pathological
+at that thread count. **§1c.29 M3 is not a default
+candidate at this hardware/model**; the flag stays opt-in.
+
+Future work that could change this verdict:
+1. Fix the eager-path slab-sizing bug so B=4 can be
+   measured.
+2. Investigate why captured-graph per-op overhead is high
+   on this build (the +88 → +277 ms scaling with workload
+   size suggests something in the D2H / UVA / captured-
+   host_fn path is more expensive than expected).
+3. Multi-stream wait kernel (§1c.30 sketch) — let GPU
+   compute proceed on a separate stream while the wait
+   kernel idles, recovering the captured-vs-eager loss.
+
 #### Design warning: SM occupancy from spin-wait
 
 The wait kernel busy-spins (with PTX `nanosleep` between

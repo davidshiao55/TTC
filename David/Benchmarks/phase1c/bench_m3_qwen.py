@@ -82,7 +82,7 @@ DEFAULT_F = 0.05
 DEFAULT_THREADS = 16
 
 
-def arms_for(threads: int) -> dict[str, list[str]]:
+def arms_for(threads: int, f_cpu_store: float = DEFAULT_F) -> dict[str, list[str]]:
     """Return arm name -> CLI flag list.
 
     Seven-arm grid (apples-to-apples per the commit-3-real review):
@@ -104,7 +104,7 @@ def arms_for(threads: int) -> dict[str, list[str]]:
         "--offload-backend",
         "cots",
         "--cots-f-cpu-store",
-        str(DEFAULT_F),
+        str(f_cpu_store),
         "--cots-cpu-runner",
         "native",
     ]
@@ -132,10 +132,29 @@ _EAGER_ARMS: frozenset[str] = frozenset({
 })
 
 
-def cell_path(arm: str, batch: int, threads: int) -> Path:
-    if threads == DEFAULT_THREADS:
-        return RESULTS_DIR / f"{arm}_b{batch}.json"
-    return RESULTS_DIR / f"{arm}_b{batch}_t{threads}.json"
+def cell_path(
+    arm: str,
+    batch: int,
+    threads: int,
+    *,
+    output_len: int = OUTPUT_LEN,
+    f_cpu_store: float = DEFAULT_F,
+) -> Path:
+    """Per-cell JSON path. Default-valued (output_len, f) are
+    elided from the filename so the existing committed grid at
+    output=128, f=0.05 is preserved bit-for-bit. Non-default
+    workload points get a suffix `_o<output>_f<f×100>` so a wider
+    grid can coexist with the prior cells under the same dir."""
+    name = f"{arm}_b{batch}"
+    if threads != DEFAULT_THREADS:
+        name += f"_t{threads}"
+    if output_len != OUTPUT_LEN:
+        name += f"_o{output_len}"
+    if f_cpu_store != DEFAULT_F:
+        # 0.10 → "f10", 0.05 → elided, 0.20 → "f20" (avoids
+        # decimal points in filenames).
+        name += f"_f{int(round(f_cpu_store * 100))}"
+    return RESULTS_DIR / f"{name}.json"
 
 
 def run_cell(
@@ -147,8 +166,13 @@ def run_cell(
     num_iters: int,
     num_iters_warmup: int,
     extra_flags: list[str],
+    output_len: int = OUTPUT_LEN,
+    f_cpu_store: float = DEFAULT_F,
 ) -> Path:
-    out_json = cell_path(arm, batch, threads)
+    out_json = cell_path(
+        arm, batch, threads,
+        output_len=output_len, f_cpu_store=f_cpu_store,
+    )
     out_log = out_json.with_suffix(".log")
     if out_json.exists():
         print(f"  [skip] {arm} b={batch} (cached)")
@@ -166,7 +190,7 @@ def run_cell(
         "--input-len",
         str(INPUT_LEN),
         "--output-len",
-        str(OUTPUT_LEN),
+        str(output_len),
         "--batch-size",
         str(batch),
         "--num-iters-warmup",
@@ -266,6 +290,14 @@ def main() -> None:
     ap.add_argument("--num-iters", type=int, default=2)
     ap.add_argument("--num-iters-warmup", type=int, default=1)
     ap.add_argument(
+        "--output-len", type=int, default=OUTPUT_LEN,
+        help="Generated tokens per sequence (default 128).",
+    )
+    ap.add_argument(
+        "--f-cpu-store", type=float, default=DEFAULT_F,
+        help="CotsOffloadConfig.f_cpu_store (default 0.05).",
+    )
+    ap.add_argument(
         "--extra-flag",
         action="append",
         default=[],
@@ -277,13 +309,13 @@ def main() -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     print(
         f"[setup] threads={args.threads}, batches={args.batches}, "
-        f"f={DEFAULT_F}, input={INPUT_LEN}, output={OUTPUT_LEN}, "
+        f"f={args.f_cpu_store}, input={INPUT_LEN}, output={args.output_len}, "
         f"iters={args.num_iters} (warmup {args.num_iters_warmup})"
     )
 
     rows: dict = {}
     for t in args.threads:
-        arms = arms_for(t)
+        arms = arms_for(t, f_cpu_store=args.f_cpu_store)
         run_arms = (
             arms if not args.only_arms
             else {n: arms[n] for n in args.only_arms if n in arms}
@@ -299,10 +331,19 @@ def main() -> None:
                     num_iters=args.num_iters,
                     num_iters_warmup=args.num_iters_warmup,
                     extra_flags=args.extra_flag,
+                    output_len=args.output_len,
+                    f_cpu_store=args.f_cpu_store,
                 )
 
-        for arm in arms_for(t):
-            row = {B: parse_avg(cell_path(arm, B, t)) for B in args.batches}
+        for arm in arms_for(t, f_cpu_store=args.f_cpu_store):
+            row = {
+                B: parse_avg(cell_path(
+                    arm, B, t,
+                    output_len=args.output_len,
+                    f_cpu_store=args.f_cpu_store,
+                ))
+                for B in args.batches
+            }
             rows[(arm, t)] = row
 
     print("\n" + "=" * 88)
