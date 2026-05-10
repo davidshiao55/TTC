@@ -161,10 +161,21 @@ def test_set_runtime_num_tokens_zero_falls_back_to_slab_cap() -> None:
         r.close()
 
 
-def test_set_runtime_num_tokens_above_slab_cap_hard_fails() -> None:
-    """Reviewer's defensive test: runtime_num_tokens > slab.num_tokens
-    must hard-fail. We never want the worker to read past the slab's
-    pinned buffer."""
+def test_set_runtime_num_tokens_above_slab_cap_clamps() -> None:
+    """§1c.31 commit-3-real fix: runtime_num_tokens > slab.num_tokens
+    is no longer a hard-fail; the worker treats the override as a
+    CAP and clamps to slab_cap. A diagnostic counter
+    (worker_clamp_override_count) records each clamp so the case is
+    observable.
+
+    Rationale: under eager mode, set_runtime_num_tokens applies
+    globally per CotsCpuInfer to whatever slab fires next,
+    regardless of which bucket sized that slab. Pre-fix behavior
+    (TORCH_CHECK) hard-failed B=4 prefill at input_len=8 when a
+    small-bucket slab fired with the global override set to 32
+    (`runtime_num_tokens=25 exceeds slab capacity slab.num_tokens=8`).
+    The slab's pinned buffer is sized for slab_cap so reading
+    beyond it is UB; clamping is the safe interpretation."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA needed")
     from vllm.model_executor.offloader import cots_ops
@@ -173,7 +184,7 @@ def test_set_runtime_num_tokens_above_slab_cap_hard_fails() -> None:
     r, _, _ = _new_runner_with_qkv_slab(bucket, 8, 6)
     try:
         infer = cots_ops._lookup_infer(r._runner_id, "test")
-        # Set slab.num_tokens=bucket via submit.
+        infer.reset_counters()
         infer.set_runtime_num_tokens(0)
         stream = torch.cuda.current_stream().cuda_stream
         infer.submit_on_stream(
@@ -183,8 +194,12 @@ def test_set_runtime_num_tokens_above_slab_cap_hard_fails() -> None:
         infer.sync_on_stream(cuda_stream=stream)
         torch.cuda.current_stream().synchronize()
 
-        # Now push runtime past the cap and submit again; worker
-        # should fail the bound check.
+        counters = dict(infer.get_counters())
+        assert counters.get("worker_clamp_override_count", 0) == 0, (
+            "baseline submit (no override) should not clamp"
+        )
+
+        # Override above slab capacity → clamp + counter increment.
         infer.set_runtime_num_tokens(bucket + 1)
         infer.submit_on_stream(
             task_id=0, num_tokens=bucket, x_gpu_ptr=0,
@@ -192,15 +207,80 @@ def test_set_runtime_num_tokens_above_slab_cap_hard_fails() -> None:
         )
         infer.sync_on_stream(cuda_stream=stream)
         torch.cuda.current_stream().synchronize()
-        # The worker error surfaces on the next Python-side call.
-        with pytest.raises(RuntimeError, match="exceeds slab capacity|exceeds"):
-            infer.set_runtime_num_tokens(0)
-            # Force a check_error path (any populate / submit /
-            # sync call surfaces it).
+
+        counters = dict(infer.get_counters())
+        assert counters.get("worker_clamp_override_count", 0) == 1, (
+            f"clamp counter should have incremented; got {counters}"
+        )
+        # The worker did NOT set has_error_; subsequent calls should
+        # succeed (vs the pre-§1c.31 hard-fail behavior).
+        assert not infer.has_error(), (
+            "worker should not record an error after a clamp; the "
+            "override is a cap, not a row-count requirement"
+        )
+        infer.set_runtime_num_tokens(0)
+        infer.submit_on_stream(
+            task_id=0, num_tokens=bucket, x_gpu_ptr=0,
+            x_cols=0, x_stride0=0, x_stride1=1, cuda_stream=stream
+        )
+        infer.sync_on_stream(cuda_stream=stream)
+        torch.cuda.current_stream().synchronize()
+        # Reset to 0 → next submit doesn't clamp again.
+        counters = dict(infer.get_counters())
+        assert counters.get("worker_clamp_override_count", 0) == 1, (
+            f"counter should stay at 1 (no new clamps); got {counters}"
+        )
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
+
+
+def test_clamp_b4_prefill_scenario_no_deadlock() -> None:
+    """§1c.31 regression for the B=4 prefill scenario that
+    motivated the clamp fix. Mirrors what the workload-grid bench
+    saw: a small-bucket slab installed at capacity 8, then a
+    global runtime_num_tokens of 25 (from a larger batch's prefill)
+    submitted. Pre-fix: TORCH_CHECK raised, worker stopped, stream
+    wedged at next sync. Post-fix: clamp + counter, worker
+    completes normally, sync returns, downstream proceeds."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA needed")
+    from vllm.model_executor.offloader import cots_ops
+
+    bucket = 8  # matches the original error: slab.num_tokens=8
+    r, _, _ = _new_runner_with_qkv_slab(bucket, 8, 6)
+    try:
+        infer = cots_ops._lookup_infer(r._runner_id, "test")
+        infer.reset_counters()
+        stream = torch.cuda.current_stream().cuda_stream
+        # Submit at bucket=8 first to set slab.num_tokens.
+        infer.set_runtime_num_tokens(0)
+        infer.submit_on_stream(
+            task_id=0, num_tokens=bucket, x_gpu_ptr=0,
+            x_cols=0, x_stride0=0, x_stride1=1, cuda_stream=stream
+        )
+        infer.sync_on_stream(cuda_stream=stream)
+        torch.cuda.current_stream().synchronize()
+        # Now simulate the B=4 prefill: global override at 25.
+        infer.set_runtime_num_tokens(25)
+        for _ in range(5):  # multiple replays at the over-cap setting
             infer.submit_on_stream(
                 task_id=0, num_tokens=bucket, x_gpu_ptr=0,
                 x_cols=0, x_stride0=0, x_stride1=1, cuda_stream=stream
             )
+            infer.sync_on_stream(cuda_stream=stream)
+            torch.cuda.current_stream().synchronize()
+
+        assert not infer.has_error(), (
+            "stream should not have wedged on clamp scenario"
+        )
+        counters = dict(infer.get_counters())
+        assert counters.get("worker_clamp_override_count", 0) == 5, (
+            f"5 over-cap submits should have produced 5 clamps; "
+            f"got {counters.get('worker_clamp_override_count', 0)}"
+        )
     finally:
         try:
             r.close()

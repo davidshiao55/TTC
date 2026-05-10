@@ -1,37 +1,37 @@
 {
   "model": "Qwen/Qwen2.5-7B-Instruct",
   "input_len": 8,
-  "output_len": 128,
-  "f": 0.05,
+  "output_len": 256,
+  "f": 0.1,
   "batches": [
     1
   ],
   "threads": [
     16
   ],
-  "num_iters": 3,
-  "num_iters_warmup": 2,
+  "num_iters": 2,
+  "num_iters_warmup": 1,
   "rows": {
     "none_capture_t16": {
-      "1": 2.032289168666466
+      "1": 4.061584968663131
     },
     "cots_native_eager_dryrun_t16": {
-      "1": 2.3527523336718636
+      "1": null
     },
     "cots_native_eager_real_t16": {
-      "1": 2.607888970669592
+      "1": 8.234247537329793
     },
     "cots_m3_off_capture_dryrun_t16": {
-      "1": 2.5326712026677947
+      "1": null
     },
     "cots_m3_on_capture_dryrun_t16": {
-      "1": 2.3884298436654112
+      "1": null
     },
     "cots_m3_off_capture_real_t16": {
-      "1": 2.782600652334319
+      "1": null
     },
     "cots_m3_on_capture_real_t16": {
-      "1": 2.696144383662613
+      "1": 8.511092467670096
     }
   }
 }

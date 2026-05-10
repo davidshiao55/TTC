@@ -324,6 +324,15 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   single block; if CPU lags often, could occupy SM time —
   diag counters must surface this. NO code in this
   section. See §1c.29 below.
+- §1c.31 — Commit-3-real review followup: (a) B=4 eager
+  slab-clamp fix (§1c.21 override is now a CAP not a row
+  count; new diag counter `worker_clamp_override_count`); (b)
+  bench summary.json suffixed per (output_len, f) so
+  workload-grid runs don't overwrite each other's metadata;
+  (c) §1c.29 status finalized — implementation correct,
+  opt-in research path, not production default. Production
+  guidance: enforce_eager=True + native runner + legacy
+  sync_cb. See §1c.31 below.
 
 ---
 
@@ -3085,6 +3094,90 @@ wait-side. Requirements:
   in dryrun, where there is no CPU GEMM tail to leak. In real
   mode, removing host_fns may unmask CPU-GEMM completion as a
   serial dependency. The validation gates account for this.
+
+---
+
+### §1c.31 — B=4 slab-clamp fix + summary.json suffix + §1c.29 status finalization (commit-3-real review)
+
+Three follow-ups on the §1c.29 wrap-up:
+
+1. **B=4 eager slab-clamp fix.** The §1c.21 live-token
+   override was applied as a required row count instead of a
+   cap. Under eager mode, `set_runtime_num_tokens()` applies
+   globally per CotsCpuInfer to whatever slab fires next,
+   regardless of which bucket sized that slab. B=4 prefill at
+   `input_len=8` → 32 tokens, but an MLP slab keyed by the
+   smallest bucket has capacity 8. The pre-fix
+   `TORCH_CHECK(n <= slab_cap, …)` hard-failed
+   (`runtime_num_tokens=25 exceeds slab capacity
+   (slab.num_tokens=8)`), wedging the stream and breaking the
+   B=4 eager arm of the workload-grid bench.
+
+   Fix in `csrc/cots/cots_cpu_infer.cpp` RunSlabOnWorker: clamp
+   `effective_n = min(override_n, slab_cap)` instead of
+   hard-failing, and increment `worker_clamp_override_count_`
+   (new field) so the clamp event is observable via
+   `get_counters()`. The slab's pinned buffer is sized for
+   `slab_cap` so reading beyond it is UB; clamping is the safe
+   interpretation and matches the original comment intent
+   ("bounded by effective_n <= slab->num_tokens"). The pre-fix
+   `TORCH_CHECK` contradicted that comment.
+
+   Tests: rewrote
+   `test_set_runtime_num_tokens_above_slab_cap_hard_fails` to
+   `_clamps` (asserts counter increments and no `has_error_`);
+   added `test_clamp_b4_prefill_scenario_no_deadlock` which
+   replays the B=4 prefill shape that motivated the fix.
+
+   Verification: B=4 eager now runs cleanly on the real model
+   (3.3728 s/gen at default config) with 133 clamp events
+   logged. **M3 still loses at B=4** (3.5192 s/gen,
+   Δ = −146.4 ms vs eager) — same pattern as the B=1 grid.
+
+2. **`summary.json` suffix.** The bench harness was always
+   writing `summary.json` and stamping it with global
+   `OUTPUT_LEN` / `DEFAULT_F` (not `args.output_len` /
+   `args.f_cpu_store`). The committed `summary.json` had
+   metadata saying `output_len=128, f=0.05` but rows from the
+   last non-default run (`o=256, f=0.10`).
+
+   Fix: name the summary file with the same suffix scheme as
+   per-cell JSONs (`summary.json` for default,
+   `summary_o256.json`, `summary_f10.json`,
+   `summary_o256_f10.json` for the others) and stamp `args.*`
+   directly. All 4 summaries now committed, each with metadata
+   matching its rows.
+
+3. **§1c.29 status finalization.** With the expanded A/B,
+   thread sweep, and workload grid all on record, the M3 path
+   is locked as **implementation-correct, opt-in research
+   path, not production default**:
+
+   * **Code shape**: parity green, safety gates in place,
+     worker `finally`-publish prevents deadlock,
+     `m3_wait_on_stream_no_check` avoids `check_error()`
+     wedging the captured stream, dispatch enqueue precedes
+     `req_slot` publish.
+   * **Synthetic-stub A/B**: M3 substrate-positive (+10 to
+     +23 µs/layer).
+   * **Real-model wall delta**: M3 beats M3-off-captured by
+     +86.5 ms/generate at the original B=1 config.
+   * **Real-model apples-to-apples**: at every measured
+     `(thread, output_len, f, batch)` point except the
+     anomalous t=8, **eager beats captured+M3**, and the gap
+     widens as `f` or `output_len` grow.
+   * **Default**: `cots_m3_wait_kernel=False` stays.
+   * **Production guidance for this hardware/model**:
+     `enforce_eager=True` + `cpu_runner='native'` + legacy
+     `sync_cb` path + per-bucket-optimal thread policy from
+     `bench_thread_policy_sweep.py`.
+   * **Open future work** (not committed-to here): fix the
+     captured-graph per-op overhead that scales steeply with
+     workload size; multi-stream wait kernel (§1c.30 sketch);
+     B=4 with the clamp fix now lets that arm be measured.
+
+   §1c.29 work closes. No further M3 chasing on B=1/f=0.05
+   from this round.
 
 ---
 

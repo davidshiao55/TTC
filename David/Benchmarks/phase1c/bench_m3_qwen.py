@@ -452,17 +452,31 @@ def main() -> None:
                                 f"lagging={lag} ({lag/tot*100:.1f}%)"
                             )
 
-    summary_path = RESULTS_DIR / "summary.json"
+    # §1c.31: per-workload summary file. Earlier runs all wrote
+    # the same "summary.json" and stamped the file with global
+    # `OUTPUT_LEN` / `DEFAULT_F` (not args.output_len /
+    # args.f_cpu_store), so the artifact got overwritten across
+    # different (output_len, f) configs and its metadata went
+    # stale. Name the file with the same suffix scheme as the
+    # per-cell JSONs so each workload point keeps its own
+    # summary, and stamp the actual args.
+    summary_suffix = ""
+    if args.output_len != OUTPUT_LEN:
+        summary_suffix += f"_o{args.output_len}"
+    if args.f_cpu_store != DEFAULT_F:
+        summary_suffix += f"_f{int(round(args.f_cpu_store * 100))}"
+    summary_path = RESULTS_DIR / f"summary{summary_suffix}.json"
     summary_path.write_text(
         json.dumps(
             {
                 "model": MODEL,
                 "input_len": INPUT_LEN,
-                "output_len": OUTPUT_LEN,
-                "f": DEFAULT_F,
+                "output_len": args.output_len,
+                "f": args.f_cpu_store,
                 "batches": args.batches,
                 "threads": args.threads,
                 "num_iters": args.num_iters,
+                "num_iters_warmup": args.num_iters_warmup,
                 "rows": {
                     f"{arm}_t{t}": {str(B): v for B, v in rows[(arm, t)].items()}
                     for (arm, t) in rows
@@ -472,6 +486,7 @@ def main() -> None:
         )
     )
     print(f"\n  results written to {RESULTS_DIR}")
+    print(f"  per-config summary: {summary_path.name}")
 
 
 if __name__ == "__main__":
