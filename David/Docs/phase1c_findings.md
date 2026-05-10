@@ -337,14 +337,21 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   penalty. Three traces (eager / m3 / none_capture) at
   default workload reveal: (i) the captured FULL graph fires
   **35% MORE COTS dispatch_cb nodes per forward** than eager
-  (76.7 vs 56.4 ops/forward) — likely capturing dispatches
-  that eager short-circuits on `num_tokens==0`; (ii) the
-  wait kernel's actual per-fire time is ~44 µs median, not
-  the 100 ns PTX hint estimate from §1c.29; (iii) GEMM work
-  is identical between arms (within 1%). Conclusion: the
-  +88 ms is dominated by op-count not wait-kernel cost, so
-  the next investigation should target reducing captured
-  COTS nodes, not optimizing M3 further. See §1c.32 below.
+  (76.7 vs 56.4 ops/forward) — initially hypothesised as
+  zero-row short-circuit artifacts; (ii) the wait kernel's
+  actual per-fire time is ~44 µs median, not the 100 ns PTX
+  hint estimate from §1c.29; (iii) GPU GEMM work is
+  comparable across arms but COTS worker op count is higher.
+  See §1c.32 below.
+- §1c.33 — per-task fire-count diagnostic refutes the
+  zero-row hypothesis. Same 56 (layer, op_kind) slabs fire
+  in BOTH arms; M3 just fires each one ~1.69× per forward
+  (1.72 vs 1.02). Not removable as zero-row — it's intrinsic
+  to captured host_fn replay (graph fires the node every
+  replay regardless of token state). Reviewer's pragmatic
+  guidance accepted: production path for Phase 2 is **native
+  eager**; the captured+M3 optimization stays backlogged.
+  See §1c.33 below.
 
 ---
 
@@ -3210,6 +3217,99 @@ Three follow-ups on the §1c.29 wrap-up:
 
 ---
 
+### §1c.33 — per-task fire-count diagnostic refutes the zero-row hypothesis
+
+Reviewer (commit-3-real verdict on §1c.32): "the zero-row
+hypothesis is reasonable, but the current operator code already
+has `if n_cpu > 0` / `if dn_n_cpu > 0` gates. So before
+implementing a fix, we need to know exactly which extra tasks
+fire — QKV or MLP? which layers? which bucket? FULL replay,
+PIECEWISE, capture-time, or measured decode replay?"
+
+Added a per-`TaskSlab` `fire_count` (single relaxed atomic add
+in `DispatchCallback`, always-on, ~1 ns per fire) plus a
+Python-side cross-reference via
+`cots_ops.dump_task_resolved_fire_counts(runner_id,
+task_id_for)`. Atexit dump gated by
+`VLLM_COTS_DUMP_TASK_FIRES=1` to
+`VLLM_COTS_DUMP_TASK_FIRES_FILE=/path/to.json`.
+
+Workload: same as §1c.32 (Qwen2.5-7B BF16, decode 8→128, B=1,
+t=16, f=0.05) but **0 warmup + 1 measured iter** so all
+captured fires belong to the single measured generate.
+Artifacts under `David/Benchmarks/phase1c/results/m3_qwen_task_fires/`.
+
+| | Eager | M3 capture |
+|---|---|---|
+| Total fires | **7,280** | **12,320** |
+| Unique slabs that fired | 56 (28 layers × 2 op_kinds) | 56 (same) |
+| Fires/forward (1 gen = 128 fwds) | 56.875 | 96.25 |
+| Fires/slab/forward | **1.02 ≈ 1** | **1.72 ≈ 1.69×** |
+| Slabs in pool | 56 (single bucket=8192) | 2,856 (51 buckets × 56) |
+| op_kind distribution | qkv=3640, mlp_block=3640 | qkv=6160, mlp_block=6160 |
+
+**Key result: M3 fires each of the SAME slabs ~1.69× per
+forward**, not "extra slabs". The op-count delta is uniform
+across QKV and MLP (50/50 each). All 28 layers fire. Only one
+bucket fires in each arm (8192 for eager because eager uses
+`max_num_batched_tokens`; 512 for M3 because that's the
+cudagraph_capture_sizes value the FULL graph replays for B=1).
+
+**The zero-row hypothesis is refuted**: there are no extra
+slabs / layers / buckets. The exact same 56 (layer, op_kind)
+tuples fire in both arms; M3 fires each one ~1.7× per
+forward.
+
+**Likely actual cause**: vLLM's captured FULL graph + Python
+orchestration interplay. Each forward at B=1 produces SOME
+Python orchestration (for boundary work between captured
+fragments) AND replays the captured FULL graph. If the
+captured graph's recorded `cudaLaunchHostFunc(dispatch_cb)`
+nodes AND the Python operator wrapper BOTH fire `dispatch_cb`
+per forward, we get ~2 fires per slab per forward.
+
+Cross-check against §1c.32 NVTX (with warmup):
+
+| NVTX scope | eager (count) | m3 (count) | m3/eager |
+|---|---:|---:|---:|
+| `cots:py_submit_gemm` | 14,448 | **10,192** | **0.71×** |
+| `cots:dispatch_cb`    | 14,448 | **19,488** | **1.35×** |
+
+In eager, py_submit_gemm == dispatch_cb (1:1) — every Python
+call to the custom op fires the host_fn once. In M3,
+py_submit_gemm DROPS by ~30% (because captured replays don't
+re-run Python) but dispatch_cb GOES UP by ~35% (because the
+captured host_fn nodes fire on every replay). The cross-check
+confirms: capture is firing dispatch_cb extra without going
+through the Python wrapper.
+
+**This is NOT a removable zero-row artifact.** It's the
+fundamental property of captured-graph replay: the host_fn
+node fires whenever the graph replays. Eager fires once per
+Python-side dispatch; capture fires once per replay regardless
+of whether Python wanted that op for this token. Reducing
+this would require either:
+
+* Pruning captured `dispatch_cb` nodes whose recorded
+  num_tokens at capture time is "trash" (e.g., capture-time
+  warmup decisions that aren't reused), OR
+* Skipping dispatch entirely when `runtime_num_tokens == 0`
+  by conditioning the captured node on a control predicate
+  — not currently supported by CUDA Graph host_fn.
+
+Neither is a small code change. The reviewer's pragmatic
+advice ("unless graph capture is mandatory for the thesis
+narrative, use native eager as the production path for Phase
+2 and backlog this as a capture-specific optimization")
+stands. The diagnostic is now in place if anyone wants to
+revisit; the production stance is **native eager for Phase
+2**.
+
+§1c.33 closes. No behavior change in this commit (counter +
+dump infrastructure only).
+
+---
+
 ### §1c.32 — nsys attribution of the +88 ms captured-vs-eager penalty
 
 Reviewer (commit-3-real verdict): before further M3 work, an
@@ -3239,8 +3339,12 @@ prior in-harness measurement; not a profiler artifact).
 * gemvx (BF16, float accum): 1.0% / 1.01 s, 141 µs × 7168 (≈ eager)
 * _uva_copy_kernel: 0.3% / 0.26 s, 1.7 µs × 19488
 
-Reading: GEMM work is essentially identical (within 1% of
-eager). What dominates GPU time in M3 is the wait kernel itself
+Reading: **GPU GEMM work is comparable across the two arms**
+(within 1% on the cublas/cutlass kernels), but the **COTS
+worker CPU op count is NOT** — see the NVTX table below
+where `cots:worker_mlp` cumulative time is 2.57× larger
+under M3 (9744 fires vs 7224 in eager). What dominates GPU
+time in M3 is the wait kernel itself
 — **median 44 µs per fire, NOT the 100 ns PTX hint estimate**. The
 spin-budget computation in §1c.29 commit 3 used the hint and
 estimated ~9.9% of recovered sync_cb time paid back as spin. The
