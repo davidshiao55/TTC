@@ -147,9 +147,11 @@ def test_m3_get_without_install_raises(infer):
 def test_m3_wait_captured_graph_replay(infer):
     """§1c.29 commit 1 review-fix: capture m3_wait_on_stream into a
     real torch.cuda.CUDAGraph and replay it 100x. The standalone
-    smoke at David/Tests/phase1c/smoke_value_signal/ proved this
-    for raw cuStreamWriteValue32 / cuStreamWaitValue32; this test
-    proves the same property for the _cots_C launcher path so
+    smoke at David/Tests/phase1c/smoke_value_signal/ exercised the
+    captured-replay property end-to-end; this test proves it for
+    the production wait-kernel + host-mapped-slot path that goes
+    through the _cots_C launcher (m3_wait_kernel reading volatile
+    uint32_t cells via cudaHostGetDevicePointer addresses), so
     commit 2 can rely on it for the operator graph capture.
 
     Key replay-safety properties exercised:
@@ -162,8 +164,9 @@ def test_m3_wait_captured_graph_replay(infer):
           the host alloc).
       (c) Immediate-resume case is the simplest replay-correctness
           shape; the lagging-then-release case in
-          test_m3_wait_lagging_then_release covers
-          cross-thread-write semantics.
+          test_m3_wait_captured_graph_lagging_release covers
+          cross-thread-write semantics with a definite-block
+          assertion.
     """
     infer.install_m3_for_task(0)
     # Pre-warm: launch once outside capture so any first-launch
@@ -195,11 +198,22 @@ def test_m3_wait_captured_graph_replay(infer):
 
 
 def test_m3_wait_captured_graph_lagging_release(infer):
-    """§1c.29 commit 1 review-fix: captured-graph lagging case.
+    """§1c.29 commit 1 review-fix-2: captured-graph lagging case
+    with a definite-block assertion.
+
     Replay the captured wait kernel with done < req, then release
-    from a worker thread. Ensures replay does not pin the
-    capture-time values and the kernel actually re-spins on the
-    live host-mapped slot."""
+    from a worker thread after a measured delay. Asserts that the
+    elapsed time from `g.replay()` to `torch.cuda.synchronize()`
+    return is at least the worker's pre-release sleep — i.e., the
+    replay actually waited. Without this assertion, the test could
+    pass even if the wait kernel returned early (or the wrong
+    stream was sync'd), because t.join(timeout=5) would still see
+    `released` set after the worker thread's own sleep. Using
+    torch.cuda.synchronize() (device-wide) instead of
+    current_stream().synchronize() is intentional: it leaves no
+    room for the wait to live on a different stream than the one
+    we sync.
+    """
     infer.install_m3_for_task(0)
     infer.m3_set_req_slot(0, 0)
     infer.m3_set_done_slot(0, 0)
@@ -215,23 +229,35 @@ def test_m3_wait_captured_graph_lagging_release(infer):
         with torch.cuda.graph(g, stream=capture_stream):
             infer.m3_wait_on_stream(0, capture_stream.cuda_stream)
 
-    # Replay with done < req; worker thread releases mid-spin.
+    # Replay with done < req; worker thread releases after a
+    # measured delay. The 50 ms sleep is a coarse target; the
+    # assertion uses 40 ms (40 ms < 50 ms target so OS jitter
+    # is tolerated) but is still firmly above the noise floor
+    # for a kernel that returns immediately.
     infer.m3_set_req_slot(0, 7)
     infer.m3_set_done_slot(0, 0)
     released = threading.Event()
+    worker_sleep_s = 0.05
 
     def worker():
-        time.sleep(0.05)
+        time.sleep(worker_sleep_s)
         infer.m3_set_done_slot(0, 7)
         released.set()
 
     t = threading.Thread(target=worker)
     t.start()
+    t0 = time.perf_counter()
     g.replay()
-    torch.cuda.current_stream().synchronize()
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t0
     t.join(timeout=5.0)
-    assert released.is_set(), "worker did not run before stream sync"
+    assert released.is_set(), "worker did not run before device sync"
     assert infer.m3_get_done_slot(0) == 7
+    assert elapsed >= 0.04, (
+        f"captured-graph wait did not actually block: elapsed={elapsed:.4f}s "
+        f"(< 40 ms; worker sleeps {worker_sleep_s * 1000:.0f} ms before "
+        f"writing done_slot, so a real wait must take at least that long)"
+    )
 
 
 def test_m3_diag_counters_when_enabled(monkeypatch):
