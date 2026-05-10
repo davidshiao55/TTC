@@ -224,36 +224,50 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   finding. Mechanism selection now depends on the real-mode
   overlap analysis, which §1c.27 does NOT measure. See §1c.27
   below.
-- §1c.28 (design only, no code) — **Mechanism plan: stream-
-  value-signaled submit, host_fn sync, dependency-aware,
-  replay-safe.** Per-layer dependency map makes whole-forward
-  batching and same-layer QKV+MLP fusion ILLEGAL (cross-layer
-  + intra-layer dependencies on activations that don't exist
-  yet at the fusion point). Per-operator host_fn fusion (M1)
-  destroys overlap and is rejected. Recommended primitive:
-  `cuStreamWriteValue32` / `cuStreamWaitValue32` over host-
-  mapped pinned monotonic-sequence slots, NOT
-  `cudaEventRecord` — events have a documented stale-signal
-  trap across repeated graph replays; monotonic seq numbers
-  make re-arm unambiguous. Recommended step 1: standalone
-  smoke test (allocate slots, capture value-write graph,
-  worker polls, replay 1,000×, assert no stale/duplicate/drop)
-  BEFORE any vLLM integration. Step 2 (M2): replace the
-  captured `cudaLaunchHostFunc(dispatch_cb)` with
-  `cuStreamWriteValue32(submit_seq_slot[task_id], next_seq)`,
-  persistent worker reads `task_id` from the signal payload
-  (or per-task slots) — slab order is NOT assumed
-  deterministic, since FULL/PIECEWISE/chunked prefill /
-  ubatching can change paths. Keep sync host_fn unchanged.
-  Step 3 (M3): replace sync host_fn with `cuStreamWaitValue32`
-  on a worker "done" counter, only after M2 lands cleanly.
-  Validation gates: M2 dryrun cgl Δ ≥ 50% of §1c.27
-  no_submit_hostfn (M2 still records ONE value-write per
-  submit, so full match isn't possible by construction);
-  real-mode output bit-exact at temperature=0; new
-  `submit_signal_to_worker_start_ns` counter median ≤ today's
-  baseline (start latency, not just worker compute median);
-  1,000× replay determinism. NO code in this section. See
+- §1c.28 / smoke step 1 — **M2 kernel-counter submit
+  replacement REJECTED by latency measurement; M3 sync-side
+  replacement promoted to next prototype.** Per-layer
+  dependency map established whole-forward batching and same-
+  layer QKV+MLP fusion as ILLEGAL; per-op host_fn fusion (M1)
+  rejected for destroying overlap. Standalone CUDA-graph
+  value-signal smoke
+  (`David/Tests/phase1c/smoke_value_signal/`) was run before
+  any vLLM integration. Findings: (a) per-task slots are
+  correctness-clean (56,000/56,000 observations every config;
+  no stale/duplicate/invalid). (b) single-packed shared slot
+  loses ~0.6-1.3% of (seq, task_id) signals — REJECTED. (c)
+  the kernel-counter primitive needed to advance seq across
+  captured-graph replays (literal `cuStreamWriteValue32`
+  freezes the value at capture time) has signal-to-worker p50
+  ≈ 25.9 μs, ~17× higher than the §1c.24 measured
+  `dispatch_cb` p50 of 1.45 μs. At B=1 / 56 ops × 128
+  forwards, that's +172 ms/generate of added worker-start
+  delay; the §1c.27 `no_submit_hostfn` cgl drop was only
+  -93 ms — the math doesn't close, M2 as designed cannot net
+  positive. **M2 kernel-counter approach is recorded as a
+  measured-rejected path, NOT the next prototype.** Repivot:
+  §1c.27 measured sync-only ablation cut cgl by -273 ms (3×
+  more than submit-only's -93 ms). M3 (replace ONLY the sync
+  host_fn) avoids the kernel-counter latency tax because
+  submit stays as the cheap existing host_fn and CPU work
+  starts on time; only the later stream-blocking sync is
+  replaced. **M3 smoke
+  (`David/Tests/phase1c/smoke_value_signal/m3_smoke.cu`) is
+  GREEN.** 1,000-replay × 56-task captured kernel-spin against
+  a worker-written monotonic done counter passes correctness
+  (56,000/56,000 observations, no stale/drop/dup/deadlock,
+  bit-identical checksum across configs). Per-fire kernel-spin
+  cost: **5.91 μs** end-to-end (single-task, busy-spin worker,
+  --sync-each), vs **~31 μs per-fire** host_fn(sync_cb) cost
+  implied by §1c.27's no_sync_hostfn cgl delta (273 ms / 156
+  launches / 56 fires per launch). M3 saves ~25 μs per fire
+  ≈ +179 ms/generate at B=1, 56 ops × 128 forwards. Next
+  step: prototype M3 in vLLM behind a feature flag. Submit
+  side stays as the existing host_fn(dispatch_cb); only sync
+  is replaced. Real-mode A/B with output bit-exact at
+  `temperature=0` is the headline correctness gate. If the
+  vLLM prototype regresses despite the smoke result, fall
+  back to `native_eager` as Phase 1c landing path. See
   §1c.28 below.
 
 ---
@@ -2923,35 +2937,95 @@ on Step 2 landing cleanly. Same validation gates plus:
   showed these are not the bottleneck. Out of scope for §1c.28.
 * **M1 (sync-time fusion).** Destroys overlap.
 
-#### Status
+#### Status — UPDATED after smoke step 1
 
-* Design only. No code changes anywhere in this section.
-* Recommended primitive: `cuStreamWriteValue32` /
-  `cuStreamWaitValue32` over host-mapped pinned monotonic-
-  sequence slots. Events are a fallback only if graph capture
-  rejects the value-write path or host-mapped visibility
-  fails. Rationale: monotonic seq numbers make replay re-arm
-  unambiguous; events have a documented stale-signal trap
-  across repeated graph replays.
-* Mechanism M2 (value-signaled submit, host_fn sync) is the
-  least-risky first step. The standalone smoke (Step 1) MUST
-  pass before any vLLM integration. M3 is contingent and
-  designed but not coded until M2 lands.
-* Slab order is NOT assumed deterministic — signals carry
-  task_id (or use per-task slots) so FULL/PIECEWISE switching,
-  chunked prefill, ubatching, and spec decode can't break
-  correctness. Deterministic ordering is an optimization, not
-  the contract.
-* The M2 dryrun gate is calibrated as "≥50% of the §1c.27
-  `no_submit_hostfn` cgl delta" rather than a full match,
-  because M2 still records ONE captured value-write per
-  submit. The full no-submit number is an upper bound that
-  M2 cannot reach by construction.
-* The overlap regression gate is start-latency
-  (`submit_signal_to_worker_start_ns`), NOT just worker
-  compute medians. A worker that starts CPU GEMM late but
-  computes at full speed would pass a medians-only gate while
-  silently losing overlap.
+The standalone smoke
+(`David/Tests/phase1c/smoke_value_signal/`) measured the M2
+mechanism end-to-end. Result: **M2 kernel-counter submit
+replacement is REJECTED by latency** — recorded here as a
+measured rejected path, NOT the next prototype.
+
+Smoke summary (1,000 graph replays × 56 tasks):
+
+* Per-task slots: correctness-clean (56,000/56,000
+  observations, no stale/duplicate/invalid). The
+  shared-packed shape lost 0.6-1.3% of signals and is
+  rejected.
+* Signal-to-worker p50 ≈ **25.9 μs** (with `--sync-each`,
+  single-fire approximation). The §1c.24-measured
+  `cots:dispatch_cb` p50 is 1.45 μs — kernel-counter
+  signaling adds ~24 μs of start delay per op.
+* At B=1 / 56 ops × 128 forwards: +172 ms/generate of added
+  worker-start delay. The §1c.27 `no_submit_hostfn` cgl
+  drop was −93 ms. Net ≈ −79 ms (regression). M2 as
+  designed cannot land net positive on real-mode wall.
+
+(The comparison is directionally clear but not perfectly
+apples-to-apples: dispatch_cb p50 measures callback BODY
+duration; the smoke measures graph-launch-to-worker
+observation. The 17× margin is large enough to reject the
+mechanism without further refinement.)
+
+#### Repivot to M3 (sync-side replacement) as the next prototype
+
+§1c.27 measured submit-only ablation = **−93 ms cgl** vs
+sync-only = **−273 ms cgl**. The bigger lever is sync. M3
+also avoids the kernel-counter latency tax because:
+
+* **Submit stays as the existing `cudaLaunchHostFunc(dispatch_cb)`**
+  — cheap (1.45 μs p50), CPU work starts on time.
+* **Sync becomes a `cuStreamWaitValue32`-style wait** on a
+  worker-written monotonic done counter. The GPU stream
+  pauses until the worker signals done; no CPU-side
+  callback round-trip.
+
+This inverts the M2 design's structure: keep the cheap thing
+cheap; replace only the expensive stream-blocking thing.
+
+#### Required gate before any vLLM M3 integration
+
+Standalone M3 smoke
+(`David/Tests/phase1c/smoke_value_signal/m3_smoke.cu` —
+written next), mirroring step 1's structure but for the
+wait-side. Requirements:
+
+1. 1,000 captured graph replays.
+2. CPU worker writes monotonic done counter after fake work.
+3. GPU stream waits via captured `cuStreamWaitValue32` (or
+   equivalent kernel-poll if the literal-value approach has
+   replay re-arm issues).
+4. Per-task slots only (correctness contract from step 1).
+5. Assertions:
+   - No stale waits (GPU wait did not match a stale done
+     value from a previous replay).
+   - No drops or duplicates.
+   - No deadlock under repeated replay (timeout fail-fast).
+   - Bit-identical worker outputs across replays.
+6. Metrics:
+   - `wait_resume_to_next_step_ns` (overhead of the wait
+     primitive itself).
+   - cudaGraphLaunch wall delta vs the host_fn(sync) baseline.
+   - replay throughput.
+
+#### M3 decision tree after smoke
+
+* Smoke green AND wait-overhead p50 < ~5 μs AND
+  cudaGraphLaunch shows the expected sync-only reduction
+  pattern → prototype M3 behind a feature flag in vLLM.
+* Smoke green BUT wait-overhead is high (≥ host_fn cost) OR
+  cudaGraphLaunch doesn't shrink → M3 also unfeasible. Stop
+  chasing graph-mode host-callback replacement.
+  **`native_eager` becomes the practical Phase 1c landing
+  path** (already validated; +0.694 s/gen vs none_capture
+  per §1c.25 wall-clock landscape, comparable to
+  `native_capture_real` at +0.835 s; eager loses some graph-
+  capture benefit but avoids the host_fn tax entirely).
+* Smoke red (drops/stales/deadlock) → fall back to either
+  `native_eager` directly, OR a §1c.29 alternative path
+  (event-based with explicit generation counters; not yet
+  designed).
+
+#### Other status
 * Real-mode wall-clock upside is uncertain — §1c.27 measured
   in dryrun, where there is no CPU GEMM tail to leak. In real
   mode, removing host_fns may unmask CPU-GEMM completion as a

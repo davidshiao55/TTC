@@ -1,0 +1,21 @@
+{
+  "mode":"m3_kernel_spin_per_task",
+  "replays":1000,
+  "tasks":56,
+  "poll_ns":0,
+  "sync_each":true,
+  "expected_observations":56000,
+  "total_observed":56000,
+  "per_task_min":1000,
+  "per_task_max":1000,
+  "stale_signals":0,
+  "coalesced_advances":0,
+  "replay_wall_ns":146655254,
+  "per_replay_wall_us":146.66,
+  "request_to_obs_p50_ns":73374,
+  "request_to_obs_p90_ns":130796,
+  "request_to_obs_max_ns":193107,
+  "latency_samples":56000,
+  "combined_checksum":"0x0000000000007bf0",
+  "assertion_failures":0
+}

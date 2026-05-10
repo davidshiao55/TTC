@@ -177,10 +177,108 @@ revised to:
 3. Re-derive the wall-clock upper-bound estimate accounting
    for the start-delay tax.
 
+## Update — M3 sync-side smoke (`m3_smoke.cu`)
+
+After the M2 result above, the §1c.28 design was repivoted to
+M3 (sync-side replacement only). A second standalone smoke
+tests captured kernel-spin on a worker-written monotonic done
+counter under repeated graph replay.
+
+The kernel does atomicAdd to compute this fire's seq, writes
+seq to `req_slot[t]` (host-mapped pinned), then spins on
+`done_slot[t]` until `done >= seq`. Worker observes req
+advance, runs fake CPU work, writes done back. Per-task slots
+only.
+
+### Correctness (1,000 replays × 56 tasks)
+
+| poll | sync_each | total_observed | stale | per_task_min | per_task_max |
+|---|---|---|---|---|---|
+| busy | yes | **56,000** | 0 | 1,000 | 1,000 ✓ |
+| busy | no  | **56,000** | 0 | 1,000 | 1,000 ✓ |
+| yield | yes | **56,000** | 0 | 1,000 | 1,000 ✓ |
+
+All clean; deterministic checksum 0x7bf0 across configs.
+
+### Single-task latency (1,000 replays × 1 task — isolates
+per-fire cost without 56-task stack-up)
+
+| poll | per_replay_wall μs | request_to_obs p50 ns | p90 ns |
+|---|---|---|---|
+| busy-spin (poll=0) | **5.91** | **3,027** | 3,141 |
+| yield (poll=1) | 5.83 | 3,226 | 3,274 |
+| nanosleep 100 ns | 51.2 | 48,537 | 48,943 |
+
+Single-fire M3 kernel-spin + busy-spin worker: ~5.9 μs
+end-to-end. That's the per-fire overhead the captured graph
+pays for sync.
+
+### M3 viability — math closes positively
+
+§1c.27 measured: removing sync host_fn cuts cgl by 273 ms over
+156 launches × 56 sync fires per launch = **~31 μs per fire**
+of cgl wall saved by removing the host_fn round-trip.
+
+M3 kernel-spin replacement costs:
+- Single-task busy-spin: 5.91 μs per fire
+- 56-task amortized: 146 μs / 56 ≈ 2.6 μs per fire (in-stream
+  pacing once kernels are queued)
+
+**Per-fire delta: M3 saves ~25 μs vs host_fn(sync_cb).** Per
+generate at B=1, 56 ops × 128 forwards × 25 μs ≈ **+179 ms
+saved**. That's comparable to §1c.27's no_sync_hostfn cgl
+delta (273 ms upper bound) after subtracting the M3 mechanism's
+own overhead.
+
+### Real-mode caveat
+
+Both the existing host_fn(sync_cb) and M3 kernel-spin wait for
+the worker's CPU GEMM (~500 μs/MLP) before the captured stream
+proceeds. The savings come from the per-fire OVERHEAD on top
+of the CPU GEMM wait, which is independent of CPU GEMM
+duration. So the +179 ms estimate above should hold in
+real-mode too, modulo run-to-run variance.
+
+### M3 recommendation
+
+**Prototype M3 in vLLM behind a feature flag.** The smoke
+clears the reviewer's stated criteria:
+
+* No stale waits, no drops, no duplicates ✓
+* No deadlock ✓
+* Host-mapped visibility works ✓
+* cudaGraphLaunch impact: 5.9 μs per fire vs host_fn's 31 μs
+  per fire = **5×** faster mechanism ✓
+* Wait overhead: 3.0 μs request-to-obs p50 (busy-spin); ~25 μs
+  net savings per fire ✓
+
+Implementation will mirror the kernel-spin approach: each COTS
+op's captured graph fires `m3_request_and_wait_kernel(req_counter[t],
+req_slot[t], done_slot[t])` instead of the existing
+`cudaLaunchHostFunc(sync_cb, ...)`. Submit-side stays as the
+existing host_fn(dispatch_cb) — §1c.27 showed submit-only
+ablation cuts only 93 ms cgl, and §1c.28 Step 1 already showed
+M2 kernel-counter regresses on the submit side.
+
+### Alternate paths (lower priority unless M3 prototype fails)
+
+* **`cuStreamWaitValue32` with cyclic per-replay slots** — the
+  literal-value variant works if we cycle slot IDs across
+  replays modulo K. Requires K ≥ max-in-flight replays;
+  complexity vs benefit unclear.
+* **Switch to native_eager** — keep the existing host_fn path
+  but disable graph capture for the COTS forward. §1c.25
+  showed native_eager_dryrun is +0.382 s/gen vs none vs
+  native_capture_dryrun's +0.584 s/gen. Eager is +0.694 s
+  vs none on real-mode (§1c.25 wall-clock landscape) vs
+  capture's +0.835 s — a 141 ms gap that M3 should be able
+  to close.
+
 ## Artifacts
 
-* `value_signal_smoke.cu` — the test source.
-* `value_signal_smoke` — built binary (gitignored — regenerable
-  via the nvcc invocation above).
-* `result_*.json` — machine-readable per-config outputs.
-* `result_*.txt` — full stdout per config (where saved).
+* `value_signal_smoke.cu` — M2-side (submit-replacement) test.
+* `m3_smoke.cu` — M3-side (sync-replacement) test.
+* `value_signal_smoke`, `m3_smoke` — built binaries (gitignored).
+* `result_*.json` — machine-readable per-config outputs (M2 and
+  M3 both).
+* `result_*.txt` — full stdout per config (gitignored).
