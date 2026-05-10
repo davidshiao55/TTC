@@ -198,9 +198,32 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   native COTS Python overhead (present in eager too) +
   +201 ms graph-replay-specific (which the host_fn ablation
   more than eliminates: no_hostfn at +262 ms vs none, faster
-  than eager_dryrun's +383 ms). Mechanism for §1c.27 is
-  clear: reduce captured host_fn count from 56/forward to ≤2
-  via batched submit + sync. See §1c.26 below.
+  than eager_dryrun's +383 ms). Mechanism for §1c.28 is
+  clear: reduce the per-forward count of captured host_fns
+  (112 total = 56 submit + 56 sync, where 28 layers × 2
+  op_kinds = 56 per side) toward ≤2 via batched submit +
+  batched sync. See §1c.26 below.
+- §1c.27 (split host_fn ablation) — **DONE. Submit and sync are
+  stream-locked; both must be reduced together.** Two new env-
+  gated probe-only flags (VLLM_COTS_ABLATE_SUBMIT_HOSTFN /
+  VLLM_COTS_ABLATE_SYNC_HOSTFN), gated identically to §1c.26.
+  Six-arm matrix shows strong non-additivity: submit-only
+  ablation cuts `cudaGraphLaunch_v10000` by **−93 ms (3.9%)**;
+  sync-only by **−273 ms (11.3%)**; both together by **−2,362 ms
+  (97.7%)**. Naive additive expectation = −366 ms; actual when
+  both removed = −2,362 ms — 6.5× the additive. The submit and
+  sync host_fns act as a single stream-serialization unit:
+  removing one side leaves the other firing 56×/forward and
+  pausing the stream the same way. Implication for §1c.28: a
+  production mechanism that reduces only one side would land at
+  ~109-126 ms wall improvement (the partial cgl deltas), far
+  below the §1c.26 322 ms upper bound. Both candidate
+  mechanisms ("one batched submit + one batched sync per
+  forward" or "combine submit_qkv + submit_mlp per layer")
+  reduce both sides symmetrically and are consistent with this
+  finding. Mechanism selection now depends on the real-mode
+  overlap analysis, which §1c.27 does NOT measure. See §1c.27
+  below.
 
 ---
 
@@ -2225,8 +2248,9 @@ manual GUI work.
 ablation results):
 
 * **Captured-node count** (best current hypothesis). Coalesce
-  per-layer captured ops; fold host_fn fires from 56 to ≤4 per
-  forward; etc.
+  per-layer captured ops; fold host_fn fires from 112/forward
+  (56 submit + 56 sync, where 28 layers × 2 op_kinds = 56 per
+  side) toward ≤2 per forward; etc.
 * **Move D2H + UVA off the compute stream** onto a dedicated
   copy stream that's also captured. Reduces stream pause from
   host_fn nodes blocking compute kernels.
@@ -2364,21 +2388,23 @@ forward to as few as feasible** (the §1c.25 candidate the
 reviewer correctly told us not to start until ablation was
 complete). Two designs:
 
-1. **Coalesced submit + sync per forward.** Replace the 28
-   per-(layer, op_kind) submit + 28 per-(layer, op_kind) sync
-   pattern with: one batched submit at forward start +
-   one batched sync at forward end. Worker processes a list
-   of slabs in order. Reduces 56 host_fns → 2 per forward.
-   Risk: the worker no longer overlaps with per-layer GPU
-   work; CPU-GEMM tail latency potentially leaks past the
-   GPU window in real (non-dryrun) mode. The §1c.24 finding
-   that sync_cb_wait was NOT the bottleneck (capture is
-   FASTER than eager per-fire on sync_cb_wait p50) suggests
+1. **Coalesced submit + sync per forward.** Replace the 56
+   per-(layer, op_kind) submit + 56 per-(layer, op_kind) sync
+   pattern (28 layers × 2 op_kinds = 56 each side; 112 total
+   host_fns/forward) with: one batched submit at forward start
+   + one batched sync at forward end. Worker processes a list
+   of slabs in order. Reduces 112 → 2 host_fns per forward
+   (98% reduction). Risk: the worker no longer overlaps with
+   per-layer GPU work; CPU-GEMM tail latency potentially leaks
+   past the GPU window in real (non-dryrun) mode. The §1c.24
+   finding that sync_cb_wait was NOT the bottleneck (capture
+   is FASTER than eager per-fire on sync_cb_wait p50) suggests
    tail leak isn't a concern, but real-mode A/B is required.
 2. **Per-layer combined host_fn.** Keep per-layer
    submit-and-sync overlap but combine submit_qkv +
    submit_mlp into one host_fn (and likewise for sync).
-   Reduces 56 → 28 per forward.
+   Reduces 112 → 56 per forward (50% reduction); each side
+   goes from 56 to 28.
 
 Recommended: prototype design 1 first (bigger reduction,
 larger effect size; if it works in dryrun + real mode, no
@@ -2393,6 +2419,153 @@ draft §1c.27 prototype design.**
 
 * `David/Benchmarks/phase1c/results/diag_nsys_1c26/*.json`
   — bench wall-clock outputs (small).
+* `*.nsys-rep` traces gitignored (regenerable; commands and
+  env vars documented above).
+
+---
+
+### §1c.27 — split host_fn ablation: submit and sync are stream-locked
+
+#### Why split
+
+§1c.26 proved that captured `cudaLaunchHostFunc` is the 98% lever
+on `cudaGraphLaunch_v10000`, but it conflated submit/dispatch
+host_fns and sync host_fns. §1c.27 splits the test so the §1c.28
+mechanism design knows which side to target.
+
+#### Method
+
+Two new env-gated probe-only flags, gated identically to §1c.26
+(both `dry_run=True` AND `VLLM_COTS_DIAG=1`; misuse hard-fails
+with `RuntimeError`):
+
+* `VLLM_COTS_ABLATE_SUBMIT_HOSTFN=1` — skip ONLY the captured
+  `cudaLaunchHostFunc(dispatch_cb)`. Keep D2H, sync host_fn,
+  UVA.
+* `VLLM_COTS_ABLATE_SYNC_HOSTFN=1` — skip ONLY the captured
+  `cudaLaunchHostFunc(sync_cb)`. Keep D2H, submit host_fn,
+  UVA.
+* `VLLM_COTS_ABLATE_HOSTFN=1` (§1c.26 broad flag, retained as
+  a "submit+sync" macro).
+
+Implementation: extended `CotsCpuInfer::set_ablations(
+ablate_d2h, ablate_hostfn, ablate_submit_hostfn=false,
+ablate_sync_hostfn=false)`. The narrow flags compose with
+`ablate_hostfn` (a true on either skips the corresponding
+host_fn). Default false on all four.
+
+#### Wall-clock matrix (1 warmup + 1 measured iter)
+
+| arm | wall | Δ vs `none_capture` | Δ vs `native_capture_dryrun` |
+|---|---|---|---|
+| `none_capture` | 2.039 s | — | — |
+| `native_capture_dryrun_no_hostfn` (both) | 2.295 s | +256 ms | **−288 ms** |
+| `native_eager_dryrun` (control) | 2.421 s | +382 ms | −162 ms |
+| `native_capture_dryrun_no_sync_hostfn` | 2.457 s | +418 ms | **−126 ms** |
+| `native_capture_dryrun_no_submit_hostfn` | 2.474 s | +435 ms | **−109 ms** |
+| `native_capture_dryrun` (baseline) | 2.583 s | +544 ms | — |
+
+#### CUPTI `cudaGraphLaunch_v10000` (the §1c.25 localization point)
+
+| arm | cgl total ms | Δ vs baseline | % of baseline cgl |
+|---|---|---|---|
+| `native_capture_dryrun` (baseline) | 2,416.0 | — | — |
+| `native_capture_dryrun_no_submit_hostfn` | 2,322.7 | **−93.3 ms** | **3.9%** |
+| `native_capture_dryrun_no_sync_hostfn` | 2,143.0 | **−273.0 ms** | **11.3%** |
+| `native_capture_dryrun_no_hostfn` (both) | 54.4 | **−2,361.6 ms** | **97.7%** |
+
+#### Critical observation: strong non-additivity
+
+Naive additive expectation (submit-only + sync-only):
+−93 + (−273) = **−366 ms**. Actual when both are removed:
+**−2,362 ms** — 6.5× the additive expectation.
+
+**The submit and sync host_fns act as a stream-serialization
+unit.** Per forward: 28 layers × 2 op_kinds (qkv + mlp_block)
+= 56 submit fires + 56 sync fires = **112 captured host_fns
+total** (the §1c.24 marker-filtered NVTX confirmed n=7,168
+`cots:dispatch_cb` and n=7,168 `cots:sync_cb_wait` inside the
+measured iter, both = 56 × 128 forwards). Removing only submit
+leaves sync firing 56×/forward; each sync still pauses the
+stream. Removing only sync leaves submit firing 56×/forward;
+each submit still pauses. Only when both are removed does the
+captured stream stop pausing at host_fn boundaries entirely —
+and that's when cudaGraphLaunch returns near-instantly
+(54 ms vs 2,416 ms baseline).
+
+Submit and sync are NOT independent levers: a production
+mechanism that reduces only one side will get a small fraction
+of the benefit. Reducing both sides together (e.g., one batched
+submit + one batched sync per forward) is required to capture
+the §1c.26-style 322 ms wall improvement.
+
+#### Asymmetry between sync (−273 ms) and submit (−93 ms)
+
+Sync-side ablation cuts 3× more than submit-side, even though
+each side fires 56×/forward (same count). Hypothesis (not
+directly measured):
+sync's `task_queue_->sync(0)` involves a cv-wait whose
+acquire/notify pattern has higher driver-thread overhead than
+submit's `task_queue_->enqueue([...])`. In dryrun the worker
+has no work, so neither does meaningful CPU work — the
+asymmetry is in the host_fn round-trip cost itself.
+
+This is informative but doesn't change the §1c.28 design: even
+the sync-only ablation (most impactful single side) only
+recovers 11.3% of cgl. Both sides must be reduced together.
+
+#### What §1c.27 establishes
+
+* The host_fn pair (submit + sync) is one stream-serialization
+  unit; partial removal yields ~5-15% of the cgl benefit.
+* §1c.28 mechanism MUST reduce both submit and sync counts
+  symmetrically. Reducing only one side is a dead end.
+* The 322 ms wall upper bound (§1c.26 no_hostfn) is achievable
+  only with simultaneous reduction; partial designs (e.g.,
+  "fold submits but keep per-layer syncs") would land closer
+  to the 109-126 ms range — a lower ceiling than the §1c.26
+  number suggested.
+
+#### What §1c.27 does NOT establish
+
+* The exact mechanism by which one-side ablation leaves the
+  other side blocking the stream. The cv-wait hypothesis
+  above is consistent with the asymmetry but not directly
+  measured. A more granular trace (per-host_fn-invocation
+  duration via per-fire NVTX, or CUDA event timing across
+  cudaLaunchHostFunc nodes) would confirm.
+* Whether the asymmetry persists in real-mode (worker has CPU
+  GEMM work). In dryrun, sync's "wait for empty queue" is
+  trivial; in real mode it could be the dominant cost — but
+  §1c.24's marker-filtered NVTX showed `cots:sync_cb_wait`
+  median 18.2 μs in capture_real, so sync wait is small even
+  with real CPU work.
+
+#### Implication for §1c.28 design
+
+Both candidate mechanisms from §1c.26 reduce both sides:
+
+1. **One batched submit + one batched sync per forward**
+   (112 → 2 host_fns/forward; that's 56 submits → 1, 56 syncs
+   → 1). 98% reduction in node count; §1c.27 says symmetric
+   reduction is required, so this captures most of the
+   upper-bound benefit.
+2. **Combine the 2 op_kinds at each layer into one
+   submit + one sync per layer** (112 → 56 host_fns/forward;
+   that's 56 → 28 on each side). 50% symmetric reduction.
+
+Either is consistent with §1c.27's "both sides together" rule.
+The choice between them turns on the real-mode overlap risk
+(per-layer worker overlap with GPU GEMMs), which §1c.27 does
+NOT measure.
+
+**Status: split attribution complete; both sides must be
+addressed together. §1c.28 design draft can proceed.**
+
+#### Artifacts
+
+* `David/Benchmarks/phase1c/results/diag_nsys_1c27/*.json` —
+  bench wall-clock outputs.
 * `*.nsys-rep` traces gitignored (regenerable; commands and
   env vars documented above).
 
