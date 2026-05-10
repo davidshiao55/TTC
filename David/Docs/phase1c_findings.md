@@ -1596,9 +1596,14 @@ row counts:
 - `runtime_num_tokens` — live rows to compute. Set OUT OF GRAPH by
   `gpu_model_runner.execute_model` from
   `scheduler_output.total_num_scheduled_tokens` BEFORE every
-  forward. Always `runtime_num_tokens <= slab.num_tokens`. The
-  worker's `at::linear` shapes, scratch slicing, and y_pinned write
-  region key off this.
+  forward. Worker effective rows = `min(runtime_num_tokens,
+  slab.num_tokens)` (§1c.31 clamp); see §1c.31 below for the
+  rationale. Pre-§1c.31 the contract was the stronger
+  `runtime_num_tokens <= slab.num_tokens` enforced by TORCH_CHECK,
+  but that hard-failed under eager mode where the global override
+  applies to whatever slab fires next regardless of bucket size.
+  The worker's `at::linear` shapes, scratch slicing, and y_pinned
+  write region key off the clamped value.
 
 Plumb-through:
 1. `gpu_model_runner.execute_model` calls
@@ -1661,8 +1666,9 @@ mechanism makes the WORKER ignore that bucket and process only
 1. `set_runtime_num_tokens` smaller than bucket → worker processes
    only first n rows; rest of y_pinned untouched.
 2. `runtime_num_tokens=0` → fall back to `slab.num_tokens`.
-3. `runtime_num_tokens > slab.num_tokens` → hard-fail TORCH_CHECK
-   (worker exception surfaces on next Python call).
+3. `runtime_num_tokens > slab.num_tokens` → clamp to `slab.num_tokens`
+   AND increment `worker_clamp_override_count` (§1c.31 contract
+   change; was: hard-fail TORCH_CHECK pre-§1c.31).
 4. Negative value rejected at the Python boundary.
 
 Triple suite: phase1a 60, phase1b 80, phase1c 147 (143 + 4 new).
@@ -3148,6 +3154,17 @@ Three follow-ups on the §1c.29 wrap-up:
    directly. All 4 summaries now committed, each with metadata
    matching its rows.
 
+   Note on coverage: the three non-default summaries
+   (`summary_f10.json`, `summary_o256.json`,
+   `summary_o256_f10.json`) only ran the 3 production arms
+   (none_capture, cots_native_eager_real,
+   cots_m3_on_capture_real) — the dryrun and M3-off-capture
+   rows are `null` because those cells weren't executed at
+   those workload points. The default `summary.json` covers
+   all 7 arms. This is intentional (the production
+   M3-vs-eager decision metric only needs the 3 arms) but
+   means the non-default summaries are not full 7-arm grids.
+
 3. **§1c.29 status finalization.** With the expanded A/B,
    thread sweep, and workload grid all on record, the M3 path
    is locked as **implementation-correct, opt-in research
@@ -3685,17 +3702,22 @@ axes at B=1, this doesn't hold — capture's per-op overhead
 scales linearly with operations-per-generate, and there is
 no point in this grid where capture+M3 catches up.
 
-B=4 axis: not measured. Hit a pre-existing eager-path
-slab-sizing bug (`runtime_num_tokens=25 exceeds slab
-capacity (slab.num_tokens=8)`) at B=4 eager — slabs are
-sized from cudagraph_capture_sizes which doesn't cover the
-B=4 prefill demand at input_len=8. Not introduced by §1c.29;
-a separate Phase 1c eager-path issue. The production
-decision metric (M3 vs eager) can't be evaluated at B=4 in
-the current code state without fixing that bug first; out
-of scope here. Ironically capture+M3 succeeds at B=4 (it's
-the eager path that's broken), but the comparison can't be
-made.
+B=4 axis (measured after the §1c.31 clamp fix unblocked
+the eager path):
+
+| arm | s/gen |
+|---|---:|
+| native_eager_real_b4   | 3.3728 |
+| m3_on_capture_real_b4  | 3.5192 |
+| **M3 − eager**         | **−146.4 ms** (FAIL) |
+
+Same pattern as the B=1 grid — M3 loses to eager at B=4
+too. The original "slab-sizing bug" diagnosis here was
+wrong (corrected by the reviewer and resolved in §1c.31):
+the actual cause was the §1c.21 live-token override being
+applied as a required row count instead of a cap. See
+§1c.31 below; the clamp fix landed `worker_clamp_override_count
+= 133` for this B=4 eager run.
 
 **Aggregate decision across all of §1c.29's experiments**:
 captured+M3 wins at exactly one anomalous point (t=8 at
@@ -3706,8 +3728,10 @@ at that thread count. **§1c.29 M3 is not a default
 candidate at this hardware/model**; the flag stays opt-in.
 
 Future work that could change this verdict:
-1. Fix the eager-path slab-sizing bug so B=4 can be
-   measured.
+1. ~~Fix the eager-path slab-sizing bug so B=4 can be
+   measured.~~ Resolved in §1c.31 (clamp instead of
+   TORCH_CHECK). B=4 was measured post-fix and the M3
+   verdict is unchanged: −146.4 ms vs eager.
 2. Investigate why captured-graph per-op overhead is high
    on this build (the +88 → +277 ms scaling with workload
    size suggests something in the D2H / UVA / captured-
