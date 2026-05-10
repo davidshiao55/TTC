@@ -13,7 +13,13 @@ revision:
      replaces this if margin is tight).
   3. No correctness regression (parity test already covers).
 
-Four arms (matched baselines per §1c.18-style protocol):
+Seven arms (apples-to-apples per the commit-3-real review):
+  * none_capture                — graph-mode no-offload baseline.
+  * cots_native_eager_dryrun    — substrate gate, no capture.
+  * cots_native_eager_real      — substrate + real CPU GEMM, no
+                                  capture; the production
+                                  alternative M3 must beat to
+                                  justify a default flip.
   * cots_m3_off_capture_dryrun  — baseline substrate, M3 off.
   * cots_m3_on_capture_dryrun   — substrate A/B, M3 on.
   * cots_m3_off_capture_real    — production baseline, M3 off.
@@ -254,7 +260,8 @@ def main() -> None:
         "--only-arms",
         nargs="*",
         default=None,
-        help="Subset of arms to run; default = all 4 (M3 off/on × dryrun/real)",
+        help="Subset of arms to run; default = all 7 (none_capture + "
+        "native_eager × {dryrun,real} + m3 × {off,on} × {dryrun,real})",
     )
     ap.add_argument("--num-iters", type=int, default=2)
     ap.add_argument("--num-iters-warmup", type=int, default=1)

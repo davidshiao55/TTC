@@ -3507,6 +3507,66 @@ sign.
    for B=1 decode at this f is `enforce_eager=True` +
    `cots_m3_wait_kernel=False`.
 
+#### Thread-policy sweep — M3-vs-eager IS thread-count
+sensitive (commit-3-real follow-up)
+
+Per the reviewer's hunch that lower thread counts may favor
+eager differently than M3. Same workload (Qwen2.5-7B BF16,
+decode 8→128, B=1, f=0.05, 2 warmup + 3 measured iters,
+single harness/session) swept across CPU thread counts:
+
+| t  | none_capture | eager_real | m3_on_real | M3 − eager | Verdict |
+|---:|---:|---:|---:|---:|:---:|
+|  4 | 2.0317 | 2.4870 | 2.6484 | **−161.4 ms** | FAIL |
+|  8 | 2.0318 | **2.8501** | **2.7815** | **+68.6 ms** | **PASS** |
+| 16 | 2.0323 | 2.6079 | 2.6961 | −88.3 ms | FAIL |
+| 24 | 2.0317 | 2.5331 | 2.5961 | −63.0 ms | FAIL |
+
+Reading: **M3 beats eager only at t=8** in this sweep.
+
+* `none_capture` is flat (~2.032 s) — no-offload baseline is
+  thread-invariant as expected.
+* `native_eager_real` shows a dramatic spike at t=8
+  (2.8501 s) vs neighboring 2.4870 / 2.6079 / 2.5331 at
+  t=4/16/24. Eager CPU work cost (real − dryrun) at t=8 is
+  **+478.4 ms**, vs +135.6 / +255.1 / +186.6 ms at the other
+  thread counts. Looks like a CPU/GPU contention / oneDNN
+  thread-scaling step at t=8 specifically — main-thread CUDA
+  dispatch and the worker thread pool collide at this point.
+* `m3_on_capture_real` is more thread-stable (2.6484 →
+  2.7815 → 2.6961 → 2.5961). The captured wait-kernel path
+  decouples CPU/GPU at the substrate level — eager doesn't
+  have that decoupling, so it's exposed to whatever the OS
+  scheduler does at each thread count.
+* Net: **the reviewer was right** that this is a thread-policy
+  issue, not a graph-design failure. M3 narrows the variance;
+  whether it WINS depends entirely on whether the eager path
+  happens to land in a contention-bad thread count.
+
+This does NOT justify flipping the default. The result is
+brittle:
+
+1. M3-vs-eager PASS at t=8 is contingent on eager being
+   pathological at t=8. The "win" is "M3 isn't as bad as
+   eager-at-t=8", not "M3 is fundamentally faster".
+2. At every other tested thread count (4/16/24), eager wins
+   outright.
+3. The Planner can pick t=16 or t=24 for the eager path
+   directly and beat captured+M3 at every workload point
+   measured here.
+
+**Production guidance is unchanged**: at B=1 decode at
+f=0.05, `enforce_eager=True` with the legacy sync_cb path
+remains the recommended configuration; pick t=24 (or
+whatever the per-bucket sweep produces). M3 stays opt-in.
+
+What the sweep is good for: the thread-stability profile
+(M3 has lower variance across t) suggests M3 may be the
+better path under workloads where eager-real's optimum is
+unstable — e.g., longer decodes that mix bucket sizes. A
+B-and-output-len sweep is the next concrete step before any
+default-flip reconsideration.
+
 #### Design warning: SM occupancy from spin-wait
 
 The wait kernel busy-spins (with PTX `nanosleep` between
