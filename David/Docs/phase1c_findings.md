@@ -157,26 +157,34 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   should extend NVTX coverage to model-forward boundaries,
   attention, and the scatter path before any optimization
   attempt. See §1c.24 below for the controlled tables.
-- §1c.25 (non-COTS attribution) — **DIAGNOSTIC COMPLETE for the
-  dryrun gap; mechanism not yet pinned.** Extended NVTX to
+- §1c.25 (non-COTS attribution) — **DIAGNOSTIC COMPLETE; ABLATION
+  REQUIRED before mechanism selection.** Extended NVTX to
   `cots:execute_model` / `cots:model_forward[FULL|PIECEWISE|NONE]`
   (env-gated, fast-path skipped when `VLLM_COTS_DIAG=0`).
-  Marker-bounded decomposition of `native_capture_dryrun −
-  none_capture` (+0.571 s/generate, CPU-GEMM-independent): GPU
-  kernel sum delta +180 ms (~32%), D2H memcpy delta +7 ms (~1%).
-  CUPTI runtime API table inside the marker shows the time
-  concentrates in `cudaGraphLaunch_v10000`: same call count
-  (156) as `none_capture`, but +2,422 ms of CPU time spent
-  inside the call. Per-forward NVTX `cots:model_forward[FULL]`
-  median goes from 199 μs (none) to 19,178 μs (dryrun) on the
-  127 FULL-replay decode forwards — 96× slower, consistent
-  with the cudaGraphLaunch finding. The captured-node-count
-  hypothesis (56 host_fn + 28 D2H + 28 UVA per forward × 128 =
-  ~14,300 extra captured node fires/generate) is *consistent*
-  with the +2,422 ms CUPTI delta but **not directly measured by
-  it** — would need per-graph-node attribution to confirm. DO
-  NOT implement another optimization until that is closed. See
-  §1c.25 below.
+  Marker-bounded findings for `native_capture_dryrun −
+  none_capture` (+0.571 s/generate, CPU-GEMM-independent):
+  - The dryrun gap **localizes inside `cudaGraphLaunch_v10000`**:
+    same 156 calls inside the marker (= 127 FULL decode launches
+    + ~28 PIECEWISE prefill chunks; NOT capture warmups, which
+    are outside the marker), but +2,422 ms of CPU time spent
+    inside the call. Runtime API sums are not an additive
+    wall-clock budget; this is a localization, not an exact
+    breakdown.
+  - SQLite per-graph-node attribution via `graphNodeId` on
+    `KERNEL` and `MEMCPY` activity tables: captured-GPU-work
+    delta is **+228 ms** (mostly `triton_poi_fused_7` at +145 ms
+    plus the COTS UVA / D2H / smaller fused kernels). Directly
+    measured.
+  - **+343 ms residual is not attributable from SQLite alone**:
+    captured `cudaLaunchHostFunc` nodes are not exposed as a
+    separate CUPTI activity table. Strongly suspected (stream
+    pause + driver dispatch) but unmeasured.
+  Next required step: diagnostic ablation (probe-only, NOT
+  production code) — dryrun with host_fn nodes no-op'd, dryrun
+  without D2H captured nodes, dryrun without UVA captured nodes
+  — and re-measure `cudaGraphLaunch_v10000` delta per ablation.
+  That identifies which node class moves the cudaGraphLaunch
+  wall before §1c.26 mechanism selection. See §1c.25 below.
 
 ---
 
@@ -2033,56 +2041,89 @@ time.)
 
 #### Critical-path conclusion for §1c.25
 
-The +0.571 s/generate dryrun overhead is **directly attributable
-to extra time spent inside `cudaGraphLaunch`**:
+The +0.571 s/generate dryrun gap **localizes to time spent
+inside `cudaGraphLaunch`**, but the runtime API table is a
+sum of host-call durations, not an additive wall-clock budget:
 
-* `cudaGraphLaunch` is called the same number of times in dryrun
-  and none_capture (156 each — 28 capture warmups + 128 measured
-  forwards), but each call returns ~15.5 ms later in dryrun
-  (avg 15.7 ms per call) vs ~0.16 ms in none_capture.
-* The captured graph in dryrun contains 56 cudaLaunchHostFunc
-  nodes per forward (28 dispatch_cb + 28 sync_cb), 28 captured
-  cudaMemcpyAsync (D2H, bucket-sized), 28 captured Triton UVA
-  kernels, plus the GPU GEMMs that none_capture also has.
-* `cudaGraphLaunch` blocks until certain captured nodes finish.
-  cudaLaunchHostFunc nodes pause the stream until the host
-  callback returns; with 56/forward, even fast dryrun host_fns
-  add up. The ~+15.5 ms/call of cudaGraphLaunch time is
-  consistent with that — but the CUPTI table does not directly
-  attribute the time to specific captured-node types.
+* `cudaGraphLaunch` is called the same number of times in
+  dryrun and none_capture (156 each, both inside the marker
+  for the 1 measured iter). Of those, 127 are FULL-mode decode
+  graph launches (= 1 per decode forward) and ~28 are
+  PIECEWISE chunk launches for the prefill (FULL_AND_PIECEWISE
+  splits the prefill across attention boundaries; one
+  cudaGraphLaunch per piece). That's 127 + 28 ≈ 156, give or
+  take a setup launch. **The 156 are NOT capture warmups —
+  warmups happen during engine init, before the marker.**
+* Per-call cudaGraphLaunch time goes from 0.16 ms (none) to
+  15.7 ms avg (dryrun) — a ~100× increase **without changing
+  the call count**.
+* Bench wall-clock delta is +571 ms, while cudaGraphLaunch
+  CUPTI sum delta is +2,422 ms. These don't equate — runtime
+  API durations measure CPU time inside the call, which can
+  overlap with engine subprocess sampling/scheduler work and
+  is amortized by async patterns. The signal is "this is where
+  the runtime spends the added CPU time," not "this is the
+  wall-clock budget."
 
-**Hypothesis** (consistent with the CUPTI signal but not
-directly measured by it): the dominant factor is captured-node
-count — specifically the cudaLaunchHostFunc / cudaMemcpyAsync /
-Triton-UVA fan-out. Order of magnitude:
+#### Per-graph-node attribution via SQLite (extends CUPTI runtime)
 
-* 56 cudaLaunchHostFunc × 128 forwards × ~30 μs ≈ 215 ms
-* 28 captured cudaMemcpyAsync × 128 × ~20 μs ≈ 72 ms
-* 28 captured Triton UVA × 128 × ~5 μs ≈ 18 ms
-* cudaGraphLaunch wrapper × 128 × ~80 μs ≈ 10 ms
+`CUPTI_ACTIVITY_KIND_KERNEL` and `CUPTI_ACTIVITY_KIND_MEMCPY`
+both carry `graphNodeId` for nodes captured inside CUDA graphs.
+Inside the marker, grouped by node:
 
-Sum ≈ 315 ms — close to the wall-clock delta of +571 ms with
-some slack for stream-serialization effects beyond per-node
-dispatch. The hypothesis is *consistent* with both the CUPTI
-runtime delta (+2422 ms in cudaGraphLaunch) and the wall-clock
-delta (+571 ms after async overlap with engine work).
+| node class | dryrun (count, unique nodes, sum_ms) | none (count, unique nodes, sum_ms) | dryrun−none |
+|---|---|---|---|
+| `gemvx::kernel<...>` (cublas BF16) | 14,224 / 112 / 1,760 ms | 14,224 / 112 / 1,768 ms | ~0 |
+| `triton_poi_fused_7` (COTS-installed) | 3,456 / 54 / 145 ms | — | **+145 ms (NEW)** |
+| `flash_fwd_splitkv*` (attention) | 7,112 / 56 / 62 ms | 7,112 / 56 / 59 ms | +3 ms |
+| `_uva_copy_kernel` (COTS UVA) | 7,168 / 112 / 11.8 ms | — | **+12 ms (NEW)** |
+| `triton_red_fused_4` | 3,456 / 54 / 10 ms | — | +10 ms |
+| `cutlass...wmma_tensorop` | 28 / 28 / 17 ms | 112 / 112 / 14 ms | +3 ms |
+| `reshape_and_cache_flash` | 3,556 / 28 / 6 ms | 3,556 / 28 / 6 ms | ~0 |
+| MEMCPY D2H (COTS) | 7,168 / 112 / 7.1 ms | — | **+7 ms (NEW)** |
+| MEMCPY D2D | 3,556 / 28 / 3 ms | 7,112 / 56 / 6 ms | −3 ms |
 
-**What the trace cannot prove:** the exact split among the
-captured-node types. To confirm "captured-node count" as the
-mechanism, we'd need either (a) per-graph-node attribution
-(Nsight Systems' captured-graph node timeline view, manually
-inspected), or (b) a controlled prototype that reduces one
-node type and re-measures the cudaGraphLaunch delta. The
-CUPTI runtime table establishes that the time IS spent inside
-cudaGraphLaunch; it does not establish that captured-node
-count is the lever to reduce it.
+Net captured-GPU-work delta dryrun − none, summed across
+captured kernels + memcpys: **~+228 ms** (mostly
+`triton_poi_fused_7` at +145 ms, plus the COTS UVA + D2H +
+small triton fused kernels). This figure is directly measured
+from the CUPTI tables.
 
-Marker-bounded GPU-side breakdown (separate from runtime API):
+Wall-clock delta is +571 ms; captured-GPU-work delta accounts
+for ~+228 ms of that. **The remaining ~+343 ms is unattributed
+by the kernel + memcpy graphNodeId tables** — most likely
+captured `cudaLaunchHostFunc` nodes (which are not exposed as
+a separate CUPTI activity table and therefore can't be
+graphNodeId-grouped from SQLite alone). NVTX sums for
+`cots:dispatch_cb` (~10 ms) + `cots:sync_cb_wait` (~3.7 ms)
+account for direct host_fn execution time but NOT for the
+stream-pause-while-host_fn-runs serialization that propagates
+into cudaGraphLaunch wall.
 
-* GPU kernel sum delta: +180 ms (captured Triton UVA + small
-  dummy kernels). ~32% of the +571 ms wall.
-* D2H memcpy delta: +7 ms — small (54 MB at PCIe speeds).
-* H2D memcpy delta: ~0 — weight-prefetch overlaps with compute.
+#### What §1c.25 establishes (and does not)
+
+What is firmly established (direct measurement):
+
+* The dryrun gap lives **inside the graph replay /
+  `self.model(...)` window**, NOT in the COTS C++ worker /
+  D2H byte traffic / UVA byte traffic.
+* The `cudaGraphLaunch_v10000` runtime API call is where the
+  +2,422 ms of CPU time concentrates (CUPTI runtime table).
+* Of the +571 ms wall-clock delta, **+228 ms is captured-GPU-
+  work** (kernels + memcpys, attributed by graphNodeId). The
+  largest single component is `triton_poi_fused_7` (+145 ms)
+  — a COTS-installed Triton fused kernel.
+
+What is NOT firmly established:
+
+* The remaining +343 ms wall-clock delta is unattributed.
+  Strongly suspected: captured `cudaLaunchHostFunc` nodes
+  (stream pause + driver dispatch), which CUPTI does not
+  expose as a separate activity table.
+* Whether reducing any specific captured-node class would
+  actually move the cudaGraphLaunch wall. The CUPTI runtime
+  table localizes the cost; it does not measure node-by-node
+  contribution to cudaGraphLaunch wall.
 
 #### What this trace cannot prove
 
@@ -2128,35 +2169,56 @@ What is **NOT** firmly established:
   attribution (Nsight Systems node-level timeline view) or a
   controlled prototype.
 
-#### Hypotheses for §1c.26 (do not implement until validated)
+#### Next required step: diagnostic ablation, not production prototype
 
-Ordered by best-current-hypothesis match to the CUPTI signal:
+Per the §1c.24 gate ("do not implement another optimization
+until the timeline proves the bottleneck"), the captured-node-
+count hypothesis is **NOT yet eligible** for production
+prototyping. The +343 ms residual is suspected (host_fn stream
+serialization) but unmeasured. The next step is a **diagnostic
+ablation** that ABLATES one captured-node class at a time
+inside the dryrun graph — not a permanent mechanism — and
+re-measures `cudaGraphLaunch_v10000` runtime delta + wall-clock
+delta:
 
-1. **Captured-node count** (best current hypothesis). Coalesce
-   per-layer captured ops — fewer cudaMemcpyAsync, fewer
-   cudaLaunchHostFunc — and re-measure cudaGraphLaunch wall.
-   If cudaGraphLaunch time drops proportionally, mechanism
-   confirmed.
-2. **Host-callback stream serialization.** cudaLaunchHostFunc
-   pauses the stream until the host_fn returns. Reduce
-   host_fn fires from 56 to ≤4 per forward (one batched
-   submit + one batched sync) and re-measure.
-3. **D2H/UVA on compute stream contention.** Move both off the
-   compute stream onto a dedicated copy stream that's also
-   captured. Larger blast radius; low priority unless 1 and 2
-   miss.
+1. **dryrun − host_fn nodes**: replace each `cudaLaunchHostFunc`
+   with a no-op host_fn that returns immediately, OR remove
+   them entirely from the captured graph (would break sync
+   semantics; needs to be a controlled probe, not production
+   code). Re-measure cudaGraphLaunch wall.
+2. **dryrun − D2H nodes**: skip the captured `cudaMemcpyAsync`
+   per layer. Worker reads stale pinned data; output is garbage
+   but timing is what we measure. Re-measure.
+3. **dryrun − UVA nodes**: skip the Triton UVA kernel. Same
+   approach.
 
-**Recommended next step BEFORE any of the above:** add CUPTI
-graph-node attribution (or open one trace in Nsight Systems'
-GUI and inspect captured-graph node timeline manually) to
-confirm which captured-node type accounts for the bulk of the
-cudaGraphLaunch wall. That keeps the §1c.24 gate rule honored:
-"Do not implement another optimization until the timeline
-proves the bottleneck."
+Each ablation tells us how much of the +571 ms wall (and
++2,422 ms cudaGraphLaunch CPU time) that node class
+contributes. Once the dominant class is identified, design
+§1c.26 around that.
 
-**Status: diagnostic complete with one outstanding question
-(per-node attribution within cudaGraphLaunch). Mechanism
-selection deferred until that is closed.**
+**Why ablation, not GUI inspection:** Nsight Systems' captured-
+graph node timeline view exists but requires manual inspection
+on a host with the GUI; the SQLite tables already exhausted
+what's available CLI-side (kernels + memcpys via graphNodeId,
+host_fn nodes not exposed as a separate activity table). An
+ablation in code gives a quantitative answer per class without
+manual GUI work.
+
+**Mechanism candidates** (deferred — selection waits on
+ablation results):
+
+* **Captured-node count** (best current hypothesis). Coalesce
+  per-layer captured ops; fold host_fn fires from 56 to ≤4 per
+  forward; etc.
+* **Move D2H + UVA off the compute stream** onto a dedicated
+  copy stream that's also captured. Reduces stream pause from
+  host_fn nodes blocking compute kernels.
+* **Stream serialization** redesign — non-blocking host_fns
+  (cudaStreamCreateWithPriority + dedicated host_fn stream).
+
+**Status: diagnostic complete; ablation step required before
+mechanism selection.**
 
 #### Artifacts
 
