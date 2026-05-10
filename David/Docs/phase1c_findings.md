@@ -3342,11 +3342,18 @@ Revised gate:
    the Qwen2.5-7B real-model anchor (or its FastTTS-equivalent).
    The synthetic stub's per-forward μs delta does not translate
    directly — only the real-model wall is gating.
-2. **Spin-cost budget**: `m3_wait_spin_iters_total × 100 ns ≤
-   10% of (sync_cb_wait_total_ns saved)`. Captures the actual
-   SM time burned versus the actual driver-thread time recovered.
-   If spin time approaches the savings, the wait kernel is
-   actively losing the substrate trade.
+2. **Spin-cost budget**: `m3_wait_spin_iters_total × ~100 ns ≤
+   10% of (sync_cb_wait_total_ns saved)`. The `~100 ns` figure
+   is the PTX `nanosleep.u32 100` hint, NOT a guaranteed wall-
+   clock nanosecond — actual per-iteration time depends on SM
+   scheduler behavior and occupancy. Use it as a gate-level
+   estimate; for the real-model run, confirm against an nsys
+   trace of the wait-kernel duration if the budget margin is
+   close (the synthetic stub is currently at ~6% headroom out
+   of a 10% budget so the estimate is safe; tightening would
+   warrant a measured number). The intent of the metric is the
+   same: actual SM time burned vs actual driver-thread time
+   recovered.
 3. **No correctness regression**: phase1a/1b/1c suites green;
    bit-equivalent captured-replay output between M3-on and M3-off
    (already covered by `test_m3_parity_with_baseline.py`).
@@ -3368,9 +3375,12 @@ f_cpu_store=0.10, n_iters=200; committed at
 | real_m3_on    | 288.3 | 153 | 1615 | 91.34 % | 10514 | 6.5 |
 
 Substrate-positive on both arms despite real-mode 91% lagging:
-spin time ≈ 10514 × 100 ns ≈ 1.05 ms aggregated across all
-real-mode fires, against 18.0 ms of `sync_cb_wait_total_ns` that
-M3 removed. ~6 % of the savings paid back as spin — net win.
+estimated spin time ≈ 10514 × ~100 ns ≈ ~1.05 ms aggregated
+across all real-mode fires (estimate based on the PTX
+`nanosleep.u32 100` hint; not nsys-confirmed), against
+18.0 ms of measured `sync_cb_wait_total_ns` that M3 removed.
+~6 % of the savings paid back as spin — net win at the gate
+level; tightening this would require an nsys trace.
 
 This synthetic result is encouraging but is **NOT** a real-model
 acceptance. The flag stays `cots_m3_wait_kernel=False` until the
