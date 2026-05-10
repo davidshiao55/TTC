@@ -19,10 +19,29 @@ Four arms (matched baselines per §1c.18-style protocol):
   * cots_m3_off_capture_real    — production baseline, M3 off.
   * cots_m3_on_capture_real     — M3 candidate.
 
-DIAG=1 should be set before invoking this bench so the diag
-counters (m3_immediate_resume_count, m3_lagging_wait_count,
-m3_wait_spin_iters_total, sync_cb_wait_total_ns) are captured
-into the per-arm JSON for the spin-budget computation.
+Two env vars are required for the spin-budget gate to be
+populated:
+  * VLLM_COTS_DIAG=1 — enables the diag wait kernel that
+    increments `m3_immediate_resume_count`,
+    `m3_lagging_wait_count`, `m3_wait_spin_iters_total`. Without
+    this the production wait kernel runs and the M3 counters
+    stay zero.
+  * VLLM_COTS_DUMP_COUNTERS=1 — registers the atexit dump in
+    `cots_ops._dump_counters_at_exit` (cots_ops.py:451) that
+    writes per-runner counters to stderr at EngineCore process
+    exit. The harness parses these from the .log file next to
+    the .json. Without this env, the .log has no counter dump
+    and the spin-budget computation is skipped.
+
+Counter reset caveat (commit-3-real review note): the front-end
+side `_diag_pre` reset in latency.py runs in the bench process,
+NOT in the EngineCore subprocess that owns the CotsCpuInfer
+counters. So under multiproc=spawn the dumped counters span
+ALL warmup + measured iters, not just the measured window. The
+spin-budget RATIO (spin / sync_cb_wait_total_ns saved) is
+scale-invariant as long as both arms ran the same warmup + iter
+count, but absolute per-generate numbers should be divided by
+the total generate count if they're reported.
 
 Outputs go to `David/Benchmarks/phase1c/results/m3_qwen/`.
 
@@ -151,11 +170,18 @@ def parse_avg(path: Path) -> float | None:
 
 def parse_cots_counters(path: Path) -> dict[str, int]:
     """Best-effort extract `[cots]` counter dump from the bench log
-    (printed at process exit when VLLM_COTS_DUMP_COUNTERS=1 OR
-    VLLM_COTS_DIAG=1 — see cots_ops.py:425). The bench launches
-    `vllm bench latency` as a subprocess that exits cleanly; the
-    dump lands in the .log next to the .json. Returns {} when the
-    dump isn't found."""
+    (printed at process exit when VLLM_COTS_DUMP_COUNTERS=1 — see
+    cots_ops.py:_dump_counters_at_exit at cots_ops.py:451). The bench
+    launches `vllm bench latency` as a subprocess that exits cleanly;
+    the dump lands in the .log next to the .json. Returns {} when the
+    dump isn't found.
+
+    NB: VLLM_COTS_DIAG=1 controls whether the diag wait kernel runs
+    (gating m3_immediate_resume_count / m3_lagging_wait_count /
+    m3_wait_spin_iters_total at increment time);
+    VLLM_COTS_DUMP_COUNTERS=1 controls whether the atexit dump fires
+    (gating whether we can READ the counters). Both are needed for
+    the M3 spin-budget gate."""
     log_path = path.with_suffix(".log")
     if not log_path.exists():
         return {}

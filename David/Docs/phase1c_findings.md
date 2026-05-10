@@ -3387,41 +3387,84 @@ acceptance. The flag stays `cots_m3_wait_kernel=False` until the
 Qwen2.5-7B real-model anchor delivers the wall-clock win against
 the revised gate.
 
-Real-model A/B (Qwen2.5-7B BF16, decode 8→128, B=1, t=16, f=0.05,
-2 warmup + 3 iters; harness `bench_m3_qwen.py`; artifacts under
-`David/Benchmarks/phase1c/results/m3_qwen/`):
+Real-model A/B (Qwen2.5-7B BF16, decode 8→128, B=1, t=16, f=0.05;
+harness `bench_m3_qwen.py`):
 
-| Arm | s/gen | Δ vs off | Counters (M3 on) |
-|---|---:|---:|---|
-| dryrun M3 off | 2.5327 | — | sync_cb_count=… |
-| dryrun M3 on  | 2.3884 | **+144.2 ms** | imm/lag=…/… |
-| real   M3 off | 2.7826 | — | sync_cb_wait=92.86 s |
-| real   M3 on  | 2.6961 | **+86.5 ms** | imm=158, lag=40834 (99.6 %), spin=9.15 e7 |
+Wall (2 warmup + 3 measured iters, stable wall-clock; artifacts
+under `David/Benchmarks/phase1c/results/m3_qwen/`):
+
+| Arm | s/gen | Δ vs off |
+|---|---:|---:|
+| dryrun M3 off | 2.5327 | — |
+| dryrun M3 on  | 2.3884 | **+144.2 ms** |
+| real   M3 off | 2.7826 | — |
+| real   M3 on  | 2.6961 | **+86.5 ms** |
+
+Counters (1 generate, 0 warmup — isolated to exactly one
+generate so the spin/sync ratio is per-generate clean; artifacts
+under `David/Benchmarks/phase1c/results/m3_qwen_isolated/`).
+Reason for the separate run: the front-end side `_diag_pre`
+reset in `latency.py:136` runs in the bench process, NOT in
+the EngineCore subprocess that owns the CotsCpuInfer counters
+(`multiproc=spawn`), so dumps under `2 warmup + 3 iters` span
+all 5 generates. Per-generate isolation requires `--num-iters 1
+--num-iters-warmup 0`:
+
+| Counter | M3 off | M3 on |
+|---|---:|---:|
+| `runtime_set_calls` | 128 | 128 |
+| `worker_run_count`  | 12,320 | 12,320 |
+| `sync_cb_count`     | 12,320 | 0 |
+| `sync_cb_wait_total_ns` | **91.51 s** | 0 |
+| `m3_immediate_resume_count` | 0 | 70 |
+| `m3_lagging_wait_count` | 0 | 12,250 |
+| `m3_wait_spin_iters_total` | 0 | 90,708,502 |
+
+Per-fire sync-cb wait (M3 off): 91.51 s / 12,320 fires =
+**~7.4 ms/fire** displaced — this is the average driver-thread
+block per COTS sync point at f_cpu_store=0.05 on Qwen2.5-7B.
 
 Acceptance check:
-* Real wall delta **+86.5 ms/generate ≥ +50 ms** → **PASS** (gate 1).
-* Spin estimate `9.15 e7 × ~100 ns = ~9.15 s` against
-  `92.86 s` recovered sync_cb wait = **9.9 % ≤ 10 %** → **PASS at
-  the estimate level** (gate 2). The margin is at the boundary;
-  the 100 ns figure is the PTX hint, not a measured ns. An nsys
-  trace of the wait kernel would confirm whether the actual
-  wall-time per iteration is below or above the hint. Wall-clock
-  (gate 1) is the load-bearing signal and is comfortably positive.
-* Parity test green (gate 3): see `test_m3_parity_with_baseline.py`.
+* Real wall delta **+86.5 ms/generate ≥ +50 ms** → **PASS**
+  (gate 1).
+* Spin estimate (isolated): `90,708,502 × ~100 ns = ~9.07 s`
+  against `91.51 s` recovered sync_cb_wait_total_ns =
+  **9.91 % ≤ 10 %** → **PASS at the estimate level** (gate 2).
+  The 100 ns figure is the PTX `nanosleep.u32 100` hint, NOT a
+  measured ns; the margin is on the 10 % boundary so the gate
+  is sensitive to the hint accuracy. An nsys trace of the wait
+  kernel duration would settle whether the real per-iter is
+  below or above 100 ns. Wall-clock (gate 1) is the
+  load-bearing signal and is comfortably positive (73 % over
+  the bar).
+* Parity test green (gate 3): `test_m3_parity_with_baseline.py`.
 
-Diag canary at 7B scale: 99.6 % lagging — the GPU window
-essentially never covers a full transformer-layer worth of CPU
-GEMM at this model size. M3 still wins because each lagging fire
-spins for ~2240 iters on average (90.4 e6 / 40834), and the
-nanosleep-based spin remains cheap relative to the displaced
-host_fn driver-thread block.
+Diag canary at 7B scale: **99.43 % lagging** (12,250 lag /
+12,320 fires) — the GPU window essentially never covers a
+full transformer-layer worth of CPU GEMM at this model size.
+M3 still wins because each lagging fire spins for ~7,400 iters
+on average (90,708,502 / 12,250) ≈ **~740 µs per lag fire**
+(estimate at 100 ns/iter), against the displaced ~7.4 ms/fire
+sync_cb host_fn driver-thread block — roughly a **10× win per
+fire** on the substrate trade.
 
 This is a real-model PASS at the synthetic-stub-confirmed gate
-shape. **Default still `cots_m3_wait_kernel=False`** — the win
-is real but the spin budget is on the boundary; flipping the
-default would require either an nsys-measured spin time inside
-budget OR a wider margin on a longer-decode workload (e.g.,
-output_len=256, B=4) that re-establishes a comfortable cushion.
+shape. **Default stays `cots_m3_wait_kernel=False`.** Reasons
+for not flipping the default yet:
+
+1. Spin budget margin is on the 10 % boundary; the 100 ns
+   figure is a PTX hint not a wall-clock measurement. An
+   nsys-traced wait-kernel duration would either confirm
+   inside-budget OR reveal headroom we don't currently have.
+2. Counter reset hook (`latency.py:_diag_pre` →
+   `cots_ops.reset_all_counters`) runs in the wrong process
+   under multiproc=spawn, so warm+measured arm runs need the
+   isolated `--num-iters 1` workaround to produce clean
+   per-generate counters. Plumbing a reset into EngineCore
+   would close that.
+3. Want a wider-margin run on longer decodes
+   (output_len=256, B=4) before flipping — current data
+   covers only one workload point.
 
 #### Design warning: SM occupancy from spin-wait
 
