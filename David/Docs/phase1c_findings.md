@@ -314,8 +314,12 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   captured graph replaces `cudaLaunchHostFunc(sync_cb)` with
   `m3_wait_kernel` before UVA. Old sync host_fn path stays
   as fallback. Validation: 3 unit tests (smoke, install
-  gates, parity) + dryrun A/B + real A/B. Acceptance: real
-  wall ≥ +50 ms/generate AND lagging_wait < 50% of fires.
+  gates, parity) + dryrun A/B + real A/B. Acceptance gate
+  was revised at commit 3 (the original "lagging < 50% of
+  fires" draft was too coarse; the synthetic A/B hit 91%
+  lagging while still winning wall-clock). New gate: real
+  wall ≥ +50 ms/generate AND spin time ≤ 10% of recovered
+  sync_cb_wait_total_ns AND parity green.
   Design warning called out: wait kernel busy-spins on a
   single block; if CPU lags often, could occupy SM time —
   diag counters must surface this. NO code in this
@@ -3320,18 +3324,58 @@ Bench A/B (in `David/Benchmarks/phase1c/`):
 | `native_capture_real_m3_on` | `native_capture_real` (M3 off) | real wall delta — the gate target. Upper-bound estimate from smoke arithmetic: ~+179 ms/generate. Real-mode upside likely smaller (overlap matters). |
 | Same arms, but with VLLM_COTS_DIAG=1 | — | Capture `m3_wait_spin_iters_total`, `m3_immediate_resume_count`, `m3_lagging_wait_count` to characterize spin behavior. |
 
-Acceptance:
+Acceptance (revised, §1c.29 commit 3 review-fix):
 
-* All three tests green.
-* Real-mode wall delta ≥ +50 ms/generate (a third of the
-  upper-bound) AND `m3_lagging_wait_count` < 50% of total
-  fires (i.e., GPU window covers CPU work most of the time).
-* No correctness regression on phase1a/1b/1c suites.
+The original draft gated on `m3_lagging_wait_count < 50% of
+fires`. Commit 3's synthetic A/B run (DIAG=1) showed this gate
+is too coarse: real_m3_on hit **91.3% lagging** (1615 lag / 153
+immediate) but the wall-clock still improved by **+165 μs /
+forward (+20.6 μs / layer)** because each lagging fire spun for
+only ~6.5 iterations on average (~0.65 μs of nanosleep each).
+A "lagging fire" means `done < req` at the kernel's first read;
+it does NOT mean the wait was long. The blunt count overweights
+short spins and overrides the wall-clock signal.
 
-If real-mode wall delta is < +50 ms/generate OR lagging_wait
-count is high, the prototype is rejected and `native_eager`
+Revised gate:
+
+1. **Wall-clock**: real-mode wall delta ≥ **+50 ms/generate** on
+   the Qwen2.5-7B real-model anchor (or its FastTTS-equivalent).
+   The synthetic stub's per-forward μs delta does not translate
+   directly — only the real-model wall is gating.
+2. **Spin-cost budget**: `m3_wait_spin_iters_total × 100 ns ≤
+   10% of (sync_cb_wait_total_ns saved)`. Captures the actual
+   SM time burned versus the actual driver-thread time recovered.
+   If spin time approaches the savings, the wait kernel is
+   actively losing the substrate trade.
+3. **No correctness regression**: phase1a/1b/1c suites green;
+   bit-equivalent captured-replay output between M3-on and M3-off
+   (already covered by `test_m3_parity_with_baseline.py`).
+
+If real-mode wall delta is < +50 ms/generate OR the spin-cost
+budget is exceeded, the prototype is rejected and `native_eager`
 becomes the practical Phase 1c landing path (per §1c.28's
 fall-back).
+
+Synthetic A/B (commit 3 result, DIAG=1, n_layers=8, num_tokens=4,
+f_cpu_store=0.10, n_iters=200; committed at
+`David/Benchmarks/phase1c/results/bench_m3_wait_kernel_ab_diag.json`):
+
+| Arm | t_us | imm | lag | lag % | spin_iters | per-fire |
+|---|---:|---:|---:|---:|---:|---:|
+| dryrun_m3_off | 341.7 | — | — | — | — | — |
+| dryrun_m3_on  | 253.7 | 1754 | 14 | 0.79 % | 816 | 58.3 |
+| real_m3_off   | 453.0 | — | — | — | — | — |
+| real_m3_on    | 288.3 | 153 | 1615 | 91.34 % | 10514 | 6.5 |
+
+Substrate-positive on both arms despite real-mode 91% lagging:
+spin time ≈ 10514 × 100 ns ≈ 1.05 ms aggregated across all
+real-mode fires, against 18.0 ms of `sync_cb_wait_total_ns` that
+M3 removed. ~6 % of the savings paid back as spin — net win.
+
+This synthetic result is encouraging but is **NOT** a real-model
+acceptance. The flag stays `cots_m3_wait_kernel=False` until the
+Qwen2.5-7B real-model anchor delivers the wall-clock win against
+the revised gate.
 
 #### Design warning: SM occupancy from spin-wait
 
