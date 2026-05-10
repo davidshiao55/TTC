@@ -1,0 +1,21 @@
+{
+  "shape":"per_task",
+  "replays":1000,
+  "tasks":56,
+  "poll_ns":1,
+  "expected_observations":56000,
+  "total_observed":56000,
+  "per_task_min":1000,
+  "per_task_max":1000,
+  "stale_signals":0,
+  "duplicate_signals":0,
+  "dropped_signals":9,
+  "invalid_task_ids":0,
+  "replay_wall_ns":47082381,
+  "signal_to_obs_p50_ns":22788011,
+  "signal_to_obs_p90_ns":41612759,
+  "signal_to_obs_max_ns":46317071,
+  "latency_samples":55991,
+  "combined_checksum":"0x0000000000007bfa",
+  "assertion_failures":1
+}

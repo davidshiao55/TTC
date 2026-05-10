@@ -1,0 +1,6 @@
+# Built binary — regenerable via:
+#   nvcc -O2 -std=c++17 value_signal_smoke.cu -o value_signal_smoke -lpthread
+value_signal_smoke
+
+# Run outputs in plain text (commit only the JSON for reproducibility).
+result_*.txt
