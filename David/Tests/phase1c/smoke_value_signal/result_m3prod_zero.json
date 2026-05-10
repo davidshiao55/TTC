@@ -12,12 +12,12 @@
   "per_task_max":1000,
   "stale_signals":0,
   "coalesced_advances":0,
-  "replay_wall_ns":1119807136,
-  "per_replay_wall_us":1119.81,
-  "submit_to_worker_start_p50_ns":88,
-  "submit_to_worker_start_p90_ns":131,
-  "submit_to_worker_start_max_ns":1972725,
-  "latency_samples":55999,
+  "replay_wall_ns":1140116400,
+  "per_replay_wall_us":1140.12,
+  "submit_to_worker_start_p50_ns":145,
+  "submit_to_worker_start_p90_ns":176,
+  "submit_to_worker_start_max_ns":12854,
+  "latency_samples":56000,
   "combined_checksum":"0x0000000000007bf0",
   "assertion_failures":0
 }

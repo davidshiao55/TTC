@@ -274,12 +274,23 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   worker-written done counter; NOT literal
   `cuStreamWaitValue32`, which has a stale-wait trap across
   replays). All four production-shaped configs pass:
-  56,000/56,000 observations, no stale, no deadlock; submit-
-  to-worker-start p50 = **88-103 ns** (CPU GEMM start
-  preserved at the existing host_fn pattern's level);
-  overlap behavior correct in both GPU-bound (full overlap)
-  and CPU-bound (wait correctly serializes against worker)
-  regimes. Next step: prototype M3 in vLLM behind a feature
+  56,000/56,000 observations, no stale, no deadlock. An
+  initial draft had a measurement race in `submit_cb` (req
+  and submit_ns published in separate unsynchronized stores
+  → worker could pair a new replay's req with a stale
+  replay's timestamp). Reviewer caught this; fixed via a
+  per-seq timestamp ring (`submit_ts_ring[t][(seq-1)&MASK]`)
+  so the worker reads ts deterministically paired with the
+  observed seq. Post-fix: submit-to-worker-start p50 =
+  **145-160 ns**, p90 ≤ 290 ns, max ~13-25 μs (Linux
+  scheduler tick) across all configs. CPU GEMM start is
+  preserved at the existing host_fn(dispatch_cb) pattern's
+  level. Overlap behavior correct in both GPU-bound and
+  CPU-bound regimes; per-replay wall numbers depend on the
+  GPU clock-rate calibration used by `gpu_busywait_kernel`
+  (hard-coded 2.2 GHz estimate) — read as "config ran
+  without deadlock and signals were preserved", not as
+  precise overlap measurements. Next step: prototype M3 in vLLM behind a feature
   flag. Submit side stays as the existing
   `cudaLaunchHostFunc(dispatch_cb)`; only the
   `cudaLaunchHostFunc(sync_cb)` is replaced with

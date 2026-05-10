@@ -131,27 +131,44 @@ static inline unsigned long long cpu_fake_work(unsigned int seq,
   return cs;
 }
 
-// Per-task submit context for cudaLaunchHostFunc userData.
+// §1c.28 review-fix: per-seq timestamp ring. The earlier draft
+// had submit_cb store (req_slot, then submit_ns) and the worker
+// read (req_slot, then submit_ns); a race let the worker observe
+// req advancing from replay N+1 while still reading replay N's
+// submit_ns (or vice versa), producing the huge p90/max
+// latencies in the original smoke. Fix: store the timestamp in
+// a per-seq slot so the worker can deterministically pair (seq
+// it observed) with (timestamp recorded at submission of that
+// seq). 2,048 slots gives plenty of headroom for 1,000-replay
+// runs without wraparound.
+constexpr int TS_RING_SIZE = 2048;
+constexpr int TS_RING_MASK = TS_RING_SIZE - 1;
+static_assert((TS_RING_SIZE & TS_RING_MASK) == 0,
+              "TS_RING_SIZE must be power of 2");
+
 struct SubmitCtx {
-  unsigned int* host_next_seq;       // CPU-only counter
-  unsigned int* host_req_slot;       // host-mapped pinned slot
-  std::atomic<long long>* submit_ns; // submit time stamp for latency measurement
+  unsigned int* host_next_seq;  // CPU-only counter, incremented per fire
+  unsigned int* host_req_slot;  // host-mapped pinned, GPU-visible
+  long long* submit_ts_ring;    // per-task ring, indexed by (seq-1) & MASK
   int task_id;
 };
 
 extern "C" void CUDART_CB submit_cb(void* user_data) {
   auto* ctx = static_cast<SubmitCtx*>(user_data);
   unsigned int seq = ++(*ctx->host_next_seq);
-  *ctx->host_req_slot = seq;
-  // Publish via membar so the worker thread (which polls without
-  // a synchronizing read) sees the write promptly. On x86 a plain
-  // store is well-ordered for another CPU thread, but the GPU side
-  // of the host-mapped slot benefits from the fence too.
+  // Write the timestamp into the per-seq slot BEFORE publishing
+  // the new req. The worker, on observing req=N, indexes into the
+  // ring at (N-1) & MASK and gets ts_N (or older — never newer,
+  // because submit_cb advances seq monotonically and writes ts to
+  // its OWN slot, not a shared cell). Release fence ensures the
+  // ts write is visible before the req publish.
+  ctx->submit_ts_ring[(seq - 1) & TS_RING_MASK] =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
   std::atomic_thread_fence(std::memory_order_release);
-  ctx->submit_ns->store(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch())
-                            .count(),
-                        std::memory_order_release);
+  *ctx->host_req_slot = seq;
+  std::atomic_thread_fence(std::memory_order_release);
 }
 
 struct Args {
@@ -220,16 +237,18 @@ int main(int argc, char** argv) {
   // CPU-only per-task counter (incremented by submit_cb).
   std::vector<unsigned int> host_next_seq(a.tasks, 0);
 
-  // Submit timestamps — one per task, latest replay's timestamp.
-  std::vector<std::atomic<long long>> submit_ns(a.tasks);
-  for (int t = 0; t < a.tasks; ++t) submit_ns[t].store(0);
+  // Per-task per-seq timestamp ring. submit_cb writes
+  // submit_ts_ring[t][(seq-1) & MASK] = now_ns. Worker reads the
+  // same slot when observing req=seq. Replay-safe pairing.
+  std::vector<std::vector<long long>> submit_ts_ring(
+      a.tasks, std::vector<long long>(TS_RING_SIZE, 0));
 
   // Submit contexts (stable addresses for cudaLaunchHostFunc userData).
   std::vector<SubmitCtx> submit_ctx(a.tasks);
   for (int t = 0; t < a.tasks; ++t) {
     submit_ctx[t].host_next_seq = &host_next_seq[t];
     submit_ctx[t].host_req_slot = &host_req[t];
-    submit_ctx[t].submit_ns = &submit_ns[t];
+    submit_ctx[t].submit_ts_ring = submit_ts_ring[t].data();
     submit_ctx[t].task_id = t;
   }
 
@@ -292,7 +311,14 @@ int main(int argc, char** argv) {
         unsigned int last = stats.last_seen_req[t].load();
         if (cur > last) {
           long long obs_ns = now_ns();
-          long long sub_ns = submit_ns[t].load(std::memory_order_acquire);
+          // §1c.28 review-fix: read the timestamp from the
+          // per-seq ring, indexed by (cur-1) & MASK. This is
+          // the timestamp submit_cb wrote when it advanced to
+          // seq=cur — guaranteed-paired with this observation,
+          // not a stale or future-replay timestamp.
+          std::atomic_thread_fence(std::memory_order_acquire);
+          long long sub_ns =
+              submit_ts_ring[t][(cur - 1) & TS_RING_MASK];
           if (sub_ns > 0) {
             std::lock_guard<std::mutex> g(stats.lat_mtx);
             stats.submit_to_worker_start_ns.push_back(obs_ns - sub_ns);

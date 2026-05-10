@@ -328,51 +328,63 @@ checksum 0x7bf0 in the (0, 0) config; checksum varies with
 non-zero cpu_work_us because the cpu_fake_work mixes a hash
 that depends on micro-timing.
 
-### Submit-to-worker-start latency
+### Submit-to-worker-start latency (after timestamp-race fix)
 
-The headline metric: how long from `submit_cb` writing
-`req_slot[t]` to the worker observing it.
+A first version of this smoke had a measurement race:
+`submit_cb` published `req_slot` then `submit_ns` in separate
+unsynchronized stores; the worker, reading `req_slot` then
+`submit_ns`, could observe a new replay's req paired with a
+stale (or future) replay's timestamp. The original output
+showed huge p90/max latencies (24-29 ms) that were actually
+race artifacts, not true latencies.
 
-| gpu_delay μs | cpu_work μs | p50 ns | p90 ns | per_replay_wall μs |
-|---|---|---|---|---|
-| 0 | 0 | **88** | 131 | 1,120 |
-| 50 | 100 | 95 | 166 | 6,535 |
-| 500 | 400 | 103 | 23,955,740 | 24,098 |
-| 100 | 500 | 99 | 29,360,373 | 29,321 |
+Fix: a per-seq timestamp ring (`submit_ts_ring[t][(seq-1) &
+MASK]`). `submit_cb` writes the timestamp into a SEQ-INDEXED
+slot before publishing the new req; the worker, on observing
+req=N, indexes into the ring at (N-1)&MASK to get ts_N
+deterministically. The ring is sized 2,048 — far above the
+1,000-replay test, no wraparound.
 
-p50 = **88-103 ns** across all configs. The worker sees the
-submit signal essentially immediately. **CPU GEMM start is
-preserved at the existing host_fn pattern's level** —
+The headline metric — how long from `submit_cb` writing
+`req_slot[t]` to the worker observing it — now reads cleanly:
+
+| gpu_delay μs | cpu_work μs | p50 ns | p90 ns | max ns | per_replay_wall μs |
+|---|---|---|---|---|---|
+| 0 | 0 | **145** | 176 | 12,854 | 1,140 |
+| 50 | 100 | 147 | 233 | 12,773 | 6,528 |
+| 500 | 400 | 154 | 266 | 14,290 | 24,120 |
+| 100 | 500 | 160 | 288 | 24,542 | 29,300 |
+
+p50 = **145-160 ns** across all configs. p90 ≤ 290 ns. Max
+~13-25 μs (Linux scheduler tick / OS interruption — not a
+mechanism issue). The worker sees submit signals
+essentially immediately. **CPU GEMM start is preserved at
+the existing host_fn(dispatch_cb) pattern's level** —
 production M3 keeps the early-start property.
-
-p90 stays low when CPU is fast (< 200 ns at cpu_work=0 or 100
-μs), but rises sharply when the worker is single-thread
-serial on >100 μs CPU GEMMs across 56 tasks. That's expected:
-the worker can process one task's CPU work at a time, so
-later tasks' submit observations accumulate stack-up while
-the worker is busy. The high p90 at large cpu_work is NOT a
-mechanism issue — it's the inherent serialization of the
-single-thread CPU worker, which is the same in today's
-host_fn(dispatch_cb) design.
 
 ### Overlap behavior
 
-The (500 μs GPU, 400 μs CPU) config models the full-overlap
-case: GPU GEMM window is longer than CPU GEMM, so by the time
-the wait kernel fires for task t, the worker has already
-written done_slot[t] = req_slot[t] (CPU finished first). The
-wait spins ~one PTX nanosleep iteration and exits. Per-replay
-wall = 24 ms ≈ 56 tasks × 500 μs GPU bound, NOT 28 ms
-(56 × 500 μs serial). The shortfall is the partial overlap
-of CPU work happening concurrently with GPU work for early
-tasks.
+The (500 μs GPU, 400 μs CPU) config models the GPU-bound
+case: GPU GEMM window is longer than CPU GEMM, so when the
+wait kernel fires for task t, the worker has already
+written done_slot[t] (CPU finished first). The wait spins
+~one PTX nanosleep iteration and exits.
 
 The (100 μs GPU, 500 μs CPU) config models the CPU-bound
 case: CPU GEMMs take longer than GPU GEMMs, so the wait
-kernel actually waits for the worker to drain. Per-replay
-wall = 29 ms ≈ 56 × 500 μs CPU-bound. M3's wait correctly
-serializes against CPU completion in this regime — no signal
-is dropped, no deadlock.
+kernel actually waits for the worker to drain. The replay
+proceeds task-by-task; M3's wait correctly serializes
+against CPU completion in this regime — no signal is
+dropped, no deadlock.
+
+NB: per-replay wall numbers vary with the GPU clock rate
+used by `gpu_busywait_kernel`. The kernel uses
+`clock64()` and a hard-coded 2,200 cycles/μs estimate
+(roughly RTX 4090 base clock). Actual clock under load can
+differ; the wall numbers above should be read as "config
+ran without deadlock and signals were preserved", not as
+precise overlap measurements. Pure clock-calibration
+sensitivity, not a mechanism issue.
 
 ### M3 net-win estimate (unchanged in direction; framed as upper bound)
 
