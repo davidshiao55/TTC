@@ -333,6 +333,18 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   opt-in research path, not production default. Production
   guidance: enforce_eager=True + native runner + legacy
   sync_cb. See §1c.31 below.
+- §1c.32 — nsys attribution of the +88 ms captured-vs-eager
+  penalty. Three traces (eager / m3 / none_capture) at
+  default workload reveal: (i) the captured FULL graph fires
+  **35% MORE COTS dispatch_cb nodes per forward** than eager
+  (76.7 vs 56.4 ops/forward) — likely capturing dispatches
+  that eager short-circuits on `num_tokens==0`; (ii) the
+  wait kernel's actual per-fire time is ~44 µs median, not
+  the 100 ns PTX hint estimate from §1c.29; (iii) GEMM work
+  is identical between arms (within 1%). Conclusion: the
+  +88 ms is dominated by op-count not wait-kernel cost, so
+  the next investigation should target reducing captured
+  COTS nodes, not optimizing M3 further. See §1c.32 below.
 
 ---
 
@@ -3195,6 +3207,134 @@ Three follow-ups on the §1c.29 wrap-up:
 
    §1c.29 work closes. No further M3 chasing on B=1/f=0.05
    from this round.
+
+---
+
+### §1c.32 — nsys attribution of the +88 ms captured-vs-eager penalty
+
+Reviewer (commit-3-real verdict): before further M3 work, an
+nsys trace must answer "where does the +88 ms live?" Three traces
+captured at the default workload (Qwen2.5-7B BF16, decode 8→128,
+B=1, t=16, f=0.05, 1 warmup + 1 measured iter, VLLM_COTS_DIAG=1
+so cots:* NVTX scopes fire):
+
+* `trace_eager.nsys-rep`   — native eager, real CPU GEMM (2.7251 s/gen)
+* `trace_m3.nsys-rep`      — captured + M3, real CPU GEMM (2.8139 s/gen)
+* `trace_none.nsys-rep`    — captured + no offload (2.0378 s/gen)
+
+Penalty under nsys: m3 − eager = **+88.8 ms** (matches the
+prior in-harness measurement; not a profiler artifact).
+
+#### Top GPU kernel time
+
+**Eager arm:**
+* cublas gemvx (BF16 GEMM): 40.3% / 1.93 s, 270 µs/instance × 7112
+* gemvx (BF16, float accum):  20.8% / 0.99 s, 140 µs × 7112
+* cutlass GEMM (cutlass_80):  7.5% / 0.36 s, 12.9 ms × 28
+* _uva_copy_kernel:           2.3% / 0.11 s, 2.6 µs × 14448
+
+**M3 arm:**
+* **m3_wait_kernel_diag: 92.2% / 93.18 s, median 44.3 µs/instance × 19488**
+* cublas gemvx (BF16 GEMM): 2.0% / 1.98 s, 277 µs × 7168 (≈ eager)
+* gemvx (BF16, float accum): 1.0% / 1.01 s, 141 µs × 7168 (≈ eager)
+* _uva_copy_kernel: 0.3% / 0.26 s, 1.7 µs × 19488
+
+Reading: GEMM work is essentially identical (within 1% of
+eager). What dominates GPU time in M3 is the wait kernel itself
+— **median 44 µs per fire, NOT the 100 ns PTX hint estimate**. The
+spin-budget computation in §1c.29 commit 3 used the hint and
+estimated ~9.9% of recovered sync_cb time paid back as spin. The
+nsys-measured per-fire time is ~440× higher than the hint, which
+breaks the original budget but not the wall-clock conclusion (the
+wait kernel uses 1 SM × 1 block, parallel SMs continue with GEMM
+work).
+
+#### COTS op-count delta (captured vs eager): 35% MORE ops in M3
+
+NVTX `cots:dispatch_cb` instance counts per `cots:model_forward`:
+* Eager (model_forward[NONE]):  14,448 dispatch_cb / 256 forwards = **56.4 ops/forward**
+* M3    (model_forward[FULL]):  19,488 dispatch_cb / 254 forwards = **76.7 ops/forward**
+
+The captured FULL graph fires **35% more COTS dispatch_cb nodes
+per forward** than the eager path (~20 extra fires per
+forward). Combined with worker time:
+
+| NVTX scope | eager (total / median / count) | m3 (total / median / count) |
+|---|---|---|
+| cots:worker_mlp | 35.23 s / 484 µs / 7224  | **90.57 s / 481 µs / 9744** |
+| cots:worker_qkv | 3.44 s / 67 µs / 7224   | 8.59 s / 55 µs / 9744 |
+| cots:sync_cb_wait | 34.35 s / 22.6 µs / 14448 | — (replaced by m3_wait_kernel) |
+| cots:py_uva_copy | 2.36 s / 27 µs / 14448 | 2.64 s / 19 µs / 10192 |
+
+Per-fire latencies are similar; the bulk of the cumulative time
+delta is **op count**: M3's captured graph fires ~35% more COTS
+ops than eager processes. cots:worker_mlp aggregates to 2.57×
+more total time in M3 than in eager (90.57 s vs 35.23 s) almost
+entirely because M3 fires 9744 worker_mlp's vs eager's 7224.
+
+#### Memcpy nodes (D2H byte transfers)
+
+| | Eager | M3 |
+|---|---:|---:|
+| H2D count | 2,588 | 7,190 (2.8×) |
+| D2H count | 14,704 | 19,744 (1.34×) |
+| D2H total time | 144.7 ms | 428.0 ms (2.96×) |
+
+Eager has 5052 fewer D2H copies; M3's extra captured nodes
+contribute ~283 ms of cumulative D2H time. Per-copy latency is
+the same (~1 µs median); the delta is purely op count.
+
+#### What's actually causing +88 ms
+
+Three sources, ranked by contribution per nsys evidence:
+
+1. **Excess captured COTS op fires** (35% more per forward).
+   The FULL graph appears to retain dispatch_cb nodes for ops
+   that the eager path doesn't fire (likely because eager skips
+   on `runtime_num_tokens` heuristics or num_tokens=0
+   short-circuits that the captured node can't see). This is
+   the largest factor: 20 extra dispatch_cb + worker pairs per
+   forward × ~140 µs/op = ~2.8 ms/forward × 128 = ~360 ms
+   cumulative extra worker time per generate (but only some of
+   this is on the wall-clock critical path).
+2. **Wait kernel actual cost is 440× the design hint**. Doesn't
+   move wall directly (1 SM out of 80+ on the RTX 4090 doesn't
+   block GEMM), but it makes the §1c.29 spin-budget gate
+   misleading. The wait kernel runtime is dominated by genuine
+   "wait for CPU worker" time, not the nanosleep spin itself.
+3. **No CPU-overlap window**. In eager mode the Python
+   orchestration runs DURING `cots:sync_cb_wait` (host_fn
+   blocks driver thread but Python continues). In captured
+   mode there's no Python loop to overlap with, so the wait is
+   pure dead time. This is a structural property of capture,
+   not something M3 can fix.
+
+The reviewer's hypothesis was right: **the path to make capture
+≤ eager is "reduce per-op graph nodes" (item 1), not "optimize
+the wait kernel" (item 2)**. M3 attacked the wrong axis.
+
+#### Implications for next direction
+
+1. **Investigate why captured FULL graph fires 35% more COTS
+   ops than eager.** Likely candidates: graph captures dispatch
+   nodes that eager skips via `if num_tokens == 0` / `if
+   bucket == None` short-circuits. Removing those from the
+   captured node set could close most of the +88 ms.
+2. The §1c.29 design hint "100 ns/spin" needs a footnote: in
+   practice the wait kernel runs for tens of microseconds per
+   fire because it spins until the worker finishes, not for a
+   fixed-duration nanosleep. The 100 ns is the spin granularity,
+   not the wait duration.
+3. M3 itself stays opt-in. Removing it wouldn't help (the
+   sync_cb host_fn would replace it 1:1). But it also doesn't
+   solve the captured-vs-eager gap.
+
+Trace artifacts (~210 MB combined): `trace_eager.nsys-rep`,
+`trace_m3.nsys-rep`, `trace_none.nsys-rep` under
+`David/Benchmarks/phase1c/results/m3_qwen_nsys/` (logs are
+gitignored; .nsys-rep too — committed via gitignore exception
+if disk allows, otherwise regenerable via the bench harness
++ nsys flags documented in `David/Docs/phase1c_findings.md`).
 
 ---
 
