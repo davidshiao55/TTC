@@ -185,6 +185,22 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   — and re-measure `cudaGraphLaunch_v10000` delta per ablation.
   That identifies which node class moves the cudaGraphLaunch
   wall before §1c.26 mechanism selection. See §1c.25 below.
+- §1c.26 (captured-node ablation) — **DONE. Captured
+  `cudaLaunchHostFunc` is the 98% lever on cudaGraphLaunch.**
+  Three probe-only ablations (HOSTFN/D2H/UVA, env-gated to
+  dry_run + DIAG): removing host_fns drops
+  `cudaGraphLaunch_v10000` from 2,464.5 ms → 53.2 ms (−98%)
+  and wall-clock by 322 ms; D2H removal is neutral on cgl
+  and actually +328 ms slower (scheduling artifact, not a
+  mechanism); UVA removal is essentially neutral (−35 ms cgl).
+  Eager-dryrun control arm (no graph capture) is +383 ms vs
+  none_capture, splitting the +584 ms dryrun gap into +383 ms
+  native COTS Python overhead (present in eager too) +
+  +201 ms graph-replay-specific (which the host_fn ablation
+  more than eliminates: no_hostfn at +262 ms vs none, faster
+  than eager_dryrun's +383 ms). Mechanism for §1c.27 is
+  clear: reduce captured host_fn count from 56/forward to ≤2
+  via batched submit + sync. See §1c.26 below.
 
 ---
 
@@ -2241,6 +2257,144 @@ mechanism selection.**
   WHERE copyKind=2
     AND start >= (...) AND end <= (...);
   ```
+
+---
+
+### §1c.26 — captured host_fn ablation: cudaLaunchHostFunc is the cost
+
+#### Method (probe-only)
+
+Three env vars (all gated to `dry_run=True` AND `VLLM_COTS_DIAG=1`)
+control which captured graph-node class is omitted at install time:
+
+* `VLLM_COTS_ABLATE_HOSTFN=1` — skip captured
+  `cudaLaunchHostFunc(dispatch_cb)` AND
+  `cudaLaunchHostFunc(sync_cb)`. Worker is never enqueued.
+* `VLLM_COTS_ABLATE_D2H=1` — skip captured `cudaMemcpyAsync`
+  (activation D2H per layer/op).
+* `VLLM_COTS_ABLATE_UVA=1` — skip captured Triton UVA copy.
+
+Implementation: `CotsCpuInfer::set_ablations(ablate_d2h,
+ablate_hostfn)` (C++) plus `cots_ops.set_uva_ablation(bool)`
+(Python). `CotsOffloader._install_ablations()` reads env at
+post_init, validates the gate (warns and skips if either
+gate is unmet — misuse must be loud), and pushes the flags.
+The C++ `submit_on_stream` and `sync_on_stream` skip the
+respective `cudaXxxAsync` calls when set; the Python
+`_cots_sync_then_uva_impl` skips the `_uva_copy_*` call.
+
+Output is garbage in dryrun anyway (worker is no-op), so
+ablation is safe — wall-clock and `cudaGraphLaunch_v10000`
+runtime measurements remain valid.
+
+#### Wall-clock matrix (1 warmup + 1 measured iter, B=1, in=8, out=128, Qwen2.5-7B BF16)
+
+| arm | wall | Δ vs `none_capture` | Δ vs `native_capture_dryrun` |
+|---|---|---|---|
+| `none_capture` | 2.039 s | — | — |
+| `native_capture_dryrun_no_hostfn` | **2.301 s** | **+262 ms** | **−322 ms** |
+| `native_eager_dryrun` (control) | 2.422 s | +383 ms | −201 ms |
+| `native_capture_dryrun_no_uva` | 2.589 s | +550 ms | −34 ms |
+| `native_capture_dryrun` (baseline) | 2.623 s | +584 ms | — |
+| `native_capture_dryrun_no_d2h` | **2.951 s** | **+913 ms** | **+328 ms (slower!)** |
+
+#### CUPTI runtime API: cudaGraphLaunch_v10000
+
+| arm | cgl count | cgl total ms |
+|---|---|---|
+| `none_capture` | 156 | 25.8 |
+| `native_eager_dryrun` (no graph) | 0 | 0.0 |
+| `native_capture_dryrun_no_hostfn` | 156 | **53.2** |
+| `native_capture_dryrun_no_d2h` | 156 | 2422.5 |
+| `native_capture_dryrun_no_uva` | 156 | 2429.3 |
+| `native_capture_dryrun` (baseline) | 156 | 2464.5 |
+
+**`cudaGraphLaunch` time drops from 2,464.5 ms → 53.2 ms when
+captured host_fns are removed — a 98% reduction.** D2H and UVA
+removal each leave cgl essentially unchanged.
+
+#### Critical-path conclusions
+
+1. **Captured `cudaLaunchHostFunc` is the dominant graph-replay
+   cost.** Of the +2,438 ms `cudaGraphLaunch` runtime delta vs
+   `none_capture`, ~98% goes away when captured host_fns are
+   removed. Wall-clock drops by 322 ms.
+
+2. **The eager-dryrun control separates the +584 ms dryrun gap
+   into two components:**
+   - +383 ms native COTS Python orchestration overhead (present
+     in eager too — NOT graph-replay-specific).
+   - +201 ms graph-replay-specific component
+     (= capture_dryrun − eager_dryrun).
+   The host_fn ablation drops capture_dryrun BELOW the eager
+   arm (+262 vs +383 vs none), which means removing captured
+   host_fns goes beyond just eliminating the graph-replay
+   regression — it eliminates COTS Python overhead that the
+   captured graph carries forward.
+
+3. **D2H ablation is misleading and not a §1c.27 lever.** Wall-
+   clock got +328 ms WORSE when captured D2H was removed; cgl
+   was unchanged. NVTX shows `dispatch_cb` time jumped 3×
+   (8.9 → 30.6 ms) and `sync_cb_wait` jumped 5× (3.0 → 16.8 ms)
+   in this arm, suggesting a scheduling interaction at the
+   worker cv when D2H is no longer there to serialize before
+   the host_fn. Bottom line: the captured D2H is not the
+   bottleneck; removing it perturbs the system rather than
+   improving it. Not chasing this further as a mechanism.
+
+4. **UVA ablation is neutral (−34 ms wall, −35 ms cgl).**
+   Already established in §1c.23; re-confirmed here. Output-
+   side bytes are not the bottleneck.
+
+#### What §1c.26 establishes
+
+* Direct measurement: captured `cudaLaunchHostFunc` is the
+  98% lever on `cudaGraphLaunch_v10000` wall.
+* The +201 ms graph-replay-specific component (eager →
+  capture in dryrun) is essentially attributable to captured
+  host_fns.
+* Pure native COTS Python overhead vs `none_capture` is
+  +383 ms (`native_eager_dryrun`); this exists regardless of
+  graph capture and is a separate target if pursued.
+
+#### Mechanism for §1c.27 (now justified)
+
+**Reduce captured `cudaLaunchHostFunc` count from 56 per
+forward to as few as feasible** (the §1c.25 candidate the
+reviewer correctly told us not to start until ablation was
+complete). Two designs:
+
+1. **Coalesced submit + sync per forward.** Replace the 28
+   per-(layer, op_kind) submit + 28 per-(layer, op_kind) sync
+   pattern with: one batched submit at forward start +
+   one batched sync at forward end. Worker processes a list
+   of slabs in order. Reduces 56 host_fns → 2 per forward.
+   Risk: the worker no longer overlaps with per-layer GPU
+   work; CPU-GEMM tail latency potentially leaks past the
+   GPU window in real (non-dryrun) mode. The §1c.24 finding
+   that sync_cb_wait was NOT the bottleneck (capture is
+   FASTER than eager per-fire on sync_cb_wait p50) suggests
+   tail leak isn't a concern, but real-mode A/B is required.
+2. **Per-layer combined host_fn.** Keep per-layer
+   submit-and-sync overlap but combine submit_qkv +
+   submit_mlp into one host_fn (and likewise for sync).
+   Reduces 56 → 28 per forward.
+
+Recommended: prototype design 1 first (bigger reduction,
+larger effect size; if it works in dryrun + real mode, no
+need to fall back to 2). Probe-only with the existing
+ablation flags can give an upper-bound estimate of the wall
+delta — already measured at −322 ms vs the baseline.
+
+**Status: ablation complete, mechanism justified, ready to
+draft §1c.27 prototype design.**
+
+#### Artifacts
+
+* `David/Benchmarks/phase1c/results/diag_nsys_1c26/*.json`
+  — bench wall-clock outputs (small).
+* `*.nsys-rep` traces gitignored (regenerable; commands and
+  env vars documented above).
 
 ---
 
