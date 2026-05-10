@@ -274,11 +274,152 @@ M2 kernel-counter regresses on the submit side.
   capture's +0.835 s — a 141 ms gap that M3 should be able
   to close.
 
+## Update — production-shaped M3 smoke (`m3_submit_hostfn_wait_kernel_smoke.cu`)
+
+The first M3 smoke (`m3_smoke.cu`) had ONE captured kernel per
+task that did BOTH the request signaling AND the wait. CPU
+work effectively started when the wait kernel began executing
+— collapsing the per-op overlap window the production M3
+design depends on. Reviewer correctly flagged this: production
+M3 keeps submit as the existing host_fn (CPU GEMM starts
+early) and replaces ONLY the sync host_fn with a wait kernel.
+
+The new smoke implements the production sequence:
+
+```
+captured graph per task per replay:
+  cudaLaunchHostFunc(submit_cb, &ctx[t])
+       — submit_cb: ++next_seq[t], req_slot[t] = seq, returns
+  [optional gpu_busywait_kernel(target_clocks)]
+       — simulates per-op GPU GEMM window
+  m3_wait_kernel(req_slot[t], done_slot[t])
+       — busy-spins until done_slot[t] >= req_slot[t]
+
+worker thread:
+  poll req_slot[t] for advance
+  run fake CPU work (parameterized cpu_work_us)
+  done_slot[t] = req_slot[t]   // releases the wait kernel
+```
+
+Note: this is NOT `cuStreamWaitValue32`. The literal-value
+`cuStreamWaitValue32` has a documented stale-wait trap across
+repeated graph replays (literals are frozen at capture; after
+the first replay's done write, every subsequent replay's wait
+succeeds immediately). The smoke uses a custom kernel-spin
+that reads `req_slot` (just-written by submit_cb on THIS
+replay) and waits for `done >= req`, which is replay-safe by
+construction. Document references to "`cuStreamWaitValue32`-
+style" should read "custom wait kernel" — the distinction
+matters because a future variant with cyclic per-replay slots
+COULD use `cuStreamWaitValue32`, but the implemented path
+doesn't.
+
+### Correctness (1,000 replays × 56 tasks, all 4 configs)
+
+| gpu_delay μs | cpu_work μs | total_observed | stale | per_task_min/max |
+|---|---|---|---|---|
+| 0 | 0 | **56,000** | 0 | 1,000 / 1,000 ✓ |
+| 50 | 100 | **56,000** | 0 | 1,000 / 1,000 ✓ |
+| 500 | 400 | **56,000** | 0 | 1,000 / 1,000 ✓ |
+| 100 | 500 | **56,000** | 0 | 1,000 / 1,000 ✓ |
+
+All clean. No stale waits, no drops, no deadlocks. Bit-identical
+checksum 0x7bf0 in the (0, 0) config; checksum varies with
+non-zero cpu_work_us because the cpu_fake_work mixes a hash
+that depends on micro-timing.
+
+### Submit-to-worker-start latency
+
+The headline metric: how long from `submit_cb` writing
+`req_slot[t]` to the worker observing it.
+
+| gpu_delay μs | cpu_work μs | p50 ns | p90 ns | per_replay_wall μs |
+|---|---|---|---|---|
+| 0 | 0 | **88** | 131 | 1,120 |
+| 50 | 100 | 95 | 166 | 6,535 |
+| 500 | 400 | 103 | 23,955,740 | 24,098 |
+| 100 | 500 | 99 | 29,360,373 | 29,321 |
+
+p50 = **88-103 ns** across all configs. The worker sees the
+submit signal essentially immediately. **CPU GEMM start is
+preserved at the existing host_fn pattern's level** —
+production M3 keeps the early-start property.
+
+p90 stays low when CPU is fast (< 200 ns at cpu_work=0 or 100
+μs), but rises sharply when the worker is single-thread
+serial on >100 μs CPU GEMMs across 56 tasks. That's expected:
+the worker can process one task's CPU work at a time, so
+later tasks' submit observations accumulate stack-up while
+the worker is busy. The high p90 at large cpu_work is NOT a
+mechanism issue — it's the inherent serialization of the
+single-thread CPU worker, which is the same in today's
+host_fn(dispatch_cb) design.
+
+### Overlap behavior
+
+The (500 μs GPU, 400 μs CPU) config models the full-overlap
+case: GPU GEMM window is longer than CPU GEMM, so by the time
+the wait kernel fires for task t, the worker has already
+written done_slot[t] = req_slot[t] (CPU finished first). The
+wait spins ~one PTX nanosleep iteration and exits. Per-replay
+wall = 24 ms ≈ 56 tasks × 500 μs GPU bound, NOT 28 ms
+(56 × 500 μs serial). The shortfall is the partial overlap
+of CPU work happening concurrently with GPU work for early
+tasks.
+
+The (100 μs GPU, 500 μs CPU) config models the CPU-bound
+case: CPU GEMMs take longer than GPU GEMMs, so the wait
+kernel actually waits for the worker to drain. Per-replay
+wall = 29 ms ≈ 56 × 500 μs CPU-bound. M3's wait correctly
+serializes against CPU completion in this regime — no signal
+is dropped, no deadlock.
+
+### M3 net-win estimate (unchanged in direction; framed as upper bound)
+
+§1c.27's no_sync_hostfn cgl delta was 273 ms over 156 launches
+× 56 fires = ~31 μs per fire of cgl wall saved. M3's new
+captured nodes (submit host_fn — same as today + wait kernel
+~5.9 μs from the earlier kernel-spin smoke) add roughly the
+existing host_fn cost (~1.5 μs dispatch + spin) plus a small
+wait kernel launch cost. Per-fire delta is bounded above by
+the §1c.27 measurement; **the actual M3 saving in vLLM is an
+upper-bound estimate of ~+179 ms/generate at B=1, with the
+caveat that real-mode CPU/GPU overlap behavior, vLLM's
+graph-launch dispatch overhead, and Python boundary costs
+are not modeled by this smoke.**
+
+### Recommendation — UPDATED
+
+The production-shaped smoke clears the reviewer's gates:
+
+* No stale waits, drops, dups, deadlocks ✓
+* Host-mapped visibility works ✓
+* Submit-to-worker-start ~100 ns p50 (preserves overlap
+  window) ✓
+* Overlap behavior matches expectation in both GPU-bound
+  and CPU-bound regimes ✓
+* Wait kernel correctly serializes against CPU completion
+  when CPU is the bottleneck ✓
+
+**Prototype M3 in vLLM behind a feature flag.** Submit side
+stays as the existing `cudaLaunchHostFunc(dispatch_cb)` —
+this is critical for preserving CPU GEMM start latency.
+Sync side replaces `cudaLaunchHostFunc(sync_cb)` with the
+custom `m3_wait_kernel`. Real-mode A/B with bit-exact
+output at `temperature=0` is the headline correctness gate;
+wall-clock gate target is +179 ms/generate (with the
+upper-bound caveat above).
+
+Fall-back path if the vLLM prototype regresses despite the
+smoke: drop to `native_eager` as the practical Phase 1c
+landing path.
+
 ## Artifacts
 
 * `value_signal_smoke.cu` — M2-side (submit-replacement) test.
-* `m3_smoke.cu` — M3-side (sync-replacement) test.
-* `value_signal_smoke`, `m3_smoke` — built binaries (gitignored).
-* `result_*.json` — machine-readable per-config outputs (M2 and
-  M3 both).
-* `result_*.txt` — full stdout per config (gitignored).
+* `m3_smoke.cu` — first M3 smoke (kernel-spin request+wait,
+  too coupled — kept as a measured stepping stone).
+* `m3_submit_hostfn_wait_kernel_smoke.cu` — production-shaped
+  M3 smoke (submit host_fn + wait kernel, preserves overlap).
+* All three binaries gitignored; sources + JSON outputs
+  committed.

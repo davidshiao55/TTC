@@ -1,0 +1,23 @@
+{
+  "mode":"m3_submit_hostfn_wait_kernel",
+  "replays":1000,
+  "tasks":56,
+  "gpu_delay_us":100,
+  "cpu_work_us":500,
+  "poll_ns":0,
+  "sync_each":true,
+  "expected_observations":56000,
+  "total_observed":56000,
+  "per_task_min":1000,
+  "per_task_max":1000,
+  "stale_signals":0,
+  "coalesced_advances":0,
+  "replay_wall_ns":29321166949,
+  "per_replay_wall_us":29321.17,
+  "submit_to_worker_start_p50_ns":99,
+  "submit_to_worker_start_p90_ns":29360373,
+  "submit_to_worker_start_max_ns":30952854,
+  "latency_samples":55987,
+  "combined_checksum":"0x0000000000000000",
+  "assertion_failures":0
+}

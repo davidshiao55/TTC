@@ -261,10 +261,29 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   --sync-each), vs **~31 μs per-fire** host_fn(sync_cb) cost
   implied by §1c.27's no_sync_hostfn cgl delta (273 ms / 156
   launches / 56 fires per launch). M3 saves ~25 μs per fire
-  ≈ +179 ms/generate at B=1, 56 ops × 128 forwards. Next
-  step: prototype M3 in vLLM behind a feature flag. Submit
-  side stays as the existing host_fn(dispatch_cb); only sync
-  is replaced. Real-mode A/B with output bit-exact at
+  ≈ **upper-bound estimate +179 ms/generate** at B=1, 56 ops
+  × 128 forwards (the smoke doesn't model real-mode CPU/GPU
+  overlap, vLLM graph-launch dispatch overhead, or Python
+  boundary costs). The first M3 smoke
+  (`m3_smoke.cu`) had ONE captured kernel doing BOTH request
+  AND wait, collapsing the CPU/GPU overlap window — reviewer
+  correctly flagged this. The production-shaped smoke
+  (`m3_submit_hostfn_wait_kernel_smoke.cu`) tests the right
+  sequence: `cudaLaunchHostFunc(submit_cb)` → optional GPU
+  delay kernel → custom `m3_wait_kernel` (kernel-spin on a
+  worker-written done counter; NOT literal
+  `cuStreamWaitValue32`, which has a stale-wait trap across
+  replays). All four production-shaped configs pass:
+  56,000/56,000 observations, no stale, no deadlock; submit-
+  to-worker-start p50 = **88-103 ns** (CPU GEMM start
+  preserved at the existing host_fn pattern's level);
+  overlap behavior correct in both GPU-bound (full overlap)
+  and CPU-bound (wait correctly serializes against worker)
+  regimes. Next step: prototype M3 in vLLM behind a feature
+  flag. Submit side stays as the existing
+  `cudaLaunchHostFunc(dispatch_cb)`; only the
+  `cudaLaunchHostFunc(sync_cb)` is replaced with
+  `m3_wait_kernel`. Real-mode A/B with output bit-exact at
   `temperature=0` is the headline correctness gate. If the
   vLLM prototype regresses despite the smoke result, fall
   back to `native_eager` as Phase 1c landing path. See
