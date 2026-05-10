@@ -140,6 +140,138 @@ def test_worker_throw_with_m3_does_not_hang_wait_kernel():
         ci.check_error()
 
 
+def test_sync_or_wait_launches_kernel_when_has_error_already_set():
+    """§1c.29 commit 2 review-fix: a sync_or_wait_on_stream call
+    must launch the wait kernel even when has_error_ was set by
+    an EARLIER worker task (i.e., before this dispatch was issued).
+
+    Failure mode being guarded: if sync_or_wait_on_stream calls
+    check_error() before launching the wait kernel, a stale
+    has_error_ from a previous dispatch raises into Python and the
+    captured wait kernel is never recorded/launched. The captured
+    graph then has no done_slot consumer, the stream wedges, and
+    the next entry point that would surface the error never gets
+    to run.
+
+    Setup:
+      1. Force a worker throw on dispatch #1 — has_error_ becomes
+         true, done_slot=1 published in finally.
+      2. Drain stream #1.
+      3. WITHOUT clearing has_error_, issue dispatch #2 to a
+         healthy slab and call sync_or_wait_on_stream. The
+         no-check launcher must record the wait kernel; the
+         worker's done publish releases it; stream #2 sync
+         returns within the watchdog.
+    """
+    from vllm._cots_C import CotsCpuInfer
+
+    # Two slabs: 0 = MLP-fail (scratch=0), 1 = dryrun-noop (always
+    # succeeds). install_m3 for both.
+    ci = CotsCpuInfer()
+    ci.install(n_slabs=2, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+
+    in_dim = 4
+    inter_per_half = 8
+    out_dim = 2
+    x_pin = torch.empty(2 * in_dim, dtype=torch.bfloat16, pin_memory=True)
+    y_pin = torch.empty(2 * out_dim, dtype=torch.bfloat16, pin_memory=True)
+    w_gate = torch.empty(inter_per_half * in_dim, dtype=torch.bfloat16, pin_memory=True)
+    w_up = torch.empty(inter_per_half * in_dim, dtype=torch.bfloat16, pin_memory=True)
+    w_down = torch.empty(out_dim * inter_per_half, dtype=torch.bfloat16, pin_memory=True)
+    ci.populate_slab_mlp(
+        task_id=0,
+        n_threads=1,
+        bucket_capacity_tokens=1,
+        x_pinned_ptr=x_pin.data_ptr(),
+        in_dim=in_dim,
+        y_pinned_ptr=y_pin.data_ptr(),
+        cpu_out_dim=out_dim,
+        w_gate_ptr=w_gate.data_ptr(),
+        w_gate_rows=inter_per_half,
+        w_up_ptr=w_up.data_ptr(),
+        w_up_rows=inter_per_half,
+        w_down_ptr=w_down.data_ptr(),
+        w_down_rows=out_dim,
+        w_down_cols=inter_per_half,
+        w_down_stride_row=inter_per_half,
+        w_down_stride_col=1,
+        intermediate_per_half=inter_per_half,
+    )
+    # Dryrun slab needs valid pinned pointers even though the
+    # worker never reads them — the slab struct fields must be
+    # populated for layouts the dispatcher walks.
+    x_pin_d = torch.empty(1 * in_dim, dtype=torch.bfloat16, pin_memory=True)
+    y_pin_d = torch.empty(1 * out_dim, dtype=torch.bfloat16, pin_memory=True)
+    _keepalive_d = (x_pin_d, y_pin_d)
+    ci.populate_slab_dryrun(
+        task_id=1,
+        bucket_capacity_tokens=1,
+        x_pinned_ptr=x_pin_d.data_ptr(),
+        in_dim=in_dim,
+        y_pinned_ptr=y_pin_d.data_ptr(),
+        cpu_out_dim=out_dim,
+    )
+    ci.install_m3_for_task(0)
+    ci.install_m3_for_task(1)
+    _keepalive = (x_pin, y_pin, w_gate, w_up, w_down)
+
+    # Phase 1: drive a failing dispatch on slab 0 → has_error_ set.
+    s1 = torch.cuda.Stream()
+    with torch.cuda.stream(s1):
+        ci.submit_on_stream(
+            task_id=0,
+            num_tokens=2,
+            cuda_stream=s1.cuda_stream,
+            x_gpu_ptr=0,
+            x_cols=0,
+            x_stride0=0,
+            x_stride1=1,
+        )
+        ci.sync_or_wait_on_stream(task_id=0, cuda_stream=s1.cuda_stream)
+    assert _bounded_stream_sync(s1, timeout_s=5.0)
+    assert ci.has_error(), "phase 1 should have set has_error_"
+
+    # Phase 2: WITHOUT clearing has_error_, dispatch on slab 1.
+    # The submit_on_stream below will see has_error_ via its own
+    # check_error() and raise — that's the expected Python-side
+    # surfacing point. But we want to verify that IF a captured
+    # graph ALREADY contains a sync_or_wait_on_stream node (from
+    # a capture done before the error), replaying that node still
+    # works. Simulate by calling sync_or_wait_on_stream DIRECTLY,
+    # bypassing submit (which is what a captured graph replay
+    # would effectively do — only stream nodes fire, no Python
+    # entry-point check_error gates).
+    s2 = torch.cuda.Stream()
+    with torch.cuda.stream(s2):
+        # No submit on slab 1 — just exercise the wait launcher
+        # path with has_error_ already set. Worker for slab 1
+        # has not run, so done_slot=0 and req_slot=0; the wait
+        # kernel sees done >= req (both 0) and returns
+        # immediately. This proves the kernel WAS launched —
+        # without the no-check fix, sync_or_wait_on_stream would
+        # raise here from check_error() and the kernel would
+        # never enter the stream.
+        ci.sync_or_wait_on_stream(task_id=1, cuda_stream=s2.cuda_stream)
+    assert _bounded_stream_sync(s2, timeout_s=5.0), (
+        "sync_or_wait_on_stream did not launch the wait kernel after "
+        "has_error_ was already set; the captured stream would wedge"
+    )
+
+    # has_error_ is still set; the next *Python* entry point with
+    # check_error() (e.g., submit_on_stream) surfaces the error.
+    assert ci.has_error()
+    with pytest.raises(RuntimeError, match="scratch_silu_up_"):
+        ci.submit_on_stream(
+            task_id=1,
+            num_tokens=1,
+            cuda_stream=s2.cuda_stream,
+            x_gpu_ptr=0,
+            x_cols=0,
+            x_stride0=0,
+            x_stride1=1,
+        )
+
+
 def test_done_slot_advanced_to_seq_after_worker_throw():
     """Sanity check that backs up the no-deadlock test: after the
     failing dispatch + sync, the host-mapped done_slot is at the seq
