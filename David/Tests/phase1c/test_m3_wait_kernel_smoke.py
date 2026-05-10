@@ -144,6 +144,96 @@ def test_m3_get_without_install_raises(infer):
         infer.m3_get_req_slot(0)
 
 
+def test_m3_wait_captured_graph_replay(infer):
+    """§1c.29 commit 1 review-fix: capture m3_wait_on_stream into a
+    real torch.cuda.CUDAGraph and replay it 100x. The standalone
+    smoke at David/Tests/phase1c/smoke_value_signal/ proved this
+    for raw cuStreamWriteValue32 / cuStreamWaitValue32; this test
+    proves the same property for the _cots_C launcher path so
+    commit 2 can rely on it for the operator graph capture.
+
+    Key replay-safety properties exercised:
+      (a) The captured kernel re-reads dev_req_slot / dev_done_slot
+          on every replay (host-mapped pinned + volatile reads),
+          NOT the values that were resident at capture time.
+      (b) Stable userData / stable kernel pointers across replays
+          (slab address-stable, dev pointers from
+          cudaHostGetDevicePointer are stable for the lifetime of
+          the host alloc).
+      (c) Immediate-resume case is the simplest replay-correctness
+          shape; the lagging-then-release case in
+          test_m3_wait_lagging_then_release covers
+          cross-thread-write semantics.
+    """
+    infer.install_m3_for_task(0)
+    # Pre-warm: launch once outside capture so any first-launch
+    # JIT / lazy-init does not contaminate the capture.
+    infer.m3_set_req_slot(0, 0)
+    infer.m3_set_done_slot(0, 0)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        infer.m3_wait_on_stream(0, s.cuda_stream)
+    s.synchronize()
+
+    # Capture once with the wait as the only graph node.
+    g = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    with torch.cuda.stream(capture_stream):
+        with torch.cuda.graph(g, stream=capture_stream):
+            infer.m3_wait_on_stream(0, capture_stream.cuda_stream)
+
+    # Replay 100x. For each replay, set req=i and done=i BEFORE
+    # replay so the wait kernel resumes immediately (volatile read
+    # of the host-mapped slots picks up the new values).
+    for i in range(1, 101):
+        infer.m3_set_req_slot(0, i)
+        infer.m3_set_done_slot(0, i)
+        g.replay()
+        torch.cuda.current_stream().synchronize()
+    assert infer.m3_get_req_slot(0) == 100
+    assert infer.m3_get_done_slot(0) == 100
+
+
+def test_m3_wait_captured_graph_lagging_release(infer):
+    """§1c.29 commit 1 review-fix: captured-graph lagging case.
+    Replay the captured wait kernel with done < req, then release
+    from a worker thread. Ensures replay does not pin the
+    capture-time values and the kernel actually re-spins on the
+    live host-mapped slot."""
+    infer.install_m3_for_task(0)
+    infer.m3_set_req_slot(0, 0)
+    infer.m3_set_done_slot(0, 0)
+
+    g = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    # Pre-warm before capture (immediate-resume) to defeat any
+    # first-launch lazy paths leaking into the capture.
+    with torch.cuda.stream(capture_stream):
+        infer.m3_wait_on_stream(0, capture_stream.cuda_stream)
+    capture_stream.synchronize()
+    with torch.cuda.stream(capture_stream):
+        with torch.cuda.graph(g, stream=capture_stream):
+            infer.m3_wait_on_stream(0, capture_stream.cuda_stream)
+
+    # Replay with done < req; worker thread releases mid-spin.
+    infer.m3_set_req_slot(0, 7)
+    infer.m3_set_done_slot(0, 0)
+    released = threading.Event()
+
+    def worker():
+        time.sleep(0.05)
+        infer.m3_set_done_slot(0, 7)
+        released.set()
+
+    t = threading.Thread(target=worker)
+    t.start()
+    g.replay()
+    torch.cuda.current_stream().synchronize()
+    t.join(timeout=5.0)
+    assert released.is_set(), "worker did not run before stream sync"
+    assert infer.m3_get_done_slot(0) == 7
+
+
 def test_m3_diag_counters_when_enabled(monkeypatch):
     """Diag-mode wait kernel updates immediate vs lagging
     counters. Requires VLLM_COTS_DIAG=1 BEFORE process import

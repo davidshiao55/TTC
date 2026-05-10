@@ -3152,14 +3152,27 @@ struct TaskSlab {
 class CotsCpuInfer {
     // ... existing fields ...
 
-    // §1c.29 diag counters (incremented when DIAG=1; relaxed
-    // atomic; observational only).
-    std::atomic<int64_t> m3_wait_spin_iters_{0};
-    std::atomic<int64_t> m3_wait_total_ns_{0};
-    std::atomic<int64_t> m3_immediate_resume_count_{0};
-    std::atomic<int64_t> m3_lagging_wait_count_{0};
+    // §1c.29 diag counters. Stored as host-mapped pinned
+    // int64_t cells (NOT std::atomic host fields) so the diag
+    // wait kernel can atomicAdd to them directly from the GPU.
+    // Lazy-allocated by install_m3_for_task ONLY when
+    // VLLM_COTS_DIAG=1 (review-fix: keep production allocation
+    // surface minimal; production never reads these so do not
+    // pay the pinned-allocation failure surface). Freed in the
+    // CotsCpuInfer dtor.
+    int64_t* m3_immediate_resume_host_{nullptr};
+    int64_t* m3_immediate_resume_dev_{nullptr};
+    int64_t* m3_lagging_wait_host_{nullptr};
+    int64_t* m3_lagging_wait_dev_{nullptr};
+    int64_t* m3_spin_iters_host_{nullptr};
+    int64_t* m3_spin_iters_dev_{nullptr};
 };
 ```
+
+The diag kernel and production kernel are separate `__global__`
+functions (no nullable pointer branches in the production hot
+path); m3_wait_on_stream selects between them by re-checking
+`diag_enabled()` at launch time.
 
 `m3_immediate_resume_count` increments when the wait kernel
 finds `done_slot >= req_slot` on its first read (CPU finished
@@ -3190,12 +3203,38 @@ of (3-5) matches the smoke's per-seq timestamp-ring fix.
 
 ```text
 worker.run(WorkerTask t):
-    1. perform CPU GEMM (existing code path: at::linear into
-       y_pinned, etc.)
-    2. atomic_thread_fence(release)  // y_pinned writes visible
-                                     // to GPU before done publish
-    3. *t.slab.host_done_slot = t.seq
+    try:
+        1. perform CPU GEMM (existing code path: at::linear into
+           y_pinned, etc.)
+        2. atomic_thread_fence(release)  // y_pinned writes
+                                         // visible to GPU before
+                                         // done publish
+    catch (std::exception& e):
+        // Existing §1c policy: stash err on CotsCpuInfer so the
+        // next Python-side submit/sync re-raises a RuntimeError
+        // (mirrors Python runner's future.result() re-raise).
+        infer.has_error_ = true
+        infer.last_error_msg_ = e.what()
+    finally:
+        // §1c.29 commit 1 review-fix (mandatory): publish done_slot
+        // ALWAYS, even on exception. If we don't, the captured
+        // m3_wait_kernel will spin forever on done < req and the
+        // GPU stream deadlocks; only Python-side error-checking
+        // happens AFTER the next submit/sync, which never returns
+        // because the stream is wedged. The publish carries no
+        // GEMM result on the failure path — the error flag tells
+        // the next op to bail before reading y_pinned — but the
+        // wait kernel on the GPU side cares only about
+        // done_slot >= seq, so we MUST publish to unblock it.
+        atomic_thread_fence(release)
+        *t.slab.host_done_slot = t.seq
 ```
+
+The try/finally shape is load-bearing for commit 2: a worker
+exception that skips `done_slot = seq` is the only way to
+deadlock the captured-replay path. `test_m3_worker_exception_no_deadlock.py`
+(commit 2) must force a worker throw and assert the next
+`m3_wait_on_stream` does not hang under a stream-sync timeout.
 
 **Captured graph** for a single COTS op (when `cots_m3_wait_kernel=True`):
 
@@ -3268,9 +3307,10 @@ Tests added in `David/Tests/phase1c/`:
 
 | Test | What it validates |
 |---|---|
-| `test_m3_wait_kernel_smoke.py` | Mirror of the standalone CUDA smoke, run via pybind: 100× captured graph replay with M3 enabled; assert no stale/drop/dup, deterministic checksum across replays. |
-| `test_m3_install_safety_gates.py` | Each of the four hard-fail gates above raises `RuntimeError` with the right message. Mirrors `test_ablation_gate_hard_fail.py` (§1c.26) structure. |
-| `test_m3_parity_with_baseline.py` | Bit-exact output at `temperature=0, seed=0` between `cots_m3_wait_kernel=True` and `=False`, on a Qwen2.5-7B 32-token sample. Headline correctness gate. |
+| `test_m3_wait_kernel_smoke.py` | Commit 1: pybind path through `m3_wait_on_stream`; immediate-resume + lagging-then-release + 100× captured-graph replay (in-process). |
+| `test_m3_install_safety_gates.py` | Commit 2: each of the four hard-fail gates above raises `RuntimeError` with the right message. Mirrors `test_ablation_gate_hard_fail.py` (§1c.26) structure. |
+| `test_m3_parity_with_baseline.py` | Commit 2: bit-exact output at `temperature=0, seed=0` between `cots_m3_wait_kernel=True` and `=False`, on a Qwen2.5-7B 32-token sample. Headline correctness gate. |
+| `test_m3_worker_exception_no_deadlock.py` | Commit 2 (review-fix): force a worker-task throw with M3 enabled; assert the next captured-replay returns under a stream-sync timeout (worker's `finally`-publish of `done_slot=seq` releases the wait kernel even on the failure path). |
 
 Bench A/B (in `David/Benchmarks/phase1c/`):
 
