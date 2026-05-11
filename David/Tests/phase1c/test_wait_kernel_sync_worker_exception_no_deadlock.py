@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """§1c.29 commit 2 (review-fix-1) — worker exception + M3 must not deadlock.
 
-The captured `m3_wait_kernel` spins on `done_slot` until it sees
+The captured `cots_wait_done_kernel` spins on `done_slot` until it sees
 `done >= req`. If the worker throws BEFORE reaching the
 `*done_slot = seq` write, the wait kernel spins forever and the GPU
 stream wedges — and Python-side `check_error()` never runs because
@@ -14,7 +14,7 @@ the worker's `what()` as a Python `RuntimeError`, but only after the
 GPU stream is unblocked enough for that call to run at all.
 
 This test is the canary: if the worker's finally-publish is removed
-or the `seq != 0 && m3_installed` guard inverts, the stream
+or the `seq != 0 && wait_kernel_sync_installed` guard inverts, the stream
 synchronize at the end will hang past the timeout — which is far
 worse than the test failing fast.
 """
@@ -97,14 +97,14 @@ def _bounded_stream_sync(stream: torch.cuda.Stream, timeout_s: float) -> bool:
 def test_worker_throw_with_m3_does_not_hang_wait_kernel():
     """Force a worker exception while M3 is installed for the slab.
     Without the finally-publish in RunSlabOnWorker, the captured
-    m3_wait_kernel would spin on `done < req` forever and stream
+    cots_wait_done_kernel would spin on `done < req` forever and stream
     sync would never return. With the publish, done_slot=seq is
     written from the worker's finally block, the wait kernel
     returns, stream sync returns, and the next entry-point call
     surfaces the error as a Python RuntimeError.
     """
     ci, _keepalive = _force_mlp_scratch_unavailable_error()
-    ci.install_m3_for_task(0)
+    ci.install_wait_kernel_sync_for_task(0)
     # Drive everything on a non-default stream so we can sync only
     # the stream we care about and avoid waiting on whatever else
     # may be enqueued process-wide.
@@ -130,7 +130,7 @@ def test_worker_throw_with_m3_does_not_hang_wait_kernel():
     assert returned, (
         "stream.synchronize() did not return within 5s — the worker "
         "exception path likely skipped the done_slot=seq publish, so the "
-        "captured m3_wait_kernel is spinning forever (GPU deadlock)."
+        "captured cots_wait_done_kernel is spinning forever (GPU deadlock)."
     )
 
     # The error must have been recorded; a follow-up entry point
@@ -211,8 +211,8 @@ def test_sync_or_wait_launches_kernel_when_has_error_already_set():
         y_pinned_ptr=y_pin_d.data_ptr(),
         cpu_out_dim=out_dim,
     )
-    ci.install_m3_for_task(0)
-    ci.install_m3_for_task(1)
+    ci.install_wait_kernel_sync_for_task(0)
+    ci.install_wait_kernel_sync_for_task(1)
     _keepalive = (x_pin, y_pin, w_gate, w_up, w_down)
 
     # Phase 1: drive a failing dispatch on slab 0 → has_error_ set.
@@ -278,9 +278,9 @@ def test_done_slot_advanced_to_seq_after_worker_throw():
     that was written to req_slot — i.e., the finally-publish ran.
     Without the publish, done_slot would still be 0 from install."""
     ci, _keepalive = _force_mlp_scratch_unavailable_error()
-    ci.install_m3_for_task(0)
-    assert ci.m3_get_req_slot(0) == 0
-    assert ci.m3_get_done_slot(0) == 0
+    ci.install_wait_kernel_sync_for_task(0)
+    assert ci.wait_kernel_get_req_slot(0) == 0
+    assert ci.wait_kernel_get_done_slot(0) == 0
 
     s = torch.cuda.Stream()
     stream_ptr = s.cuda_stream
@@ -302,8 +302,8 @@ def test_done_slot_advanced_to_seq_after_worker_throw():
     # already saw it, but the host-mapped slot read from CPU may
     # lag by a few hundred ns under heavy traffic).
     time.sleep(0.01)
-    req = ci.m3_get_req_slot(0)
-    done = ci.m3_get_done_slot(0)
+    req = ci.wait_kernel_get_req_slot(0)
+    done = ci.wait_kernel_get_done_slot(0)
     assert req == 1, (
         f"req_slot should have been bumped to 1 by the dispatch_cb "
         f"submit (got {req})"

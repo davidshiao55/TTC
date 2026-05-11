@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """§1c.29 real-model A/B — Qwen2.5-7B M3 wait kernel on/off.
 
-The synthetic stub at `bench_m3_wait_kernel_ab.py` confirmed M3 is
+The synthetic stub at `bench_cots_wait_done_kernel_ab.py` confirmed M3 is
 substrate-positive. THIS bench runs the same A/B on the real model
 with FastTTS-equivalent decode (input=8, output=128) so the
 acceptance gate can be evaluated against the §1c.29 commit-3
@@ -28,8 +28,8 @@ Seven arms (apples-to-apples per the commit-3-real review):
 Two env vars are required for the spin-budget gate to be
 populated:
   * VLLM_COTS_DIAG=1 — enables the diag wait kernel that
-    increments `m3_immediate_resume_count`,
-    `m3_lagging_wait_count`, `m3_wait_spin_iters_total`. Without
+    increments `wait_kernel_immediate_resume_count`,
+    `wait_kernel_lagging_wait_count`, `wait_kernel_spin_iters_total`. Without
     this the production wait kernel runs and the M3 counters
     stay zero.
   * VLLM_COTS_DUMP_COUNTERS=1 — registers the atexit dump in
@@ -116,9 +116,9 @@ def arms_for(threads: int, f_cpu_store: float = DEFAULT_F) -> dict[str, list[str
         "cots_native_eager_real": cots_base,
         "cots_m3_off_capture_dryrun": cots_base + ["--cots-dry-run"],
         "cots_m3_on_capture_dryrun": cots_base
-        + ["--cots-dry-run", "--cots-m3-wait-kernel"],
+        + ["--cots-dry-run", "--cots-capture-sync-mode", "wait_kernel"],
         "cots_m3_off_capture_real": cots_base,
-        "cots_m3_on_capture_real": cots_base + ["--cots-m3-wait-kernel"],
+        "cots_m3_on_capture_real": cots_base + ["--cots-capture-sync-mode", "wait_kernel"],
     }
 
 
@@ -235,8 +235,8 @@ def parse_cots_counters(path: Path) -> dict[str, int]:
     dump isn't found.
 
     NB: VLLM_COTS_DIAG=1 controls whether the diag wait kernel runs
-    (gating m3_immediate_resume_count / m3_lagging_wait_count /
-    m3_wait_spin_iters_total at increment time);
+    (gating wait_kernel_immediate_resume_count / wait_kernel_lagging_wait_count /
+    wait_kernel_spin_iters_total at increment time);
     VLLM_COTS_DUMP_COUNTERS=1 controls whether the atexit dump fires
     (gating whether we can READ the counters). Both are needed for
     the M3 spin-budget gate."""
@@ -245,9 +245,9 @@ def parse_cots_counters(path: Path) -> dict[str, int]:
         return {}
     counters: dict[str, int] = {}
     keys = (
-        "m3_immediate_resume_count",
-        "m3_lagging_wait_count",
-        "m3_wait_spin_iters_total",
+        "wait_kernel_immediate_resume_count",
+        "wait_kernel_lagging_wait_count",
+        "wait_kernel_spin_iters_total",
         "sync_cb_count",
         "sync_cb_wait_total_ns",
         "dispatch_cb_count",
@@ -257,7 +257,7 @@ def parse_cots_counters(path: Path) -> dict[str, int]:
     try:
         for line in log_path.read_text().splitlines():
             # The dump from cots_ops.py:425 prints lines like
-            #   "(EngineCore pid=12345)     m3_lagging_wait_count: 1234"
+            #   "(EngineCore pid=12345)     wait_kernel_lagging_wait_count: 1234"
             # under VLLM_WORKER_MULTIPROC_METHOD=spawn. Strip the
             # engine-prefix and split on ":".
             stripped = line.strip()
@@ -432,7 +432,7 @@ def main() -> None:
                     cell_path("cots_m3_off_capture_real", B, t)
                 )
                 if on_counters and off_counters:
-                    spin = on_counters.get("m3_wait_spin_iters_total", 0)
+                    spin = on_counters.get("wait_kernel_spin_iters_total", 0)
                     saved = off_counters.get("sync_cb_wait_total_ns", 0)
                     spin_ns_est = spin * 100  # PTX nanosleep.u32 100 hint
                     if saved > 0:
@@ -443,8 +443,8 @@ def main() -> None:
                             f"{spin_ns_est/1e6:.2f} ms / {saved/1e6:.2f} ms "
                             f"= {ratio*100:.1f}%   ≤ 10%: {bud}"
                         )
-                        imm = on_counters.get("m3_immediate_resume_count", 0)
-                        lag = on_counters.get("m3_lagging_wait_count", 0)
+                        imm = on_counters.get("wait_kernel_immediate_resume_count", 0)
+                        lag = on_counters.get("wait_kernel_lagging_wait_count", 0)
                         tot = imm + lag
                         if tot:
                             print(

@@ -26,7 +26,7 @@
 //          in production COTS. Tunable via --gpu-delay-us so we
 //          can vary how much time the worker has to finish CPU
 //          work before the wait kernel hits the spin loop.
-//   3. m3_wait_kernel<<<1,1>>>(&req_slot[t], &done_slot[t])
+//   3. cots_wait_done_kernel<<<1,1>>>(&req_slot[t], &done_slot[t])
 //        — busy-spins on done_slot[t] until done >= req. Replay-
 //          safe: req_slot was just written by submit_cb on THIS
 //          replay; done_slot must reach that seq to release the
@@ -91,7 +91,7 @@
 
 // Wait-only kernel: read expected from req_slot, spin until done >=
 // expected.  `volatile` is critical for host-mapped pinned visibility.
-__global__ void m3_wait_kernel(volatile unsigned int* req_slot,
+__global__ void cots_wait_done_kernel(volatile unsigned int* req_slot,
                                volatile unsigned int* done_slot) {
   unsigned int expected = *req_slot;
   unsigned int done;
@@ -272,7 +272,7 @@ int main(int argc, char** argv) {
     }
 
     // 3. Wait kernel — busy-spins until done_slot[t] >= req_slot[t].
-    m3_wait_kernel<<<1, 1, 0, stream>>>(&dev_req[t], &dev_done[t]);
+    cots_wait_done_kernel<<<1, 1, 0, stream>>>(&dev_req[t], &dev_done[t]);
   }
   cudaGraph_t graph = nullptr;
   CUDA_CHECK(cudaStreamEndCapture(stream, &graph));

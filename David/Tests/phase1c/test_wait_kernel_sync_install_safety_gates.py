@@ -3,7 +3,7 @@
 
 `CotsOffloader.post_init` enforces the four hard-fail preconditions
 documented in `David/Docs/phase1c_findings.md` §1c.29 when
-`cots_m3_wait_kernel=True`:
+`cots_capture_sync_mode="wait_kernel"`:
 
   1. cpu_runner != 'native' → RuntimeError
   2. enforce_eager=True     → RuntimeError
@@ -99,7 +99,7 @@ def _drive_post_init(
             config=CotsOffloadConfig(
                 f_cpu_store=0.10,
                 cpu_runner=cpu_runner,
-                cots_m3_wait_kernel=m3,
+                cots_capture_sync_mode=("wait_kernel" if m3 else "host_callback"),
                 kv_biased=True,
             )
         )
@@ -136,7 +136,7 @@ def test_m3_with_python_runner_raises() -> None:
         enforce_eager=True,
         m3=True,
         expect_raise=RuntimeError,
-        raise_match="cots_m3_wait_kernel=True requires cpu_runner='native'",
+        raise_match=r"cots_capture_sync_mode='wait_kernel' requires cpu_runner='native'",
     )
 
 
@@ -150,7 +150,7 @@ def test_m3_with_eager_mode_raises() -> None:
         enforce_eager=True,
         m3=True,
         expect_raise=RuntimeError,
-        raise_match="cots_m3_wait_kernel=True requires enforce_eager=False",
+        raise_match=r"cots_capture_sync_mode='wait_kernel' requires enforce_eager=False",
     )
 
 
@@ -167,7 +167,7 @@ def test_m3_native_graph_passes() -> None:
 
 
 def test_m3_disabled_default_path_unchanged() -> None:
-    """Default config: cots_m3_wait_kernel=False. None of the M3
+    """Default config: cots_capture_sync_mode="host_callback". None of the M3
     gates fire; the legacy sync_cb host_fn path is wired (verified
     indirectly — post_init succeeds under both eager and graph-capture
     mode regardless of cpu_runner, as the existing test suite
@@ -182,7 +182,7 @@ def test_m3_disabled_default_path_unchanged() -> None:
 
 def test_m3_install_marks_every_slab() -> None:
     """After post_init with M3 enabled, every slab in the pool has
-    `m3_installed=True`. Confirms the install_m3 walk reaches all
+    `wait_kernel_sync_installed=True`. Confirms the install_m3 walk reaches all
     task_ids (no off-by-one) and that the per-slab gate inside
     `sync_or_wait_on_stream` will dispatch to the wait kernel for
     every dispatch."""
@@ -195,7 +195,7 @@ def test_m3_install_marks_every_slab() -> None:
             config=CotsOffloadConfig(
                 f_cpu_store=0.10,
                 cpu_runner="native",
-                cots_m3_wait_kernel=True,
+                cots_capture_sync_mode="wait_kernel",
                 kv_biased=True,
             )
         )
@@ -220,8 +220,8 @@ def test_m3_install_marks_every_slab() -> None:
             n_slabs = offloader._runner._n_slabs
             assert n_slabs > 0, "test fixture should produce at least one slab"
             for tid in range(n_slabs):
-                assert infer.m3_installed_for_task(tid), (
-                    f"task_id={tid} not flagged m3_installed after post_init"
+                assert infer.wait_kernel_sync_installed_for_task(tid), (
+                    f"task_id={tid} not flagged wait_kernel_sync_installed after post_init"
                 )
         finally:
             if offloader._runner is not None:

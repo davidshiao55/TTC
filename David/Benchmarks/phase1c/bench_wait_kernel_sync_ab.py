@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """§1c.29 commit 3 — M3 wait kernel A/B benchmark.
 
-Compares the captured COTS path with `cots_m3_wait_kernel=True` (M3
+Compares the captured COTS path with `cots_capture_sync_mode="wait_kernel"` (M3
 on, replaces the captured `cudaLaunchHostFunc(sync_cb)` node with a
-`m3_wait_kernel<<<>>>` reading a host-mapped done_slot) vs
-`cots_m3_wait_kernel=False` (legacy sync_cb host_fn that blocks the
+`cots_wait_done_kernel<<<>>>` reading a host-mapped done_slot) vs
+`cots_capture_sync_mode="host_callback"` (legacy sync_cb host_fn that blocks the
 CUDA driver thread on `TaskQueue::sync(0)`). Submit-side host_fn
 (dispatch_cb) is unchanged in both arms.
 
@@ -30,19 +30,19 @@ Four arms × {dryrun, real}:
 
 The dryrun A/B isolates the SUBSTRATE cost: without real CPU work,
 the only difference between arms is sync_cb-host_fn vs
-m3_wait_kernel. The real A/B reflects the production workload — if
+cots_wait_done_kernel. The real A/B reflects the production workload — if
 M3 helps in dryrun but loses in real, the spin cost dominates and
 the whole approach should be revisited.
 
 Diag mode: when run with VLLM_COTS_DIAG=1, the diag wait kernel
-captures `m3_immediate_resume_count`, `m3_lagging_wait_count`, and
-`m3_wait_spin_iters_total`. The bench prints these as the canary
+captures `wait_kernel_immediate_resume_count`, `wait_kernel_lagging_wait_count`, and
+`wait_kernel_spin_iters_total`. The bench prints these as the canary
 the §1c.29 design called out — high lagging count means CPU GEMM
 exceeds the GPU window (M3 has nothing to recover).
 
 Run:
-    /opt/conda/envs/thesis/bin/python bench_m3_wait_kernel_ab.py
-    VLLM_COTS_DIAG=1 /opt/conda/envs/thesis/bin/python bench_m3_wait_kernel_ab.py
+    /opt/conda/envs/thesis/bin/python bench_cots_wait_done_kernel_ab.py
+    VLLM_COTS_DIAG=1 /opt/conda/envs/thesis/bin/python bench_cots_wait_done_kernel_ab.py
 """
 
 from __future__ import annotations
@@ -146,7 +146,7 @@ def _build_offloaded_stub(
                 cpu_runner="native",
                 kv_biased=True,
                 dry_run=dry_run,
-                cots_m3_wait_kernel=m3,
+                cots_capture_sync_mode=("wait_kernel" if m3 else "host_callback"),
             )
         )
         set_offloader(offloader)
@@ -360,9 +360,9 @@ def main() -> int:
     # Diag-mode counter dump (only meaningful with VLLM_COTS_DIAG=1).
     for arm in arms:
         if arm["m3"] and arm["diag_counters"]:
-            imm = arm["diag_counters"].get("m3_immediate_resume_count", 0)
-            lag = arm["diag_counters"].get("m3_lagging_wait_count", 0)
-            spin = arm["diag_counters"].get("m3_wait_spin_iters_total", 0)
+            imm = arm["diag_counters"].get("wait_kernel_immediate_resume_count", 0)
+            lag = arm["diag_counters"].get("wait_kernel_lagging_wait_count", 0)
+            spin = arm["diag_counters"].get("wait_kernel_spin_iters_total", 0)
             tot = imm + lag
             ratio = (lag / tot) if tot > 0 else 0.0
             print(f"  {arm['label']:>15} diag — immediate={imm}, lagging={lag} "
@@ -386,7 +386,7 @@ def main() -> int:
     diag_on = _os.environ.get("VLLM_COTS_DIAG", "0") == "1"
     args.results_dir.mkdir(parents=True, exist_ok=True)
     suffix = "_diag" if diag_on else ""
-    out_path = args.results_dir / f"bench_m3_wait_kernel_ab{suffix}.json"
+    out_path = args.results_dir / f"bench_cots_wait_done_kernel_ab{suffix}.json"
     out_path.write_text(json.dumps({
         "args": vars(args) | {"results_dir": str(args.results_dir)},
         "arms": arms,

@@ -2,8 +2,8 @@
 """§1c.29 commit 2 — M3 wait-kernel parity gate.
 
 Captured-graph replay results MUST match between the legacy
-`cudaLaunchHostFunc(sync_cb)` path (`cots_m3_wait_kernel=False`) and
-the M3 path (`cots_m3_wait_kernel=True`) at bf16 tolerance, on both
+`cudaLaunchHostFunc(sync_cb)` path (`cots_capture_sync_mode="host_callback"`) and
+the M3 path (`cots_capture_sync_mode="wait_kernel"`) at bf16 tolerance, on both
 the QKV operator and the MLP-block operator. Same inputs / same
 weights / same captured graph topology except the sync node — any
 output divergence indicates the M3 ordering or done_slot publish is
@@ -134,7 +134,7 @@ def _build_qkv(*, f_cpu_store: float, m3: bool) -> tuple[_QkvLayer, CotsOffloade
                 f_prefetch=0.0,
                 kv_biased=True,
                 cpu_runner="native",
-                cots_m3_wait_kernel=m3,
+                cots_capture_sync_mode=("wait_kernel" if m3 else "host_callback"),
             )
         )
         set_offloader(offloader)
@@ -162,7 +162,7 @@ def _build_mlp(*, f_cpu_store: float, m3: bool) -> tuple[_MlpLayer, CotsOffloade
                 f_prefetch=0.0,
                 kv_biased=True,
                 cpu_runner="native",
-                cots_m3_wait_kernel=m3,
+                cots_capture_sync_mode=("wait_kernel" if m3 else "host_callback"),
             )
         )
         set_offloader(offloader)
@@ -215,7 +215,7 @@ def test_qkv_m3_matches_baseline(f_cpu_store: float) -> None:
     M3-off (within bf16 atol). This is the load-bearing parity gate
     for the operator-side M3 wiring: the captured graph is identical
     in every node EXCEPT the sync node (sync_cb host_fn vs
-    m3_wait_kernel), so any divergence indicates the M3 ordering or
+    cots_wait_done_kernel), so any divergence indicates the M3 ordering or
     done_slot publish is broken."""
     torch.manual_seed(31)
     x = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
@@ -282,7 +282,7 @@ def test_mlp_m3_matches_baseline(f_cpu_store: float) -> None:
 
 def test_diag_counters_increment_under_m3() -> None:
     """When VLLM_COTS_DIAG=1 is set BEFORE process start, the diag
-    wait kernel runs and `m3_immediate_resume_count + m3_lagging_wait_count`
+    wait kernel runs and `wait_kernel_immediate_resume_count + wait_kernel_lagging_wait_count`
     increments by exactly the captured wait-kernel fire count per
     replay. Skipped when env is not set (the env is read once at
     diag_enabled() first call; setting it mid-process is a no-op)."""
@@ -308,12 +308,12 @@ def test_diag_counters_increment_under_m3() -> None:
         # 5 replays × N wait-kernel fires per replay.
         counters = dict(infer.get_counters())
         total = (
-            counters.get("m3_immediate_resume_count", 0)
-            + counters.get("m3_lagging_wait_count", 0)
+            counters.get("wait_kernel_immediate_resume_count", 0)
+            + counters.get("wait_kernel_lagging_wait_count", 0)
         )
         assert total > 0, (
-            f"diag mode active but neither m3_immediate_resume_count "
-            f"nor m3_lagging_wait_count incremented; got {counters}"
+            f"diag mode active but neither wait_kernel_immediate_resume_count "
+            f"nor wait_kernel_lagging_wait_count incremented; got {counters}"
         )
         assert len(replays) == 5
     finally:
