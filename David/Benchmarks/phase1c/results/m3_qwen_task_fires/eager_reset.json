@@ -1,0 +1,396 @@
+{
+  "runner_1": [
+    {
+      "task_id": 0,
+      "layer_idx": 0,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 1,
+      "layer_idx": 1,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 2,
+      "layer_idx": 2,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 3,
+      "layer_idx": 3,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 4,
+      "layer_idx": 4,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 5,
+      "layer_idx": 5,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 6,
+      "layer_idx": 6,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 7,
+      "layer_idx": 7,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 8,
+      "layer_idx": 8,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 9,
+      "layer_idx": 9,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 10,
+      "layer_idx": 10,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 11,
+      "layer_idx": 11,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 12,
+      "layer_idx": 12,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 13,
+      "layer_idx": 13,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 14,
+      "layer_idx": 14,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 15,
+      "layer_idx": 15,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 16,
+      "layer_idx": 16,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 17,
+      "layer_idx": 17,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 18,
+      "layer_idx": 18,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 19,
+      "layer_idx": 19,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 20,
+      "layer_idx": 20,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 21,
+      "layer_idx": 21,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 22,
+      "layer_idx": 22,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 23,
+      "layer_idx": 23,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 24,
+      "layer_idx": 24,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 25,
+      "layer_idx": 25,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 26,
+      "layer_idx": 26,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 27,
+      "layer_idx": 27,
+      "bucket": 8192,
+      "op_kind": "qkv",
+      "fire_count": 130
+    },
+    {
+      "task_id": 28,
+      "layer_idx": 0,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 29,
+      "layer_idx": 1,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 30,
+      "layer_idx": 2,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 31,
+      "layer_idx": 3,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 32,
+      "layer_idx": 4,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 33,
+      "layer_idx": 5,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 34,
+      "layer_idx": 6,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 35,
+      "layer_idx": 7,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 36,
+      "layer_idx": 8,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 37,
+      "layer_idx": 9,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 38,
+      "layer_idx": 10,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 39,
+      "layer_idx": 11,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 40,
+      "layer_idx": 12,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 41,
+      "layer_idx": 13,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 42,
+      "layer_idx": 14,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 43,
+      "layer_idx": 15,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 44,
+      "layer_idx": 16,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 45,
+      "layer_idx": 17,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 46,
+      "layer_idx": 18,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 47,
+      "layer_idx": 19,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 48,
+      "layer_idx": 20,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 49,
+      "layer_idx": 21,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 50,
+      "layer_idx": 22,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 51,
+      "layer_idx": 23,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 52,
+      "layer_idx": 24,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 53,
+      "layer_idx": 25,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 54,
+      "layer_idx": 26,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    },
+    {
+      "task_id": 55,
+      "layer_idx": 27,
+      "bucket": 8192,
+      "op_kind": "mlp_block",
+      "fire_count": 130
+    }
+  ]
+}

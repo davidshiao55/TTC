@@ -334,23 +334,26 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   guidance: enforce_eager=True + native runner + legacy
   sync_cb. See §1c.31 below.
 - §1c.32 — nsys attribution of the +88 ms captured-vs-eager
-  penalty. Three traces (eager / m3 / none_capture) at
-  default workload reveal: (i) the captured FULL graph fires
-  **35% MORE COTS dispatch_cb nodes per forward** than eager
-  (76.7 vs 56.4 ops/forward) — initially hypothesised as
-  zero-row short-circuit artifacts; (ii) the wait kernel's
-  actual per-fire time is ~44 µs median, not the 100 ns PTX
-  hint estimate from §1c.29; (iii) GPU GEMM work is
-  comparable across arms but COTS worker op count is higher.
-  See §1c.32 below.
-- §1c.33 — per-task fire-count diagnostic refutes the
-  zero-row hypothesis. Same 56 (layer, op_kind) slabs fire
-  in BOTH arms; M3 just fires each one ~1.69× per forward
-  (1.72 vs 1.02). Not removable as zero-row — it's intrinsic
-  to captured host_fn replay (graph fires the node every
-  replay regardless of token state). Reviewer's pragmatic
-  guidance accepted: production path for Phase 2 is **native
-  eager**; the captured+M3 optimization stays backlogged.
+  penalty (PARTIALLY RETRACTED — see §1c.33 review-fix).
+  Original reading was (i) captured FULL graph fires 35% MORE
+  COTS dispatch_cb per forward + (ii) wait kernel actual
+  per-fire time ~44 µs median (not 100 ns). Item (ii) holds;
+  item (i) was a measurement artifact (capture-time fires
+  not excluded from the trace). Item (iii) — GPU GEMM
+  comparable — still holds. See §1c.32 below.
+- §1c.33 — per-task fire-count diagnostic. First run
+  appeared to refute the zero-row hypothesis with M3 firing
+  each slab ~1.69× more than eager, but the reviewer flagged
+  that the measurement window included capture-time fires.
+  The reset-isolated rerun (with the existing §1c.22
+  `VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE=1` hook
+  fired) shows op counts are essentially identical: M3 has
+  **0.8% FEWER** replay fires than eager (56.44 vs 56.88
+  ops/forward). Op count is NOT the cause of the +88 ms
+  penalty; the remaining suspects are wait-kernel per-op
+  cost, cudaGraphLaunch overhead, and the lost CPU/GPU
+  overlap window. Reviewer's production guidance (native
+  eager for Phase 2; capture + M3 stay backlogged) stands.
   See §1c.33 below.
 
 ---
@@ -3248,17 +3251,78 @@ Artifacts under `David/Benchmarks/phase1c/results/m3_qwen_task_fires/`.
 | Slabs in pool | 56 (single bucket=8192) | 2,856 (51 buckets × 56) |
 | op_kind distribution | qkv=3640, mlp_block=3640 | qkv=6160, mlp_block=6160 |
 
-**Key result: M3 fires each of the SAME slabs ~1.69× per
-forward**, not "extra slabs". The op-count delta is uniform
-across QKV and MLP (50/50 each). All 28 layers fire. Only one
-bucket fires in each arm (8192 for eager because eager uses
-`max_num_batched_tokens`; 512 for M3 because that's the
-cudagraph_capture_sizes value the FULL graph replays for B=1).
+**First-diagnostic result (CONTAMINATED — included
+capture-time fires)**: 56 slabs, 220 fires/slab in M3 vs 130 in
+eager, suggesting "1.69× more captured fires per forward."
 
-**The zero-row hypothesis is refuted**: there are no extra
-slabs / layers / buckets. The exact same 56 (layer, op_kind)
-tuples fire in both arms; M3 fires each one ~1.7× per
-forward.
+**Reviewer §1c.33 review-fix flagged**: the run did NOT set
+`VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE=1`, so the
+dumped counts included graph-record/capture activity, not just
+replay-time fires. The §1c.22 `post_cudagraph_capture` hook
+exists exactly to zero the counters at the
+end-of-capture/start-of-measurement boundary; it just wasn't
+turned on.
+
+**Reset-isolated rerun (canonical result):**
+
+| | Eager | M3 capture (post-capture reset) |
+|---|---:|---:|
+| Total fires (1 generate) | 7,280 | **7,224** |
+| Unique slabs fired | 56 | 56 |
+| Fires/slab | 130 | **129** |
+| Fires/forward (128 fwds) | 56.88 | **56.44** |
+| Fires/slab/forward | 1.016 ≈ 1 | **1.008 ≈ 1** |
+| op_kind dist. | qkv=3640, mlp=3640 | qkv=3612, mlp=3612 |
+
+**Δ: M3 has 56 FEWER replay fires than eager (-0.8%).** Op
+count is essentially identical between arms once capture-time
+fires are excluded. **The original §1c.33 "1.69×" conclusion
+was an artifact of measuring across both capture and replay.**
+
+The captured-replay log shows the reset hook fired correctly:
+
+```
+(EngineCore pid=…) INFO [cots.py:3300] [cots §1c.22]
+  reset_all_counters() fired post-cudagraph-capture
+```
+
+The 5,096 fires the original §1c.33 attributed to
+"extra captured-graph dispatches per forward" were actually
+fired during graph capture warmup (the recording phase that
+walks each captured graph instance once).
+
+**Implications for §1c.32:**
+* The NVTX figure "76.7 ops/forward in M3 vs 56.4 in eager"
+  was likewise contaminated by capture-time fires (the NVTX
+  trace ran with 1 warmup + 1 measured iter; capture happens
+  during warmup).
+* **Op count is NOT the cause of the +88 ms captured-vs-eager
+  penalty.** The replay fires identical counts.
+* The remaining suspects for the +88 ms:
+  1. **Wait kernel per-op cost** — median 44 µs/fire ×
+     ~7200 fires = ~317 ms of kernel-occupancy time, parallel
+     with GEMM but adds SM-launch overhead.
+  2. **cudaGraphLaunch overhead** (§1c.32 measured ~15 ms
+     median per launch × 256 launches / 2 generates =
+     ~3.84 s aggregate, much of which is the captured host_fn
+     fires synchronized into the launch).
+  3. **Lost CPU/GPU overlap window** — eager Python
+     orchestration runs concurrently with worker; capture has
+     no Python loop to overlap with, so worker CPU time is
+     fully exposed.
+
+The reviewer's pragmatic guidance — "use native eager as the
+production path for Phase 2 and backlog this as a
+capture-specific optimization" — still stands. The op-count
+red herring is now removed; the actual penalty sources are
+items 1-3 above, none of which has a small fix.
+
+**Doc-level correction**: §1c.32's "captured FULL graph fires
+35% MORE COTS dispatch_cb nodes per forward" claim is
+RETRACTED. Replay-only fires are within 1% of eager. The
+NVTX trace would need to be rerun with the same reset hook to
+get a clean replay-only NVTX count; the current §1c.32 numbers
+are capture-contaminated.
 
 **Likely actual cause**: vLLM's captured FULL graph + Python
 orchestration interplay. Each forward at B=1 produces SOME
@@ -3283,12 +3347,13 @@ captured host_fn nodes fire on every replay). The cross-check
 confirms: capture is firing dispatch_cb extra without going
 through the Python wrapper.
 
-**This is NOT a removable zero-row artifact.** It's the
-fundamental property of captured-graph replay: the host_fn
-node fires whenever the graph replays. Eager fires once per
+**Provisional read** (pending the reset-isolated rerun
+above): the captured host_fn semantics mean the host_fn node
+fires whenever the graph replays. Eager fires once per
 Python-side dispatch; capture fires once per replay regardless
-of whether Python wanted that op for this token. Reducing
-this would require either:
+of whether Python wanted that op for this token. IF the
+reset-isolated rerun confirms replay-only M3 fires/slab
+≫ eager's, the levers to reduce it would be:
 
 * Pruning captured `dispatch_cb` nodes whose recorded
   num_tokens at capture time is "trash" (e.g., capture-time
@@ -3353,7 +3418,19 @@ breaks the original budget but not the wall-clock conclusion (the
 wait kernel uses 1 SM × 1 block, parallel SMs continue with GEMM
 work).
 
-#### COTS op-count delta (captured vs eager): 35% MORE ops in M3
+#### COTS op-count delta (captured vs eager): 35% MORE ops in M3 — RETRACTED, see §1c.33 review-fix
+
+> **RETRACTED**: this section's "+35% ops/forward" claim was a
+> measurement artifact — the NVTX trace ran without the
+> `VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE=1` env
+> set, so the captured arm's counts included graph-capture
+> warmup fires on top of replay fires. The reset-isolated
+> rerun in §1c.33 review-fix shows replay-only op counts are
+> within **1% between arms** (56.44 vs 56.88 ops/forward), so
+> op count does not explain the +88 ms penalty. The original
+> §1c.32 paragraph below is preserved verbatim for the
+> historical record; treat it as "what the unreset trace said,
+> not what is true".
 
 NVTX `cots:dispatch_cb` instance counts per `cots:model_forward`:
 * Eager (model_forward[NONE]):  14,448 dispatch_cb / 256 forwards = **56.4 ops/forward**
