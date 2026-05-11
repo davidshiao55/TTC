@@ -117,15 +117,13 @@ def test_native_cots_runner_construct_install_close():
     assert isinstance(r._runner_id, int)
     r.install(
         slab_specs=[],
-        scratch_max_tokens=0,
-        scratch_max_intermediate_per_half=0,
+        max_num_tokens=0,
     )
     # Re-install raises.
     with pytest.raises(RuntimeError, match="install\\(\\) called twice"):
         r.install(
             slab_specs=[],
-            scratch_max_tokens=0,
-            scratch_max_intermediate_per_half=0,
+            max_num_tokens=0,
         )
     r.close()
 

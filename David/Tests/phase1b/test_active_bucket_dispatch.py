@@ -231,12 +231,8 @@ def _setup_synthetic(n_layers=N_LAYERS, table=None):
         layer_handles.append([c, r])
         flat.extend([c, r])
     CotsPrefetchBufferPool(flat, torch.device("cuda"))
-    for h in flat:
-        if h.kind == "row" and h.max_n_prefetch > 0:
-            h.w_row_prefetch_src_t = torch.empty(
-                (h.max_n_prefetch, h.out_dim),
-                dtype=h.dtype, device="cpu", pin_memory=True,
-            )
+    # Stage 7-C: row-handle's transposed w_cpu IS the prefetch
+    # source — no separate `w_row_prefetch_src_t` allocation.
     streamer = WeightPrefetchStreamer(n_layers=n_layers)
     return layer_handles, streamer
 
@@ -441,11 +437,8 @@ def test_available_greater_than_required_consumes_only_active():
     n_cpu_per_half_total = h_col.n_cpu // 2
     torch.manual_seed(0)
     h_col.w_cpu.copy_(torch.randn_like(h_col.w_cpu).to(DTYPE))
+    # Stage 7-C: row w_cpu is (n_cpu, out_dim) — random fill matches.
     h_row.w_cpu.copy_(torch.randn_like(h_row.w_cpu).to(DTYPE))
-    if h_row.w_row_prefetch_src_t is not None:
-        h_row.w_row_prefetch_src_t.copy_(
-            h_row.w_cpu[:, : h_row.max_n_prefetch].transpose(0, 1).contiguous()
-        )
 
     slot_col = h_col.w_prefetch_slots[h_col.slot_idx]
     slot_col[:max_half_col, :].copy_(h_col.w_cpu[:max_half_col, :])
@@ -458,8 +451,9 @@ def test_available_greater_than_required_consumes_only_active():
     h_col.prefetch_owner_in_slot[h_col.slot_idx] = h_col
 
     m_row = h_row.max_n_prefetch
+    # Stage 7-C: row prefetch source is w_cpu directly (transposed layout).
     h_row.w_prefetch_slots[h_row.slot_idx][:m_row, :].copy_(
-        h_row.w_row_prefetch_src_t[:m_row, :]
+        h_row.w_cpu[:m_row, :]
     )
     h_row.prefetch_available_rows_in_slot[h_row.slot_idx] = m_row
     h_row.prefetch_owner_in_slot[h_row.slot_idx] = h_row

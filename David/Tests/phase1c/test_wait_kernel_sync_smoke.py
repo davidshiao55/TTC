@@ -45,7 +45,7 @@ def infer():
     from vllm._cots_C import CotsCpuInfer
 
     inst = CotsCpuInfer()
-    inst.install(n_slabs=4, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+    inst.install(n_slabs=4, max_num_tokens=0)
     yield inst
     # Destructor runs when `inst` goes out of scope; that frees
     # the host-mapped slots.
@@ -276,7 +276,7 @@ def test_m3_diag_counters_when_enabled(monkeypatch):
     from vllm._cots_C import CotsCpuInfer
 
     inst = CotsCpuInfer()
-    inst.install(n_slabs=2, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+    inst.install(n_slabs=2, max_num_tokens=0)
     inst.install_wait_kernel_sync_for_task(0)
     inst.reset_counters()
 

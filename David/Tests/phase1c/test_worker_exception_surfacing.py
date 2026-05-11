@@ -23,12 +23,18 @@ from vllm._cots_C import CotsCpuInfer
 pytestmark = pytest.mark.needs_cuda
 
 
-def _force_mlp_scratch_unavailable_error():
-    """Install with `scratch_max_intermediate_per_half=0` so the worker's
-    `TORCH_CHECK(scratch_silu_up_.defined(), ...)` (vllm/csrc/cots/
-    cots_cpu_infer.cpp MLP block dispatch) trips when an MLP slab is
-    submitted. This is a deterministic, side-effect-free way to drive
-    the worker into the catch handler.
+def _force_mlp_worker_error():
+    """Install + populate an MLP slab with a deliberate K-dimension
+    mismatch between the down-proj weight and the silu*up intermediate
+    so the worker's bf16_gemm_transposed_at TORCH_CHECK trips. This is
+    a deterministic, side-effect-free way to drive the worker into the
+    catch handler.
+
+    Pre-Stage-7-C this helper exploited a `scratch_silu_up_` undefined
+    check (the worker used a per-instance scratch tensor); Stage 7-C
+    removed the scratch usage and the silu*up result is allocated
+    in-place per call. The new trip-wire is the shape-validation
+    TORCH_CHECK inside the custom kernel.
 
     Returns ``(ci, keepalive)``. The caller MUST bind ``keepalive``
     locally so the pinned-host backing buffers outlive the C++ slab —
@@ -36,7 +42,7 @@ def _force_mlp_scratch_unavailable_error():
     smuggle the keepalive onto the instance.
     """
     ci = CotsCpuInfer()
-    ci.install(n_slabs=1, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+    ci.install(n_slabs=1, max_num_tokens=0)
 
     in_dim = 4
     inter_per_half = 8
@@ -69,8 +75,6 @@ def _force_mlp_scratch_unavailable_error():
         w_down_ptr=w_down.data_ptr(),
         w_down_rows=out_dim,
         w_down_cols=inter_per_half,
-        w_down_stride_row=inter_per_half,
-        w_down_stride_col=1,
         intermediate_per_half=inter_per_half,
     )
     keepalive = (x_pin, y_pin, w_gate, w_up, w_down)
@@ -84,7 +88,7 @@ def test_worker_throw_does_not_hang_sync():
     the stream from the host. If the test completes within the timeout,
     the pending counter was decremented despite the throw.
     """
-    ci, _keepalive = _force_mlp_scratch_unavailable_error()
+    ci, _keepalive = _force_mlp_worker_error()
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
     ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
@@ -100,7 +104,7 @@ def test_worker_throw_does_not_hang_sync():
 
 
 def test_check_error_raises_runtime_error_with_message():
-    ci, _keepalive = _force_mlp_scratch_unavailable_error()
+    ci, _keepalive = _force_mlp_worker_error()
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
     ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
@@ -111,7 +115,7 @@ def test_check_error_raises_runtime_error_with_message():
     # Direct check_error() call surfaces the worker's std::runtime_error
     # as a Python RuntimeError. The message must carry the C++ what()
     # so callers can diagnose the failure.
-    with pytest.raises(RuntimeError, match="scratch_silu_up_"):
+    with pytest.raises(RuntimeError, match=r"\[cots worker\]"):
         ci.check_error()
 
     # check_error() consumes the error — has_error() now False, and a
@@ -124,7 +128,7 @@ def test_next_submit_call_re_raises_after_worker_failure():
     """Surfacing path that mirrors Python runner's future.result(): the
     NEXT entry point call (after a worker failure) re-raises.
     """
-    ci, _keepalive = _force_mlp_scratch_unavailable_error()
+    ci, _keepalive = _force_mlp_worker_error()
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
     ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
@@ -132,12 +136,12 @@ def test_next_submit_call_re_raises_after_worker_failure():
     torch.cuda.current_stream().synchronize()
 
     # The next submit_on_stream call's check_error() surfaces.
-    with pytest.raises(RuntimeError, match="scratch_silu_up_"):
+    with pytest.raises(RuntimeError, match=r"\[cots worker\]"):
         ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
 
 
 def test_take_error_consumes_state():
-    ci, _keepalive = _force_mlp_scratch_unavailable_error()
+    ci, _keepalive = _force_mlp_worker_error()
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
     ci.submit_on_stream(task_id=0, num_tokens=2, cuda_stream=stream_ptr, x_gpu_ptr=0, x_cols=0, x_stride0=0, x_stride1=1)
@@ -146,7 +150,7 @@ def test_take_error_consumes_state():
     assert ci.has_error()
 
     msg = ci.take_error()
-    assert "scratch_silu_up_" in msg
+    assert "[cots worker]" in msg
     assert not ci.has_error()
     # check_error() is now clean — the entry-point guard does not fire on
     # subsequent calls. We DON'T queue another submit_on_stream here:

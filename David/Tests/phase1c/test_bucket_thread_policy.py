@@ -77,8 +77,7 @@ def test_worker_observes_slab_n_threads(n_threads: int) -> None:
     """
     ci = CotsCpuInfer()
     ci.install(
-        n_slabs=1, scratch_max_tokens=1, scratch_max_intermediate_per_half=0
-    )
+        n_slabs=1, max_num_tokens=1)
     _keepalive = _populate_qkv_slab(ci, task_id=0, n_threads=n_threads)
     _drive_one_qkv_slab(ci)
     assert not ci.has_error()
@@ -98,8 +97,7 @@ def test_per_bucket_n_threads_takes_effect() -> None:
     """
     ci = CotsCpuInfer()
     ci.install(
-        n_slabs=3, scratch_max_tokens=1, scratch_max_intermediate_per_half=0
-    )
+        n_slabs=3, max_num_tokens=1)
     keepalives = [
         _populate_qkv_slab(ci, task_id=i, n_threads=n)
         for i, n in enumerate([1, 4, 8])
@@ -210,8 +208,7 @@ def test_set_worker_affinity_zero_mask_is_noop() -> None:
     continues to run."""
     ci = CotsCpuInfer()
     ci.install(
-        n_slabs=1, scratch_max_tokens=1, scratch_max_intermediate_per_half=0
-    )
+        n_slabs=1, max_num_tokens=1)
     keepalive = _populate_qkv_slab(ci, task_id=0, n_threads=1)
     ci.set_worker_affinity(0)
     _drive_one_qkv_slab(ci)
@@ -234,8 +231,7 @@ def test_set_worker_affinity_accepts_high_bit() -> None:
     """
     ci = CotsCpuInfer()
     ci.install(
-        n_slabs=1, scratch_max_tokens=1, scratch_max_intermediate_per_half=0
-    )
+        n_slabs=1, max_num_tokens=1)
     keepalive = _populate_qkv_slab(ci, task_id=0, n_threads=1)
     # 1 << 63 would fail under the prior int64_t binding with TypeError
     # ("int too big to convert"). Now passes through as uint64.
@@ -265,8 +261,7 @@ def test_set_worker_affinity_with_intersected_mask_succeeds() -> None:
 
     ci = CotsCpuInfer()
     ci.install(
-        n_slabs=1, scratch_max_tokens=1, scratch_max_intermediate_per_half=0
-    )
+        n_slabs=1, max_num_tokens=1)
     keepalive = _populate_qkv_slab(ci, task_id=0, n_threads=1)
     ci.set_worker_affinity(mask)
     # Drive a real task — implicitly drains the affinity-set

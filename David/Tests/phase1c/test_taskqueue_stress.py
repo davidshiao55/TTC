@@ -14,14 +14,14 @@ from vllm._cots_C import CotsCpuInfer
 
 def test_drain_empty_queue_is_noop():
     ci = CotsCpuInfer()
-    ci.install(n_slabs=0, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+    ci.install(n_slabs=0, max_num_tokens=0)
     ci.sync_blocking()  # should return immediately on empty queue
     assert not ci.has_error()
 
 
 def test_burst_drains():
     ci = CotsCpuInfer()
-    ci.install(n_slabs=0, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+    ci.install(n_slabs=0, max_num_tokens=0)
     ci.submit_dryrun_burst(1000)
     ci.sync_blocking()
     assert not ci.has_error()
@@ -32,7 +32,7 @@ def test_large_burst_drains_within_budget():
     is enqueue overhead + cv signaling. Budget is generous (2 s) — this
     is a correctness test, not a perf bench."""
     ci = CotsCpuInfer()
-    ci.install(n_slabs=0, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+    ci.install(n_slabs=0, max_num_tokens=0)
     t0 = time.perf_counter()
     ci.submit_dryrun_burst(100_000)
     ci.sync_blocking()
@@ -45,7 +45,7 @@ def test_repeated_burst_then_drain_stable():
     """Multiple submit/drain cycles on the same instance. Catches any
     bug where the queue's pending-counter or head/tail atomics drift."""
     ci = CotsCpuInfer()
-    ci.install(n_slabs=0, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+    ci.install(n_slabs=0, max_num_tokens=0)
     for _ in range(10):
         ci.submit_dryrun_burst(500)
         ci.sync_blocking()
@@ -58,7 +58,7 @@ def test_destruct_drains_pending():
     destructing TaskQueue."""
     for _ in range(5):
         ci = CotsCpuInfer()
-        ci.install(n_slabs=0, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+        ci.install(n_slabs=0, max_num_tokens=0)
         ci.submit_dryrun_burst(200)
         # No explicit sync; rely on destructor.
         del ci

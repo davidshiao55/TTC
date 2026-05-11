@@ -34,7 +34,7 @@ def runner():
     from vllm._cots_C import CotsCpuInfer
 
     ci = CotsCpuInfer()
-    ci.install(n_slabs=2, scratch_max_tokens=8, scratch_max_intermediate_per_half=0)
+    ci.install(n_slabs=2, max_num_tokens=8)
     yield ci
 
 
@@ -155,8 +155,7 @@ def test_replay_bucket_counters_read_capacity_not_num_tokens():
     LIVE = 1
 
     ci = CotsCpuInfer()
-    ci.install(n_slabs=1, scratch_max_tokens=BUCKET,
-               scratch_max_intermediate_per_half=0)
+    ci.install(n_slabs=1, max_num_tokens=BUCKET)
 
     # Pinned bufs sized for the bucket so the worker's at::from_blob
     # views have valid backing storage.

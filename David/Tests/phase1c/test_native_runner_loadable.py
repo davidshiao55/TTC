@@ -21,14 +21,14 @@ def test_install_zero_slabs_ok():
     from vllm._cots_C import CotsCpuInfer
 
     ci = CotsCpuInfer()
-    ci.install(n_slabs=0, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+    ci.install(n_slabs=0, max_num_tokens=0)
 
 
 def test_install_some_slabs_then_dryrun():
     from vllm._cots_C import CotsCpuInfer
 
     ci = CotsCpuInfer()
-    ci.install(n_slabs=8, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+    ci.install(n_slabs=8, max_num_tokens=0)
     for i in range(8):
         ci.populate_slab_dryrun(i, bucket_capacity_tokens=0, x_pinned_ptr=0, in_dim=0, y_pinned_ptr=0, cpu_out_dim=0)
     # Just confirms the no-CUDA path works (TaskQueue alone, no host callback).

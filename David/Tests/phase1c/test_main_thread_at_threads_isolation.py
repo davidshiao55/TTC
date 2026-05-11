@@ -76,8 +76,7 @@ def test_worker_set_num_threads_does_not_leak_to_main_thread() -> None:
 
     ci = CotsCpuInfer()
     ci.install(
-        n_slabs=1, scratch_max_tokens=1, scratch_max_intermediate_per_half=0
-    )
+        n_slabs=1, max_num_tokens=1)
     keepalive = _populate_one_qkv_slab(ci, n_threads=worker_n)
 
     stream = torch.cuda.current_stream().cuda_stream
@@ -125,8 +124,7 @@ def test_repeated_slab_dispatch_keeps_main_thread_isolated() -> None:
     n_slabs = len(n_threads_sequence)
     ci.install(
         n_slabs=n_slabs,
-        scratch_max_tokens=1,
-        scratch_max_intermediate_per_half=0,
+        max_num_tokens=1,
     )
     keepalives = []
     for i, n in enumerate(n_threads_sequence):

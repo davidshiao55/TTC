@@ -92,14 +92,9 @@ def _setup_layers(n_layers=4, table=None):
         flat_handles.extend([c, r])
 
     CotsPrefetchBufferPool(flat_handles, torch.device("cuda"))
-    # Phase 1b row-prefetch fix: allocate the transposed pinned-CPU
-    # source for row handles (mirrors `_install_prefetch_machinery`).
-    for h in flat_handles:
-        if h.kind == "row" and h.max_n_prefetch > 0:
-            h.w_row_prefetch_src_t = torch.empty(
-                (h.max_n_prefetch, h.out_dim),
-                dtype=h.dtype, device="cpu", pin_memory=True,
-            )
+    # Stage 7-C: no separate `w_row_prefetch_src_t` allocation —
+    # row-handle's `w_cpu` is now stored in transposed layout
+    # `(n_cpu, out_dim)` directly.
     streamer = WeightPrefetchStreamer(n_layers=n_layers)
     streamer.set_current_bucket(1, lambda _n: 1)
     return layer_handles, streamer
@@ -112,8 +107,8 @@ def test_start_h2d_copies_correct_bytes():
       col : slot[:n//2] == w_cpu[:n//2]            (gate prefix)
             slot[n//2:n] == w_cpu[n_cpu_per_half_total : n_cpu_per_half_total+n//2]
                                                    (up prefix — matched-index)
-      row : slot[:n, :].T == w_cpu[:, :n]          (Phase 1b transposed
-                                                   prefetch source —
+      row : slot[:n, :] == w_cpu[:n, :]            (Stage 7-C unified
+                                                   transposed source —
                                                    contiguous narrow on
                                                    dim 0)
     """
@@ -123,12 +118,6 @@ def test_start_h2d_copies_correct_bytes():
     for handles in layers:
         for h in handles:
             h.w_cpu.copy_(torch.randn_like(h.w_cpu).to(DTYPE))
-            if h.kind == "row" and h.w_row_prefetch_src_t is not None:
-                # Mirror the loader closure: transposed prefix.
-                m = h.max_n_prefetch
-                h.w_row_prefetch_src_t.copy_(
-                    h.w_cpu[:, :m].transpose(0, 1).contiguous()
-                )
 
     streamer.start(0, layers[0])
     streamer.copy_stream.synchronize()
@@ -137,10 +126,11 @@ def test_start_h2d_copies_correct_bytes():
         n = h.n_prefetch_by_bucket[1]
         slot = h.w_prefetch_slots[h.slot_idx]
         if h.kind == "row":
-            # Transposed slot: slot[:n, :] is contiguous and equals
-            # w_cpu[:, :n].T.
+            # Stage 7-C: row w_cpu is (n_cpu, out_dim) transposed
+            # storage. Slot prefix matches w_cpu prefix directly —
+            # no `.T` step.
             dst = slot.narrow(0, 0, n).cpu()
-            src = h.w_cpu[:, :n].T.contiguous().cpu()
+            src = h.w_cpu[:n, :].cpu()
             assert torch.equal(dst, src), f"row H2D mismatch on {h.qualified_name}"
         elif h.kind == "col":
             # Fixed-max layout: gate at `[0:max_half]`, up at

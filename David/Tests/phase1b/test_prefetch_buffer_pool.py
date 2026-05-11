@@ -106,9 +106,10 @@ def test_pool_allocates_k2_slots_per_handle():
 
 def test_slot_shape_matches_kind_layout():
     """col/qkv slot is `(max_n_prefetch, in_dim)`; row slot is
-    `(max_n_prefetch, out_dim)` — Phase 1b row-prefetch fix transposes
-    the row slot so contiguous H2D from `w_row_prefetch_src_t` lands
-    on a contiguous destination."""
+    `(max_n_prefetch, out_dim)` — matches Stage 7-C's unified
+    transposed `w_cpu` layout so the H2D source `w_cpu.narrow(0, 0,
+    n_pref)` and the slot destination both narrow on dim 0 and are
+    contiguous."""
     qkv = _qkv_handle()
     col = _col_handle()
     row = _row_handle()
@@ -277,9 +278,10 @@ def test_runtime_narrow_works_at_smaller_buckets():
 
 def test_h2d_copy_into_slot_smoke():
     """End-to-end smoke: pinned CPU source → GPU slot via copy_. col/qkv
-    use the contiguous narrow(0, ...) on `w_cpu`. Row uses the
-    transposed `w_row_prefetch_src_t` source (Phase 1b row-prefetch
-    fix); both source and slot are narrowed on dim 0, both contiguous."""
+    use the contiguous narrow(0, ...) on `w_cpu`. Row also uses
+    `w_cpu.narrow(0, ...)` — Stage 7-C flipped row-handle storage
+    to transposed `(n_cpu, out_dim)` so the prefetch source is the
+    same buffer as the CPU-compute source (no duplicate)."""
     col = _col_handle(n_cpu_per_half=64, half=128)  # small for fast test
     row = _row_handle(n_cpu=64, in_dim=128)
     table = {1: (0.20, 0.10)}
@@ -287,21 +289,12 @@ def test_h2d_copy_into_slot_smoke():
         h.apply_prefetch_split_per_bucket(table)
 
     CotsPrefetchBufferPool([col, row], torch.device("cuda"))
-    # Transposed source — populated manually in this test (offloader
-    # would do this in `_install_prefetch_machinery` + the row loader).
-    row.w_row_prefetch_src_t = torch.empty(
-        (row.max_n_prefetch, row.out_dim),
-        dtype=row.dtype, device="cpu", pin_memory=True,
-    )
 
     torch.manual_seed(0)
-    # Fill w_cpu with deterministic values.
+    # Fill w_cpu with deterministic values. row.w_cpu is now
+    # `(n_cpu, out_dim)` post-Stage-7-C — randn matches its shape.
     col.w_cpu.copy_(torch.randn_like(col.w_cpu).to(DTYPE))
     row.w_cpu.copy_(torch.randn_like(row.w_cpu).to(DTYPE))
-    # Mirror the loader: transposed prefix.
-    row.w_row_prefetch_src_t.copy_(
-        row.w_cpu[:, : row.max_n_prefetch].transpose(0, 1).contiguous()
-    )
 
     # H2D into slot 0. Both narrows are on dim 0 → contiguous.
     col_n = col.n_prefetch_by_bucket[1]
@@ -309,8 +302,10 @@ def test_h2d_copy_into_slot_smoke():
     col.w_prefetch_slots[0].narrow(0, 0, col_n).copy_(
         col.w_cpu.narrow(0, 0, col_n)
     )
+    # Stage 7-C: row prefetch reads directly from w_cpu (transposed
+    # layout) — no separate duplicate buffer.
     row.w_prefetch_slots[0].narrow(0, 0, row_n).copy_(
-        row.w_row_prefetch_src_t.narrow(0, 0, row_n)
+        row.w_cpu.narrow(0, 0, row_n)
     )
     torch.cuda.synchronize()
 
@@ -319,7 +314,8 @@ def test_h2d_copy_into_slot_smoke():
     col_src = col.w_cpu.narrow(0, 0, col_n).cpu()
     assert torch.equal(col_dst, col_src)
 
-    # Transposed slot back to (out_dim, row_n) for comparison with w_cpu.
-    row_dst = row.w_prefetch_slots[0].narrow(0, 0, row_n).cpu().T.contiguous()
-    row_src = row.w_cpu.narrow(1, 0, row_n).contiguous()
+    # Stage 7-C: row w_cpu is transposed (n_cpu, out_dim) — slot
+    # prefix matches w_cpu prefix directly, no `.T` needed.
+    row_dst = row.w_prefetch_slots[0].narrow(0, 0, row_n).cpu()
+    row_src = row.w_cpu.narrow(0, 0, row_n).cpu()
     assert torch.equal(row_dst, row_src)

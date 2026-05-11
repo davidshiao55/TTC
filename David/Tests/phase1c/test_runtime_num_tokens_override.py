@@ -56,8 +56,7 @@ def _new_runner_with_qkv_slab(
     cots_ops.install_infer(
         r._runner_id,
         n_slabs=1,
-        scratch_max_tokens=bucket_size,
-        scratch_max_intermediate_per_half=0,
+        max_num_tokens=bucket_size,
     )
     x_pin = torch.empty(bucket_size, in_dim, dtype=torch.bfloat16, pin_memory=True)
     y_pin = torch.empty(bucket_size, n_cpu, dtype=torch.bfloat16, pin_memory=True)
@@ -323,8 +322,7 @@ def test_set_runtime_num_tokens_negative_raises() -> None:
     r = cots.NativeCotsRunner(dry_run=False)
     try:
         cots_ops.install_infer(
-            r._runner_id, n_slabs=0, scratch_max_tokens=0,
-            scratch_max_intermediate_per_half=0,
+            r._runner_id, n_slabs=0, max_num_tokens=0,
         )
         infer = cots_ops._lookup_infer(r._runner_id, "test")
         with pytest.raises(RuntimeError, match="< 0"):

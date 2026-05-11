@@ -202,8 +202,7 @@ def _make_dryrun_runner() -> cots.NativeCotsRunner:
     )
     r.install(
         slab_specs=[slab],
-        scratch_max_tokens=4,
-        scratch_max_intermediate_per_half=0,
+        max_num_tokens=4,
     )
     return r
 

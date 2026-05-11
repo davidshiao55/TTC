@@ -88,6 +88,11 @@ def _make_handle_qkv(q_size, kv_size, n_cpu, head_dim, in_dim,
 # Row loader
 # ---------------------------------------------------------------------------
 def test_row_loader_splits_correctly():
+    """Stage 7-C: row-handle stores w_cpu in TRANSPOSED layout
+    `(n_cpu, out_dim)` — the prior natural `(out_dim, n_cpu)` was
+    replaced because the row-prefetch source needs contiguous rows.
+    Loader does the one-shot transpose at load time.
+    """
     in_dim, out_dim = 256, 128
     n_cpu = 32
     keep_gpu = in_dim - n_cpu
@@ -99,11 +104,16 @@ def test_row_loader_splits_correctly():
 
     assert linear.weight.data.shape == (out_dim, keep_gpu)
     assert torch.equal(linear.weight.data, loaded[:, :keep_gpu])
-    assert torch.equal(handle.w_cpu, loaded[:, keep_gpu:].cpu())
+    # w_cpu is now (n_cpu, out_dim) — transposed CPU storage.
+    assert handle.w_cpu.shape == (n_cpu, out_dim)
+    assert torch.equal(
+        handle.w_cpu, loaded[:, keep_gpu:].transpose(0, 1).contiguous().cpu()
+    )
 
 
 def test_row_loader_does_not_retain_loaded_weight():
-    """Two consecutive loads should write through cleanly — no stale ref."""
+    """Two consecutive loads should write through cleanly — no stale ref.
+    Stage 7-C: load-time transpose into `(n_cpu, out_dim)`."""
     in_dim, out_dim = 256, 128
     n_cpu = 32
     keep_gpu = in_dim - n_cpu
@@ -116,8 +126,10 @@ def test_row_loader_does_not_retain_loaded_weight():
     linear.weight_loader(linear.weight, loaded2)
 
     assert torch.equal(linear.weight.data, loaded2[:, :keep_gpu])
-    assert torch.equal(handle.w_cpu, loaded2[:, keep_gpu:].cpu())
-    assert not torch.equal(handle.w_cpu, loaded1[:, keep_gpu:].cpu())
+    expected2 = loaded2[:, keep_gpu:].transpose(0, 1).contiguous().cpu()
+    expected1 = loaded1[:, keep_gpu:].transpose(0, 1).contiguous().cpu()
+    assert torch.equal(handle.w_cpu, expected2)
+    assert not torch.equal(handle.w_cpu, expected1)
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +250,9 @@ def test_install_pins_w_cpu_and_replaces_param():
     handle, linear = _make_handle_row(in_dim=128, out_dim=64, n_cpu=16)
     assert handle.w_cpu is not None
     assert handle.w_cpu.is_pinned()
-    assert handle.w_cpu.shape == (64, 16)
+    # Stage 7-C: row-handle stores transposed `(n_cpu, out_dim)`
+    # layout — was `(out_dim, n_cpu)` pre-flip.
+    assert handle.w_cpu.shape == (16, 64)
     assert handle.w_cpu.dtype == torch.bfloat16
     assert handle.cpu_indices_cuda is not None
     assert handle.cpu_indices_cuda.device.type == "cuda"

@@ -22,7 +22,7 @@ def runner():
     from vllm._cots_C import CotsCpuInfer
 
     ci = CotsCpuInfer()
-    ci.install(n_slabs=4, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+    ci.install(n_slabs=4, max_num_tokens=0)
     for i in range(4):
         ci.populate_slab_dryrun(i, bucket_capacity_tokens=0, x_pinned_ptr=0, in_dim=0, y_pinned_ptr=0, cpu_out_dim=0)
     yield ci

@@ -32,8 +32,7 @@ def _new_runner_with_qkv_slab(
     cots_ops.install_infer(
         r._runner_id,
         n_slabs=1,
-        scratch_max_tokens=num_tokens,
-        scratch_max_intermediate_per_half=0,
+        max_num_tokens=num_tokens,
     )
     x_pin = torch.empty(num_tokens, in_dim, dtype=torch.bfloat16, pin_memory=True)
     y_pin = torch.empty(num_tokens, n_cpu, dtype=torch.bfloat16, pin_memory=True)

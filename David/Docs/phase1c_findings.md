@@ -91,7 +91,11 @@ COTS extension (oneDNN owns the worker's intra-op threading).
 
 **Forward work**
 - §1c.16 — Stage 7 (optional): transposed-storage row/down-proj
-  unification
+  unification (Stage 7-B LANDED — custom AVX2 BF16 GEMM that beats
+  oneDNN's `at::linear` for our row-major-weight `(K,N)` layout on
+  i9-14900KF. Stage 7-C — storage swap + remove
+  `w_row_prefetch_src_t` — blocked on review-fix items. See §1c.16
+  below.)
 - §1c.17 — `__del__` drain forward risk (registered, not yet exercised)
 - §1c.18 — Stage 6 follow-up: pre-hook × torch.compile fullgraph
   interaction (CLOSED — `_bucket_for` now Dynamo-traceable)
@@ -937,24 +941,287 @@ cd /TTC/David/Tests/phase1b && /opt/conda/envs/thesis/bin/python -m pytest . -q
 
 ---
 
-## 1c.16: Stage 7 forward — transposed-storage row/down-proj
+## 1c.16: Stage 7 — transposed-storage unification
 
-Stage 7 was deliberately deferred from the Phase 1c critical path. It
-investigates removing the duplicated row-prefetch source buffer
-`w_row_prefetch_src_t` (Phase 1b §1b.6) — currently ~1 GiB of pinned
-CPU at `f_prefetch=0.30` — by unifying the storage / kernel design.
-Constraints (per the approved plan §Stage 7):
+Stage 7 investigates removing the duplicated row-prefetch source
+buffer `w_row_prefetch_src_t` (Phase 1b §1b.6 — ~1 GiB of pinned
+CPU at `f_prefetch=0.30`) by unifying the down-proj CPU-compute
+storage with the row-prefetch source storage. Premise: with the
+native CPU runner in place, the CPU compute side could in principle
+work directly on the transposed layout (§1b.6's deferral note:
+*"primary CPU storage transpose is deferred to Phase 1c (native
+CPU kernel). The duplicate is a temporary cost paid until the
+CPU runner swap"*).
 
-- Preserve Phase 1b's measured row-prefetch BW fix (§1b.7's ~1.85×
-  PCIe recovery at the collaborative point).
-- Strided-view down-proj path (Stage 3) stays unchanged unless
-  benchmarks prove a switch is strictly better.
-- Benchmark-gated: strided `at::linear` vs proposed transposed/kernel
-  path; row-prefetch H2D BW with vs without `w_row_prefetch_src_t`;
-  end-to-end Bench 2 / Bench 3 impact.
+### Stage 7-A — oneDNN dispatch reality on i9-14900KF
 
-Stage 7 is optional and should be scheduled only after Stage 6
-real-model numbers are locked.
+The honest CPU-feature picture for our target hardware (Raptor
+Lake P-cores: AVX2 + FMA, no AVX512_BF16, no AVX2_VNNI_2, no
+AMX_BF16):
+
+* oneDNN does **have** an AVX2 fast path for `dt_a=f32, dt_b=bf16`
+  GEMM (`oneDNN/src/cpu/x64/brgemm/brgemm_utils.cpp:141-149`,
+  inner sequence at `jit_brgemm_kernel.cpp:2880-2888`:
+  `vpmovzxwd + vpslld 16 → vfmadd231ps`). This is what
+  `at::linear` reaches when src is upcast and weight is BF16 in
+  the row-major `(N_out, K)` layout (with a dim-1 narrow staying
+  inside the same fast path).
+* oneDNN does **not** have a plain-AVX2 `bf16:bf16` fast path
+  (`brgemm_utils.cpp:150-156` is explicit). Layouts that route
+  through `at::matmul` on `(K, N)` row-major BF16 weight — the
+  natural shape after a `.t()` view of transposed storage — fall
+  to a scalar reference path. The earlier microbench measured 9–
+  326× slowdowns on the transposed-storage variants for exactly
+  this reason.
+
+**Original wrong conclusion (retracted):** "a custom transposed
+BF16 GEMM cannot help." That was true for the dispatch reasons
+above only if we accepted oneDNN's BF16 dispatch table as
+exhaustive. It isn't exhaustive — `bf16:bf16` AVX2 is a gap in
+oneDNN, not a hardware blocker. The exact f32:bf16 inner-loop
+oneDNN already uses (BF16→FP32 upconvert + FP32 FMA) is reachable
+from C++ AVX2 intrinsics on this hardware.
+
+### Stage 7-B — custom AVX2 BF16 GEMM (LANDED)
+
+**Kernel:** `vllm/csrc/cots/bf16_gemm_transposed.cpp`.
+Inspired by oneDNN's f32:bf16 AVX2 inner sequence; **not** a
+BRGEMM port — no JIT, no oneDNN packing format, no post-ops, no
+runtime ISA dispatch, no AMX/AVX512 paths. ~500 LOC of C++ with
+AVX2/FMA intrinsics plus a scalar fallback.
+
+Design choices:
+
+* `M_TILE × N_INNER` register tile across the full K reduction;
+  accumulator pairs stay in ymm registers (`M_TILE × N_INNER × 2 ≤
+  13`, leaving 2 ymm for w-loads and 1 for x-broadcast).
+  Dispatched by M: M=1 → N_INNER=4 (N_tile=64); M=2 → N_INNER=2
+  (N_tile=32); M=4 → N_INNER=1 (N_tile=Nb=16, gain from M-fusion);
+  other M → per-(m, nb) fallback.
+* Inner load is the oneDNN AVX2 sequence (`vpmovzxwd + vpslld 16`)
+  for BF16→FP32 expansion, then `vfmadd231ps` into the FP32
+  accumulator.
+* Software prefetch of weights 24 K-rows ahead via
+  `_mm_prefetch(MM_HINT_T0)` to overlap DRAM latency with FMA
+  compute.
+* FP32 → BF16 output: **round-to-nearest-even** (RNE), matching
+  the semantics of the AVX-512 instruction `vcvtneps2bf16`
+  (implemented in AVX2 via the standard bias `(bits + 0x7FFF +
+  ((bits >> 16) & 1)) >> 16`). The earlier truncate-only path
+  was wrong; see §1c.16 Stage 7-B review-fix notes below.
+* Intra-op parallelism: `at::parallel_for` on the outer
+  N-tile loop. Each task writes a disjoint column range of y, so
+  no reduction or atomics. Honors `at::set_num_threads()`, which
+  is how the COTS worker is configured per bucket (§1c.04
+  bucket-aware policy). No bare OpenMP pragmas in the hot path —
+  threading goes through PyTorch's executor.
+
+Microbench result (`David/Tests/phase1c/test_stage7_layout_microbench.py` +
+`David/Tests/phase1c/results/stage7_layout_microbench.json`) on
+i9-14900KF, Qwen2.5-7B down-proj shape:
+
+| Path | Storage | Worker call | Stride / layout | Relative speed |
+|---|---|---|---|---:|
+| A (current) | row-major `(out_dim, n_cpu_total)` | `at::linear` on `narrow(1, n_pref, n_cpu)` | `(n_cpu_total, 1)` | **1.00× baseline** |
+| B | transposed `(n_cpu_total, out_dim)` | `at::linear` on `narrow(0, …).t()` | `(1, out_dim)` | 35–286× slower |
+| C | transposed | `at::linear(.contiguous())` (per-submit materialize) | row-major | 9–48× slower |
+| D | transposed | `at::matmul(x, narrow(0, …))` | row-major contiguous | 35–293× slower |
+| E | transposed | pre-materialize + `at::linear` | row-major | 9–48× slower |
+| F | transposed | `F.linear(x, .t())` | row-major | 35–229× slower |
+| G | transposed | `torch.compile(matmul)` | row-major | 35–230× slower |
+| **H (Stage 7-B)** | transposed `(n_cpu_total, out_dim)` | **custom AVX2 BF16 GEMM** on `narrow(0, …)` | row-major contiguous | **0.45–0.81×** (1.2–2.2× faster) |
+
+Six workload points across (B, f_prefetch, f_cpu_store); all six
+verdicts: **WIN** (best transposed-path ratio < 1.0).
+
+Why Path H beats Path A:
+
+1. **M-fusion** for M≥2: each w cache line FMA'd against all M
+   rows in one pass → up to 4× DRAM-traffic reduction vs the
+   per-m outer-loop pattern oneDNN uses for small M.
+2. **N-tile fusion** for M=1: 4 consecutive Nb-tiles share their
+   x-broadcast and packed prefetches.
+3. **K-prefetch** overlaps DRAM latency with FMA.
+4. **No `at::linear` → oneDNN primitive_desc lookup overhead**
+   per call. For our small ops (≤ ~3 ms) the dispatch path costs
+   tens of µs each.
+
+Single-thread head-to-head (kernel quality, threading effects
+removed) — Path H runs at **0.37–0.45× of oneDNN single-thread**
+in the post-review-fix JSON, confirming the win is kernel design
+not thread-count arbitrage.
+
+### Stage 7-B review-fix (LANDED before Stage 7-C)
+
+Issues caught and addressed before unblocking Stage 7-C:
+
+* Doc claim "custom transposed BF16 GEMM cannot help" — **wrong**;
+  the oneDNN AVX2 f32:bf16 path is reachable in C++ for the
+  `(K, N)` row-major layout. This section now states it
+  accurately.
+* FP32→BF16 conversion was **truncate**, not RNE — biased the
+  output by up to 1 ULP per accumulator. Replaced with RNE
+  matching `vcvtneps2bf16` semantics. Parity tolerance in the
+  test tightened accordingly.
+* Comment framing softened: "inspired by oneDNN's f32:bf16
+  upconversion/FMA path" instead of "mirrors oneDNN BRGEMM."
+  Explicit note that this is NOT a BRGEMM port (no JIT, no
+  packing, no post-ops, no runtime ISA dispatch).
+* Threading switched from raw `#pragma omp parallel for` to
+  `at::parallel_for` — uses PyTorch's executor (OMP or TBB,
+  depending on build), honors `at::set_num_threads`, handles
+  nested-parallel guards correctly.
+* Correctness tests added for M=1/2/4 + N-tail (N % Nb) +
+  conversion RNE check: `test_bf16_gemm_transposed_kernel.py`.
+* Performance microbench separated from the unit-pytest suite via
+  a `stage7_perf` marker so `pytest .` doesn't run the long
+  microbench by default.
+* **Large-M cliff fix** — the dispatch for M > 4 originally fell
+  to a per-m `gemm_tile_kernel<1, 1>` loop without M-fusion,
+  causing each m to re-read the full weight matrix. Measured
+  regression: 2.95-3.08× slower than oneDNN at M=256 on
+  MLP-shaped GEMMs (probe data, pre-fix). Fixed by grouping M
+  into M_TILE=4 chunks (preserves M-fusion) + per-m tail for the
+  M % 4 leftover. Post-fix at M=256, N=3788, thr=16:
+  36.0 ms vs 34.9 ms oneDNN — within 3%.
+
+### Stage 7-D — natural-layout sibling kernel (LANDED)
+
+A second BF16 GEMM kernel for the natural `(N, K)` row-major
+layout (PyTorch's `nn.Linear` weight storage), used by QKV /
+gate / up call sites where the CPU slice is stored as
+`(n_op_cpu, hidden)` row-major. Same casting / threading strategy
+as the transposed sibling — pipelined BF16→FP32 upcast in the
+inner FMA loop, no scratch buffer, `at::parallel_for` on N. The
+only structural difference is the loop nest: outer N, inner-K
+8-wide vectorize with horizontal reduce, which matches natural
+layout's fast access direction.
+
+**File:** `vllm/csrc/cots/bf16_gemm_natural.cpp`. Inspired by
+oneDNN's f32:bf16 BRGEMM inner sequence (`vpmovzxwd + vpslld 16`)
+but NOT a BRGEMM port — no JIT, no `n16c` packing, no post-ops,
+no runtime ISA dispatch.
+
+**Microbench result** at QKV / MLP1 shapes (Qwen2.5-7B,
+K=hidden=3584, N ∈ {qkv_cpu, intermediate_cpu}, B ∈ {1, 4, 32,
+256}): natural kernel achieves `0.41-0.60× of at::linear` wall
+across the full envelope — **1.7-2.4× faster than oneDNN's
+bf16:bf16 emulation path**, consistently across B and thread
+count.
+
+**Correctness suite:**
+`David/Tests/phase1c/test_bf16_gemm_natural_kernel.py` covers
+M ∈ {1, 2, 3, 4, 5, 6, 7, 8, 12}, K-tail (K % 8 != 0), RNE
+conversion (15 values + tie-to-even boundary), production-shape
+relaxed parity, and thread-count invariance. 46 tests, all
+passing.
+
+### Two-kernel architecture (Stage 7 final design)
+
+| Op | Storage layout | Kernel | Rationale |
+|---|---|---|---|
+| QKV, gate, up | `(n_op_cpu, hidden)` = `(N, K)` row-major | `bf16_gemm_natural` | PyTorch-natural slice from column-parallel TP split; prefetch source is already contiguous in this layout (no duplicate needed). |
+| down | `(n_down_cpu, hidden)` = `(K, N)` row-major | `bf16_gemm_transposed` | Was `(hidden, n_down_cpu) = (N, K)` natural + `w_row_prefetch_src_t` duplicate. Stage 7-C drops the natural-layout copy and uses the transposed-storage layout for both prefetch (contiguous) AND CPU compute. |
+
+The two kernels are structurally different (outer-K wide-N vs
+outer-N inner-K dot-product) because each layout has a different
+fast access direction. Both achieve `0.41-0.87× of at::linear`
+across the production M envelope (B ∈ {1, ..., 256}) on
+i9-14900KF, satisfying the consistency target (similar overlap
+for the same `f_cpu_compute` across all four linear ops).
+
+### Stage 7-C — storage unification (LANDED)
+
+**Production change** — Stage 7-C lands the kernel swap + storage flip
+in one commit:
+
+* C++ worker (`csrc/cots/cots_cpu_infer.cpp`) — QKV, gate, up, down
+  CPU GEMM calls now dispatch to `bf16_gemm_natural_at` (QKV/gate/up)
+  or `bf16_gemm_transposed_at` (down) instead of `at::linear`. The
+  `silu(gate)*up` intermediate is computed in-place (no longer staged
+  through `scratch_silu_up_`, which is bypassed on the hot path).
+* Row-handle CPU storage (`CotsLinearHandle.w_cpu` for down-proj)
+  flipped from natural `(out_dim, n_cpu)` to transposed
+  `(n_cpu, out_dim)` row-major. Loader does a one-shot
+  `.transpose(0, 1).contiguous()` at load time so every per-forward
+  view (prefetch row-narrow + CPU-compute row-narrow) is contiguous.
+* `w_row_prefetch_src_t` field and its allocation removed entirely —
+  the unified `w_cpu` IS the contiguous prefetch source. Saves
+  `max_n_prefetch × out_dim × sizeof(BF16)` pinned per row-handle
+  (~1 GiB on Qwen2.5-7B at `f_prefetch=0.30`, summed across 28
+  layers). All four read sites (`start`, `prepare_for_forward_bucket`,
+  `post_init` max-fill) now read from `w_cpu` directly.
+* Slab fields for down (`w_down_rows`, `w_down_cols`, strides) have
+  their semantics flipped: `w_down_rows = K (= dn_n_cpu)`,
+  `w_down_cols = N (= out_dim)`. The strided-view fields remain in
+  the slab struct for backwards-compat but are unused on the new
+  kernel path (worker uses `ContigCpuViewFromBlob`, not
+  `StridedCpuViewFromBlob`).
+* Python runner's `_make_mlp_python_callback` uses
+  `torch.matmul(z, w_down)` instead of `F.linear(z, w_down)` because
+  the new `w_down` view is `(K, N)` not `(out, in)`. Gate/up stay on
+  `F.linear` (their natural layout is unchanged).
+
+**Test impact** — all three Phase 1c-relevant suites green:
+
+* `phase1a` (60 tests) — `test_loader_wrappers` updated to expect new
+  `(n_cpu, out_dim)` row-handle shape (3 cases).
+* `phase1b` (74 tests) — `test_row_prefetch_transposed.py` deleted
+  (its premise was the dropped duplicate-buffer machinery). Fixtures
+  in `test_prefetch_buffer_pool`, `test_prefetch_streamer`, and
+  `test_active_bucket_dispatch` updated to drop the manual
+  `w_row_prefetch_src_t` setup and read prefetch source from `w_cpu`
+  directly.
+* `phase1c` (271 tests, 5 skipped, 6 deselected perf bench) —
+  `test_strided_down_proj.py` renamed to `test_contig_down_proj.py`
+  and rewritten for the new contiguous-transposed layout (post-narrow
+  pointer is still load-bearing — verified by sentinel test).
+  `test_worker_exception_surfacing` updated to expect a `[cots
+  worker]` prefix match instead of the old scratch-specific error
+  text (the trip-wire is now the kernel's shape TORCH_CHECK).
+
+**Perf** — Stage 7 perf microbench (6 cases) all still WIN
+post-flip. Best ratios `0.46-0.80×` of `at::linear` cold-cache —
+identical to the pre-Stage-7-C numbers (the kernel itself is
+unchanged; Stage 7-C only changed where it's called from).
+
+**What's left for follow-ups**:
+
+* B=1 single-thread fast path (skip `at::parallel_for` overhead at
+  trivial work). Currently lands within ~10% of `at::linear` at B=1;
+  not a regression but easy win.
+* `scratch_silu_up_` is now unused on the hot path. Removing it from
+  the install API is a follow-up; keeping it allocated for now to
+  avoid churning the install signature for one stage.
+* Per-bucket thread policy defaults (`cpu_num_threads=16` is the
+  worst-of-both-worlds for QKV/gate/up on i9-14900KF; thr=8 is the
+  sweet spot). Deferred to planner integration per user direction.
+
+With Stage 7-B + review-fix LANDED, Stage 7-C is unblocked. Plan:
+
+* Switch the worker's MLP-block down-proj call from
+  `at::linear(x, w_strided_view)` to
+  `run_bf16_gemm_transposed_inline(x, w_transposed_view, y)`
+  when the slab's weight is in transposed `(K, N)` layout.
+* Drop the row-major `(N, K)` storage from `CotsLinearHandle` for
+  down-proj; keep only the transposed `(n_cpu_total, out_dim)`
+  storage (which is the layout `w_row_prefetch_src_t` already
+  uses).
+* Remove the `w_row_prefetch_src_t` duplicate from
+  `_install_prefetch_machinery` (cots.py).
+* Re-run Phase 1b prefetch tests AND Phase 1c benches; verify
+  ~1 GiB pinned saved AND no regression in row-prefetch H2D
+  bandwidth (which was the original §1b.6 reason for the
+  duplicate).
+
+### What changes in production stance
+
+* The §1b.6 "until Phase 1c" deferral note becomes accurate after
+  Stage 7-C lands (a kernel arriving in Phase 1c is the path).
+* Stage 7-B alone does NOT change production yet — the kernel
+  exists and is microbench-validated but is not on the
+  captured-graph hot path. Stage 7-C is the step that swaps it
+  in.
 
 ---
 

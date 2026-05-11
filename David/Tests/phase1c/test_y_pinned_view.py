@@ -32,8 +32,7 @@ def _make_runner_with_one_qkv_slab(
     x_pin = torch.empty(num_tokens, in_dim, dtype=torch.bfloat16, pin_memory=True)
     y_pin = torch.empty(num_tokens, n_cpu, dtype=torch.bfloat16, pin_memory=True)
     w_cpu = torch.empty(n_cpu, in_dim, dtype=torch.bfloat16)
-    r.install(slab_specs=[], scratch_max_tokens=num_tokens,
-              scratch_max_intermediate_per_half=0)
+    r.install(slab_specs=[], max_num_tokens=num_tokens)
     # We didn't pass slab_specs to install (so the slab pool is size 0).
     # Switch strategy: use the per-task populate methods directly via
     # the cots_ops registry, which is what NativeCotsRunner.install
@@ -78,8 +77,7 @@ def test_y_pinned_view_shape_dtype_device() -> None:
     try:
         # install with one slab; we need slab_count > 0 for the pybind
         # call to succeed (the C++ side bounds-checks task_id).
-        r.install(slab_specs=[], scratch_max_tokens=num_tokens,
-                  scratch_max_intermediate_per_half=0)
+        r.install(slab_specs=[], max_num_tokens=num_tokens)
         # n_slabs=0 makes y_pinned_view raise (out-of-range), so do a
         # second install path: we go around `install` and call install_infer
         # directly with n_slabs=1, then populate.
@@ -94,8 +92,7 @@ def test_y_pinned_view_shape_dtype_device() -> None:
         cots_ops.install_infer(
             r._runner_id,
             n_slabs=1,
-            scratch_max_tokens=num_tokens,
-            scratch_max_intermediate_per_half=0,
+            max_num_tokens=num_tokens,
         )
         x_pin = torch.empty(num_tokens, in_dim, dtype=torch.bfloat16,
                             pin_memory=True)
@@ -126,8 +123,7 @@ def test_y_pinned_view_data_ptr_matches_slab() -> None:
         cots_ops.install_infer(
             r._runner_id,
             n_slabs=1,
-            scratch_max_tokens=num_tokens,
-            scratch_max_intermediate_per_half=0,
+            max_num_tokens=num_tokens,
         )
         x_pin = torch.empty(num_tokens, in_dim, dtype=torch.bfloat16,
                             pin_memory=True)
@@ -158,8 +154,7 @@ def test_y_pinned_view_reads_worker_writes() -> None:
         cots_ops.install_infer(
             r._runner_id,
             n_slabs=1,
-            scratch_max_tokens=num_tokens,
-            scratch_max_intermediate_per_half=0,
+            max_num_tokens=num_tokens,
         )
         x_pin = torch.empty(num_tokens, in_dim, dtype=torch.bfloat16,
                             pin_memory=True)
@@ -190,8 +185,7 @@ def test_y_pinned_view_rejects_out_of_range_task_id() -> None:
     r = cots.NativeCotsRunner(dry_run=False)
     try:
         cots_ops.install_infer(
-            r._runner_id, n_slabs=1, scratch_max_tokens=4,
-            scratch_max_intermediate_per_half=0,
+            r._runner_id, n_slabs=1, max_num_tokens=4,
         )
         infer = cots_ops._lookup_infer(r._runner_id, "test")
         with pytest.raises(Exception, match="out of range|task_id"):
@@ -212,8 +206,7 @@ def test_y_pinned_view_partial_num_tokens() -> None:
     r = cots.NativeCotsRunner(dry_run=False)
     try:
         cots_ops.install_infer(
-            r._runner_id, n_slabs=1, scratch_max_tokens=max_tokens,
-            scratch_max_intermediate_per_half=0,
+            r._runner_id, n_slabs=1, max_num_tokens=max_tokens,
         )
         x_pin = torch.empty(max_tokens, in_dim, dtype=torch.bfloat16,
                             pin_memory=True)

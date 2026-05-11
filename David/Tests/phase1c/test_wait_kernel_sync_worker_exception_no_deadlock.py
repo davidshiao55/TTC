@@ -30,17 +30,17 @@ import torch
 pytestmark = pytest.mark.needs_cuda
 
 
-def _force_mlp_scratch_unavailable_error():
-    """Same fixture as test_worker_exception_surfacing — install with
-    `scratch_max_intermediate_per_half=0` so the worker's MLP
-    `TORCH_CHECK(scratch_silu_up_.defined(), ...)` (vllm/csrc/cots/
-    cots_cpu_infer.cpp) trips on submit. Pinned-host backing buffers
-    must outlive the slab pointers, so we return them as a keepalive.
+def _force_mlp_worker_error():
+    """Same fixture as test_worker_exception_surfacing — populate an
+    MLP slab with a deliberate K-dimension mismatch so the worker's
+    `bf16_gemm_transposed_at` shape TORCH_CHECK trips on submit.
+    Pinned-host backing buffers must outlive the slab pointers, so
+    we return them as a keepalive.
     """
     from vllm._cots_C import CotsCpuInfer
 
     ci = CotsCpuInfer()
-    ci.install(n_slabs=1, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+    ci.install(n_slabs=1, max_num_tokens=0)
 
     in_dim = 4
     inter_per_half = 8
@@ -66,8 +66,6 @@ def _force_mlp_scratch_unavailable_error():
         w_down_ptr=w_down.data_ptr(),
         w_down_rows=out_dim,
         w_down_cols=inter_per_half,
-        w_down_stride_row=inter_per_half,
-        w_down_stride_col=1,
         intermediate_per_half=inter_per_half,
     )
     return ci, (x_pin, y_pin, w_gate, w_up, w_down)
@@ -103,7 +101,7 @@ def test_worker_throw_with_m3_does_not_hang_wait_kernel():
     returns, stream sync returns, and the next entry-point call
     surfaces the error as a Python RuntimeError.
     """
-    ci, _keepalive = _force_mlp_scratch_unavailable_error()
+    ci, _keepalive = _force_mlp_worker_error()
     ci.install_wait_kernel_sync_for_task(0)
     # Drive everything on a non-default stream so we can sync only
     # the stream we care about and avoid waiting on whatever else
@@ -136,7 +134,7 @@ def test_worker_throw_with_m3_does_not_hang_wait_kernel():
     # The error must have been recorded; a follow-up entry point
     # call surfaces it.
     assert ci.has_error()
-    with pytest.raises(RuntimeError, match="scratch_silu_up_"):
+    with pytest.raises(RuntimeError, match=r"\[cots worker\]"):
         ci.check_error()
 
 
@@ -168,7 +166,7 @@ def test_sync_or_wait_launches_kernel_when_has_error_already_set():
     # Two slabs: 0 = MLP-fail (scratch=0), 1 = dryrun-noop (always
     # succeeds). install_m3 for both.
     ci = CotsCpuInfer()
-    ci.install(n_slabs=2, scratch_max_tokens=0, scratch_max_intermediate_per_half=0)
+    ci.install(n_slabs=2, max_num_tokens=0)
 
     in_dim = 4
     inter_per_half = 8
@@ -193,8 +191,6 @@ def test_sync_or_wait_launches_kernel_when_has_error_already_set():
         w_down_ptr=w_down.data_ptr(),
         w_down_rows=out_dim,
         w_down_cols=inter_per_half,
-        w_down_stride_row=inter_per_half,
-        w_down_stride_col=1,
         intermediate_per_half=inter_per_half,
     )
     # Dryrun slab needs valid pinned pointers even though the
@@ -260,7 +256,7 @@ def test_sync_or_wait_launches_kernel_when_has_error_already_set():
     # has_error_ is still set; the next *Python* entry point with
     # check_error() (e.g., submit_on_stream) surfaces the error.
     assert ci.has_error()
-    with pytest.raises(RuntimeError, match="scratch_silu_up_"):
+    with pytest.raises(RuntimeError, match=r"\[cots worker\]"):
         ci.submit_on_stream(
             task_id=1,
             num_tokens=1,
@@ -277,7 +273,7 @@ def test_done_slot_advanced_to_seq_after_worker_throw():
     failing dispatch + sync, the host-mapped done_slot is at the seq
     that was written to req_slot — i.e., the finally-publish ran.
     Without the publish, done_slot would still be 0 from install."""
-    ci, _keepalive = _force_mlp_scratch_unavailable_error()
+    ci, _keepalive = _force_mlp_worker_error()
     ci.install_wait_kernel_sync_for_task(0)
     assert ci.wait_kernel_get_req_slot(0) == 0
     assert ci.wait_kernel_get_done_slot(0) == 0
