@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""§1c.29 commit 2 — M3 wait-kernel parity gate.
+"""§1c.29 commit 2 — wait-kernel sync parity gate.
 
 Captured-graph replay results MUST match between the legacy
 `cudaLaunchHostFunc(sync_cb)` path (`cots_capture_sync_mode="host_callback"`) and
-the M3 path (`cots_capture_sync_mode="wait_kernel"`) at bf16 tolerance, on both
+the wait-kernel-sync path (`cots_capture_sync_mode="wait_kernel"`) at bf16 tolerance, on both
 the QKV operator and the MLP-block operator. Same inputs / same
 weights / same captured graph topology except the sync node — any
-output divergence indicates the M3 ordering or done_slot publish is
+output divergence indicates the wait-kernel-sync ordering or done_slot publish is
 wrong.
 
 This complements `test_graph_capture_e2e.py` (which compares native
 runner replay vs eager reference at f_cpu_store ∈ {0.10, 0.25, 0.50})
-by running BOTH M3-on and M3-off through the same capture-replay
+by running BOTH wait_kernel-on and wait_kernel-off through the same capture-replay
 machinery and comparing them tensor-to-tensor.
 """
 
@@ -211,11 +211,11 @@ def _capture_replay(*, offloader: CotsOffloader, forward, x: torch.Tensor):
 
 @pytest.mark.parametrize("f_cpu_store", [0.10, 0.25, 0.50])
 def test_qkv_m3_matches_baseline(f_cpu_store: float) -> None:
-    """QKV captured-replay output is bit-identical between M3-on and
-    M3-off (within bf16 atol). This is the load-bearing parity gate
-    for the operator-side M3 wiring: the captured graph is identical
+    """QKV captured-replay output is bit-identical between wait_kernel-on and
+    wait_kernel-off (within bf16 atol). This is the load-bearing parity gate
+    for the operator-side wait-kernel-sync wiring: the captured graph is identical
     in every node EXCEPT the sync node (sync_cb host_fn vs
-    cots_wait_done_kernel), so any divergence indicates the M3 ordering or
+    cots_wait_done_kernel), so any divergence indicates the wait-kernel-sync ordering or
     done_slot publish is broken."""
     torch.manual_seed(31)
     x = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
@@ -241,14 +241,14 @@ def test_qkv_m3_matches_baseline(f_cpu_store: float) -> None:
     for i, (r_off, r_on) in enumerate(zip(replays_off, replays_on)):
         torch.testing.assert_close(
             r_on, r_off, rtol=BF16_RTOL, atol=BF16_ATOL,
-            msg=f"replay #{i}: M3 path diverged from baseline at f_cpu_store={f_cpu_store}",
+            msg=f"replay #{i}: wait-kernel-sync path diverged from baseline at f_cpu_store={f_cpu_store}",
         )
 
 
 @pytest.mark.parametrize("f_cpu_store", [0.10, 0.25, 0.50])
 def test_mlp_m3_matches_baseline(f_cpu_store: float) -> None:
-    """MLP-block captured-replay output is bit-identical between M3-on
-    and M3-off. Exercises the strided down-proj slab dispatch with M3
+    """MLP-block captured-replay output is bit-identical between wait_kernel-on
+    and wait_kernel-off. Exercises the strided down-proj slab dispatch with wait-kernel sync
     enabled (the worker still publishes done_slot=seq after the
     silu*up + at::linear chain finishes)."""
     torch.manual_seed(37)
@@ -276,7 +276,7 @@ def test_mlp_m3_matches_baseline(f_cpu_store: float) -> None:
     for i, (r_off, r_on) in enumerate(zip(replays_off, replays_on)):
         torch.testing.assert_close(
             r_on, r_off, rtol=BF16_RTOL, atol=atol,
-            msg=f"replay #{i}: M3 path diverged from baseline at f_cpu_store={f_cpu_store}",
+            msg=f"replay #{i}: wait-kernel-sync path diverged from baseline at f_cpu_store={f_cpu_store}",
         )
 
 
@@ -292,7 +292,7 @@ def test_diag_counters_increment_under_m3() -> None:
         pytest.skip(
             "VLLM_COTS_DIAG=1 must be set before process start. "
             "Re-run with VLLM_COTS_DIAG=1 to validate diag counter "
-            "increment under M3."
+            "increment under wait-kernel sync."
         )
 
     torch.manual_seed(41)

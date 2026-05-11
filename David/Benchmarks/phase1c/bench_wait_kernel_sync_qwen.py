@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""§1c.29 real-model A/B — Qwen2.5-7B M3 wait kernel on/off.
+"""§1c.29 real-model A/B — Qwen2.5-7B wait-kernel sync on/off.
 
-The synthetic stub at `bench_cots_wait_done_kernel_ab.py` confirmed M3 is
+The synthetic stub at `bench_cots_wait_done_kernel_ab.py` confirmed wait-kernel sync is
 substrate-positive. THIS bench runs the same A/B on the real model
 with FastTTS-equivalent decode (input=8, output=128) so the
 acceptance gate can be evaluated against the §1c.29 commit-3
@@ -13,24 +13,34 @@ revision:
      replaces this if margin is tight).
   3. No correctness regression (parity test already covers).
 
-Seven arms (apples-to-apples per the commit-3-real review):
+Seven arms (apples-to-apples per the commit-3-real review).
+Arm keys keep their historical `cots_m3_*` substring solely to
+match the cached artifact filenames under
+`results/m3_qwen/cots_m3_*_capture_*_b<B>.json` from the
+§1c.29/§1c.32/§1c.33 runs; the underlying mechanism is the
+§1c.34-renamed `cots_capture_sync_mode='wait_kernel'`:
+
   * none_capture                — graph-mode no-offload baseline.
   * cots_native_eager_dryrun    — substrate gate, no capture.
   * cots_native_eager_real      — substrate + real CPU GEMM, no
                                   capture; the production
-                                  alternative M3 must beat to
-                                  justify a default flip.
-  * cots_m3_off_capture_dryrun  — baseline substrate, M3 off.
-  * cots_m3_on_capture_dryrun   — substrate A/B, M3 on.
-  * cots_m3_off_capture_real    — production baseline, M3 off.
-  * cots_m3_on_capture_real     — M3 candidate.
+                                  alternative wait-kernel sync must
+                                  beat to justify a default flip.
+  * cots_m3_off_capture_dryrun  — captured, no GEMM,
+                                  cots_capture_sync_mode='host_callback'.
+  * cots_m3_on_capture_dryrun   — captured, no GEMM,
+                                  cots_capture_sync_mode='wait_kernel'.
+  * cots_m3_off_capture_real    — captured, real GEMM,
+                                  cots_capture_sync_mode='host_callback'.
+  * cots_m3_on_capture_real     — captured, real GEMM,
+                                  cots_capture_sync_mode='wait_kernel'.
 
 Two env vars are required for the spin-budget gate to be
 populated:
   * VLLM_COTS_DIAG=1 — enables the diag wait kernel that
     increments `wait_kernel_immediate_resume_count`,
     `wait_kernel_lagging_wait_count`, `wait_kernel_spin_iters_total`. Without
-    this the production wait kernel runs and the M3 counters
+    this the production wait kernel runs and the wait-kernel sync counters
     stay zero.
   * VLLM_COTS_DUMP_COUNTERS=1 — registers the atexit dump in
     `cots_ops._dump_counters_at_exit` (cots_ops.py:451) that
@@ -57,7 +67,7 @@ stabilize). First run loads weights ~30s.
 
 Run:
     VLLM_COTS_DIAG=1 /opt/conda/envs/thesis/bin/python \\
-        David/Benchmarks/phase1c/bench_m3_qwen.py
+        David/Benchmarks/phase1c/bench_wait_kernel_sync_qwen.py
 """
 
 from __future__ import annotations
@@ -85,20 +95,27 @@ DEFAULT_THREADS = 16
 def arms_for(threads: int, f_cpu_store: float = DEFAULT_F) -> dict[str, list[str]]:
     """Return arm name -> CLI flag list.
 
-    Seven-arm grid (apples-to-apples per the commit-3-real review):
-      * `none_capture`              — graph-mode no-offload baseline
-      * `cots_native_eager_dryrun`  — substrate gate, no capture
-      * `cots_native_eager_real`    — substrate + real CPU GEMM, no
-                                      capture; the reference M3 must
-                                      beat to justify a default flip
-      * `cots_m3_off_capture_dryrun`/`_on_*`  — captured, no GEMM
-      * `cots_m3_off_capture_real` / `_on_*` — captured, real GEMM
+    Seven-arm grid (apples-to-apples per the commit-3-real review).
+    Arm key suffixes `_m3_off_*` / `_m3_on_*` are historical and
+    match the cached artifact filenames; semantically the
+    "_m3_off" variants set `cots_capture_sync_mode='host_callback'`
+    and "_m3_on" variants set `'wait_kernel'`.
 
-    Native+capture+M3 is the only path that uses the wait kernel
-    (§1c.29 gate 1 rejects M3 under cpu_runner='python'; gate 2
-    rejects M3 under enforce_eager=True). Eager arms run on the
-    same native substrate without graph capture, providing the
-    "should we just use native_eager_real instead of M3?" reference.
+    * `none_capture`              — graph-mode no-offload baseline
+    * `cots_native_eager_dryrun`  — substrate gate, no capture
+    * `cots_native_eager_real`    — substrate + real CPU GEMM, no
+                                    capture; the reference wait-kernel
+                                    sync must beat to justify a
+                                    default flip
+    * `cots_m3_off_capture_dryrun`/`_on_*`  — captured, no GEMM
+    * `cots_m3_off_capture_real` / `_on_*` — captured, real GEMM
+
+    Captured wait-kernel sync is the only path that uses the GPU
+    wait kernel (§1c.29 gate 1 rejects it under
+    cpu_runner='python'; gate 2 rejects it under
+    enforce_eager=True). Eager arms run on the same native
+    substrate without graph capture, providing the "should we
+    just use native_eager_real instead?" reference.
     """
     cots_base = [
         "--offload-backend",
@@ -124,7 +141,7 @@ def arms_for(threads: int, f_cpu_store: float = DEFAULT_F) -> dict[str, list[str
 
 # Arms that need --enforce-eager. Eager arms include the explicit
 # native_eager_{dryrun,real} reference cells; other arms run under
-# graph capture (the M3 path requires it; none_capture explicitly
+# graph capture (the wait-kernel sync path requires it; none_capture explicitly
 # tests it).
 _EAGER_ARMS: frozenset[str] = frozenset({
     "cots_native_eager_dryrun",
@@ -239,7 +256,7 @@ def parse_cots_counters(path: Path) -> dict[str, int]:
     wait_kernel_spin_iters_total at increment time);
     VLLM_COTS_DUMP_COUNTERS=1 controls whether the atexit dump fires
     (gating whether we can READ the counters). Both are needed for
-    the M3 spin-budget gate."""
+    the wait-kernel sync spin-budget gate."""
     log_path = path.with_suffix(".log")
     if not log_path.exists():
         return {}
@@ -374,23 +391,23 @@ def main() -> None:
             if off_dry is not None and on_dry is not None:
                 d_dry = (off_dry - on_dry) * 1000  # ms
                 print(
-                    f"    dryrun: M3 off {off_dry:.4f}s, on {on_dry:.4f}s  "
+                    f"    dryrun: wait-kernel sync off {off_dry:.4f}s, on {on_dry:.4f}s  "
                     f"Δ {d_dry:+.1f} ms/gen"
                 )
             if off_real is not None and on_real is not None:
                 d_real_ms = (off_real - on_real) * 1000
                 target = "PASS" if d_real_ms >= 50.0 else "FAIL"
                 print(
-                    f"    real:   M3 off {off_real:.4f}s, on {on_real:.4f}s  "
+                    f"    real:   wait-kernel sync off {off_real:.4f}s, on {on_real:.4f}s  "
                     f"Δ {d_real_ms:+.1f} ms/gen   "
                     f"§1c.29 gate1 ≥ +50 ms: {target}"
                 )
             # Reviewer's apples-to-apples gate: native_capture_real
-            # + M3 must beat native_eager_real by a meaningful
+            # + wait-kernel sync must beat native_eager_real by a meaningful
             # margin to justify the captured-graph + wait-kernel
-            # path over plain eager. The +50 ms on M3-off is a
+            # path over plain eager. The +50 ms on wait-kernel sync-off is a
             # substrate trade; what matters for production is
-            # whether the production candidate (M3 on, captured)
+            # whether the production candidate (wait-kernel sync on, captured)
             # is faster than just running eager.
             if eager_real is not None and on_real is not None:
                 d_vs_eager_ms = (eager_real - on_real) * 1000
@@ -399,11 +416,11 @@ def main() -> None:
                     f"    vs eager: native_eager_real "
                     f"{eager_real:.4f}s, m3_on_capture_real "
                     f"{on_real:.4f}s  Δ {d_vs_eager_ms:+.1f} ms/gen   "
-                    f"M3-vs-eager (must be > 0 to justify default flip): "
+                    f"wait-kernel sync-vs-eager (must be > 0 to justify default flip): "
                     f"{target}"
                 )
             # Capture-mode COTS overhead vs none_capture (the §1.14
-            # equivalent for M3-on). Lower is better; informational.
+            # equivalent for wait-kernel sync-on). Lower is better; informational.
             if none_cap is not None and on_real is not None:
                 cap_overhead = (on_real - none_cap) * 1000
                 print(

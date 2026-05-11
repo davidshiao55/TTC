@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""§1c.29 commit 1: in-process M3 wait-kernel smoke via pybind.
+"""§1c.29 commit 1: in-process wait-kernel sync smoke via pybind.
 
 The standalone smokes (David/Tests/phase1c/smoke_value_signal/) proved
 the captured-graph value-signal protocol is replay-safe. This test
@@ -59,7 +59,7 @@ def test_install_wait_kernel_sync_for_task_basic(infer):
 
 
 def test_install_wait_kernel_sync_for_task_idempotency_violation(infer):
-    """Re-installing M3 for the same task_id raises."""
+    """Re-installing wait-kernel sync for the same task_id raises."""
     infer.install_wait_kernel_sync_for_task(0)
     with pytest.raises(RuntimeError, match="already installed"):
         infer.install_wait_kernel_sync_for_task(0)

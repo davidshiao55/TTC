@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""§1c.29 commit 3 — M3 wait kernel A/B benchmark.
+"""§1c.29 commit 3 — wait-kernel sync A/B benchmark.
 
-Compares the captured COTS path with `cots_capture_sync_mode="wait_kernel"` (M3
+Compares the captured COTS path with `cots_capture_sync_mode="wait_kernel"` (wait-kernel sync
 on, replaces the captured `cudaLaunchHostFunc(sync_cb)` node with a
 `cots_wait_done_kernel<<<>>>` reading a host-mapped done_slot) vs
 `cots_capture_sync_mode="host_callback"` (legacy sync_cb host_fn that blocks the
@@ -18,12 +18,12 @@ bench_dryrun_vs_native_qwen.py (Stage 6).
 Four arms × {dryrun, real}:
   * `dryrun_m3_off` — baseline. Captured graph replays sync_cb
     host_fn that blocks the driver thread.
-  * `dryrun_m3_on`  — M3 wait kernel replaces sync_cb. Worker
+  * `dryrun_m3_on`  — wait-kernel sync replaces sync_cb. Worker
     publishes done_slot=seq immediately (dryrun has nothing to do)
     so the wait kernel resumes immediately.
   * `real_m3_off`   — baseline with real CPU GEMM. The host_fn
     waits for the worker to finish at::linear.
-  * `real_m3_on`    — M3 with real CPU GEMM. Worker publishes
+  * `real_m3_on`    — wait-kernel sync with real CPU GEMM. Worker publishes
     done_slot=seq AFTER at::linear completes; if the GPU hits the
     wait kernel before the worker finishes, it spins on the
     host-mapped slot.
@@ -31,14 +31,14 @@ Four arms × {dryrun, real}:
 The dryrun A/B isolates the SUBSTRATE cost: without real CPU work,
 the only difference between arms is sync_cb-host_fn vs
 cots_wait_done_kernel. The real A/B reflects the production workload — if
-M3 helps in dryrun but loses in real, the spin cost dominates and
+wait-kernel sync helps in dryrun but loses in real, the spin cost dominates and
 the whole approach should be revisited.
 
 Diag mode: when run with VLLM_COTS_DIAG=1, the diag wait kernel
 captures `wait_kernel_immediate_resume_count`, `wait_kernel_lagging_wait_count`, and
 `wait_kernel_spin_iters_total`. The bench prints these as the canary
 the §1c.29 design called out — high lagging count means CPU GEMM
-exceeds the GPU window (M3 has nothing to recover).
+exceeds the GPU window (wait-kernel sync has nothing to recover).
 
 Run:
     /opt/conda/envs/thesis/bin/python bench_cots_wait_done_kernel_ab.py
@@ -204,7 +204,7 @@ def _bench_captured(
 
 def _read_diag_counters(offloader: CotsOffloader) -> dict[str, int]:
     """Snapshot the CotsCpuInfer counters via the cots_ops registry.
-    Empty dict when M3 is off or DIAG=0 (no counters increment)."""
+    Empty dict when wait-kernel sync is off or DIAG=0 (no counters increment)."""
     if offloader._runner is None:
         return {}
     rid = getattr(offloader._runner, "_runner_id", None)
@@ -303,7 +303,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
-        print("CUDA not available — skipping M3 A/B bench", file=sys.stderr)
+        print("CUDA not available — skipping wait-kernel sync A/B bench", file=sys.stderr)
         return 0
 
     _init_distributed_once()
@@ -335,25 +335,25 @@ def main() -> int:
     real_off = by_label["real_m3_off"]["t_us"]
     real_on = by_label["real_m3_on"]["t_us"]
 
-    dryrun_delta = dryrun_off - dryrun_on  # positive = M3 wins
+    dryrun_delta = dryrun_off - dryrun_on  # positive = wait-kernel sync wins
     real_delta = real_off - real_on
     dryrun_per_layer = dryrun_delta / args.n_layers
     real_per_layer = real_delta / args.n_layers
 
     print()
     print("=" * 76)
-    print("§1c.29 — M3 wait kernel A/B (synthetic stub)")
+    print("§1c.29 — wait-kernel sync A/B (synthetic stub)")
     print("=" * 76)
     print(f"  workload: n_layers={args.n_layers}, num_tokens={args.num_tokens}")
     print(f"  f_cpu_store={args.f_cpu_store}, n_iters={args.n_iters}")
     print()
-    print(f"  dryrun, M3 off: {dryrun_off:>9.1f} μs / forward")
-    print(f"  dryrun, M3 on:  {dryrun_on:>9.1f} μs / forward")
+    print(f"  dryrun, wait-kernel sync off: {dryrun_off:>9.1f} μs / forward")
+    print(f"  dryrun, wait-kernel sync on:  {dryrun_on:>9.1f} μs / forward")
     print(f"  Δ (off - on):   {dryrun_delta:>+9.1f} μs   "
           f"({dryrun_per_layer:+.2f} μs/layer)")
     print()
-    print(f"  real,   M3 off: {real_off:>9.1f} μs / forward")
-    print(f"  real,   M3 on:  {real_on:>9.1f} μs / forward")
+    print(f"  real,   wait-kernel sync off: {real_off:>9.1f} μs / forward")
+    print(f"  real,   wait-kernel sync on:  {real_on:>9.1f} μs / forward")
     print(f"  Δ (off - on):   {real_delta:>+9.1f} μs   "
           f"({real_per_layer:+.2f} μs/layer)")
     print()
@@ -369,10 +369,10 @@ def main() -> int:
                   f"({ratio*100:.1f}%), spin_iters={spin}")
     print()
     if dryrun_delta > 0:
-        print(f"  M3 substrate gain (dryrun):  {dryrun_per_layer:+.2f} μs/layer "
+        print(f"  wait-kernel sync substrate gain (dryrun):  {dryrun_per_layer:+.2f} μs/layer "
               f"— sync_cb host_fn was costlier than the wait kernel.")
     else:
-        print(f"  M3 substrate cost (dryrun):  {-dryrun_per_layer:+.2f} μs/layer "
+        print(f"  wait-kernel sync substrate cost (dryrun):  {-dryrun_per_layer:+.2f} μs/layer "
               f"— wait kernel overhead exceeds sync_cb's host_fn cost. "
               f"Consider reverting if real also loses.")
     print("=" * 76)

@@ -299,31 +299,32 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   vLLM prototype regresses despite the smoke result, fall
   back to `native_eager` as Phase 1c landing path. See
   §1c.28 below.
-- §1c.29 (M3 vLLM prototype design, doc only) — **Design
-  drafted; no code yet.** Feature flag
-  `cots_m3_wait_kernel: bool = False`, honored only with
-  `cpu_runner='native'` AND `enforce_eager=False` (hard-fail
-  on misuse, four gates). Per-slab state: host-mapped pinned
-  `req_slot` / `done_slot` + CPU monotonic `next_seq` + diag
-  per-seq timestamp ring (only when VLLM_COTS_DIAG=1).
-  Per-runner diag counters: `m3_wait_spin_iters`,
-  `m3_immediate_resume_count`, `m3_lagging_wait_count`.
-  Ordering: `dispatch_cb` advances seq, publishes
-  req_slot=seq, enqueues worker task tagged with seq;
-  worker writes done_slot=seq AFTER filling y_pinned;
-  captured graph replaces `cudaLaunchHostFunc(sync_cb)` with
-  `m3_wait_kernel` before UVA. Old sync host_fn path stays
-  as fallback. Validation: 3 unit tests (smoke, install
-  gates, parity) + dryrun A/B + real A/B. Acceptance gate
-  was revised at commit 3 (the original "lagging < 50% of
-  fires" draft was too coarse; the synthetic A/B hit 91%
-  lagging while still winning wall-clock). New gate: real
-  wall ≥ +50 ms/generate AND spin time ≤ 10% of recovered
+- §1c.29 (wait-kernel sync prototype, formerly "M3" — design
+  + landed) — captured `cudaLaunchHostFunc(sync_cb)`
+  replacement. Renamed at §1c.34 cleanup A: current production
+  config is `cots_capture_sync_mode: Literal["host_callback",
+  "wait_kernel"] = "host_callback"` (host_callback is the
+  Phase 2 recommended path; wait_kernel is opt-in research).
+  Honored only with `cpu_runner='native'` AND
+  `enforce_eager=False` (hard-fail on misuse, four gates).
+  Per-slab state: host-mapped pinned `req_slot` / `done_slot`
+  + CPU monotonic `next_seq` + lazy diag counters. Per-runner
+  diag counters: `wait_kernel_spin_iters_total`,
+  `wait_kernel_immediate_resume_count`,
+  `wait_kernel_lagging_wait_count`. Ordering: `dispatch_cb`
+  advances seq, publishes `req_slot=seq`, enqueues worker
+  task tagged with seq; worker writes `done_slot=seq` AFTER
+  filling y_pinned (try/finally so a worker exception still
+  releases the wait kernel); captured graph replaces
+  `cudaLaunchHostFunc(sync_cb)` with `cots_wait_done_kernel`
+  before UVA. Old host_callback sync path stays as the
+  default. Validation: 3 unit tests + dryrun A/B + real
+  A/B. Acceptance gate revised at commit 3: real wall ≥
+  +50 ms/generate AND spin time ≤ 10% of recovered
   sync_cb_wait_total_ns AND parity green.
-  Design warning called out: wait kernel busy-spins on a
-  single block; if CPU lags often, could occupy SM time —
-  diag counters must surface this. NO code in this
-  section. See §1c.29 below.
+  Design warning: wait kernel busy-spins on a single block;
+  if CPU lags often, occupies SM time — diag counters
+  surface this. See §1c.29 below.
 - §1c.31 — Commit-3-real review followup: (a) B=4 eager
   slab-clamp fix (§1c.21 override is now a CAP not a row
   count; new diag counter `worker_clamp_override_count`); (b)
@@ -3205,11 +3206,14 @@ Three follow-ups on the §1c.29 wrap-up:
      `(thread, output_len, f, batch)` point except the
      anomalous t=8, **eager beats captured+M3**, and the gap
      widens as `f` or `output_len` grow.
-   * **Default**: `cots_m3_wait_kernel=False` stays.
+   * **Default**: `cots_capture_sync_mode='host_callback'`
+     stays (the original boolean `cots_m3_wait_kernel` was
+     removed at §1c.34 cleanup A; no back-compat alias).
    * **Production guidance for this hardware/model**:
-     `enforce_eager=True` + `cpu_runner='native'` + legacy
-     `sync_cb` path + per-bucket-optimal thread policy from
-     `bench_thread_policy_sweep.py`.
+     `enforce_eager=True` + `cpu_runner='native'` +
+     `cots_capture_sync_mode='host_callback'` (legacy
+     sync_cb host_fn path) + per-bucket-optimal thread
+     policy from `bench_thread_policy_sweep.py`.
    * **Open future work** (not committed-to here): fix the
      captured-graph per-op overhead that scales steeply with
      workload size; multi-stream wait kernel (§1c.30 sketch);
@@ -3916,7 +3920,8 @@ save. M3 closes the captured-vs-eager gap from
 −175 ms (off−eager) to −88 ms (on−eager); it does not flip the
 sign.
 
-**Default stays `cots_m3_wait_kernel=False`.** Updated reasons:
+**Default stays `cots_capture_sync_mode='host_callback'`.**
+Updated reasons:
 
 1. **Apples-to-apples FAIL**: the production candidate
    (m3_on_capture_real) is slower than the no-capture
@@ -3937,7 +3942,7 @@ sign.
    recommended next step is a wider grid before any
    default-flip discussion. Until then, the production path
    for B=1 decode at this f is `enforce_eager=True` +
-   `cots_m3_wait_kernel=False`.
+   `cots_capture_sync_mode='host_callback'`.
 
 #### Thread-policy sweep — M3-vs-eager IS thread-count
 sensitive (commit-3-real follow-up)

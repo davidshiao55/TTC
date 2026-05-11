@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""§1c.29 commit 2 (review-fix-1) — worker exception + M3 must not deadlock.
+"""§1c.29 commit 2 (review-fix-1) — worker exception + wait-kernel sync must not deadlock.
 
 The captured `cots_wait_done_kernel` spins on `done_slot` until it sees
 `done >= req`. If the worker throws BEFORE reaching the
@@ -95,7 +95,7 @@ def _bounded_stream_sync(stream: torch.cuda.Stream, timeout_s: float) -> bool:
 
 
 def test_worker_throw_with_m3_does_not_hang_wait_kernel():
-    """Force a worker exception while M3 is installed for the slab.
+    """Force a worker exception while wait-kernel sync is installed for the slab.
     Without the finally-publish in RunSlabOnWorker, the captured
     cots_wait_done_kernel would spin on `done < req` forever and stream
     sync would never return. With the publish, done_slot=seq is
