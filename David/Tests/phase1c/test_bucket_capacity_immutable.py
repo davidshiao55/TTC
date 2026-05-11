@@ -132,7 +132,20 @@ def test_replay_bucket_counters_read_capacity_not_num_tokens():
 
     If the counters read `slab.num_tokens` instead, both replay-bucket
     counters would equal 64 (the live bytes), not 4096.
+
+    Requires VLLM_COTS_DIAG=1 at process start — the
+    d2h/uva_replay_bucket_bytes counters were diag-gated in
+    §1c.34 cleanup C so the production-default hot path skips
+    the atomic adds entirely.
     """
+    import os
+
+    if os.environ.get("VLLM_COTS_DIAG", "0") != "1":
+        pytest.skip(
+            "VLLM_COTS_DIAG=1 must be set before process start — "
+            "d2h/uva_replay_bucket_bytes counters are diag-gated "
+            "(§1c.34 cleanup C). Re-run with VLLM_COTS_DIAG=1 pytest ..."
+        )
     from vllm._cots_C import CotsCpuInfer
 
     BUCKET = 64

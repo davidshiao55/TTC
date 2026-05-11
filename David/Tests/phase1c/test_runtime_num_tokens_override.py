@@ -20,8 +20,27 @@ each run.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
+
+# §1c.34 cleanup C: tests that read diagnostic counters
+# (worker_clamp_override_count, d2h_replay_bucket_bytes, etc.) need
+# VLLM_COTS_DIAG=1 set BEFORE process start because the env is read
+# once at first call into the diag_enabled() lambda. Setting it
+# mid-process via monkeypatch is a no-op against the cached read.
+_DIAG_REQUIRED_SKIP_REASON = (
+    "VLLM_COTS_DIAG=1 must be set before process start to populate the "
+    "diagnostic counters this test reads (see §1c.34 cleanup C — "
+    "production-default skips all observational counter increments). "
+    "Re-run with VLLM_COTS_DIAG=1 pytest ..."
+)
+
+
+def _require_diag_env() -> None:
+    if os.environ.get("VLLM_COTS_DIAG", "0") != "1":
+        pytest.skip(_DIAG_REQUIRED_SKIP_REASON)
 
 
 def _new_runner_with_qkv_slab(
@@ -165,7 +184,8 @@ def test_set_runtime_num_tokens_above_slab_cap_clamps() -> None:
     """§1c.31 commit-3-real fix: runtime_num_tokens > slab.num_tokens
     is no longer a hard-fail; the worker treats the override as a
     CAP and clamps to slab_cap. A diagnostic counter
-    (worker_clamp_override_count) records each clamp so the case is
+    (worker_clamp_override_count, diag-gated under VLLM_COTS_DIAG=1
+    per §1c.34 cleanup C) records each clamp so the case is
     observable.
 
     Rationale: under eager mode, set_runtime_num_tokens applies
@@ -178,6 +198,7 @@ def test_set_runtime_num_tokens_above_slab_cap_clamps() -> None:
     beyond it is UB; clamping is the safe interpretation."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA needed")
+    _require_diag_env()
     from vllm.model_executor.offloader import cots_ops
 
     bucket = 4
@@ -244,9 +265,14 @@ def test_clamp_b4_prefill_scenario_no_deadlock() -> None:
     global runtime_num_tokens of 25 (from a larger batch's prefill)
     submitted. Pre-fix: TORCH_CHECK raised, worker stopped, stream
     wedged at next sync. Post-fix: clamp + counter, worker
-    completes normally, sync returns, downstream proceeds."""
+    completes normally, sync returns, downstream proceeds.
+
+    Asserts the clamp counter increments — diag-gated, so this
+    test requires VLLM_COTS_DIAG=1 at process start (§1c.34
+    cleanup C)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA needed")
+    _require_diag_env()
     from vllm.model_executor.offloader import cots_ops
 
     bucket = 8  # matches the original error: slab.num_tokens=8
