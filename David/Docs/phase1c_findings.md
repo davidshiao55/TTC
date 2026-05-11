@@ -3230,9 +3230,11 @@ fire — QKV or MLP? which layers? which bucket? FULL replay,
 PIECEWISE, capture-time, or measured decode replay?"
 
 Added a per-`TaskSlab` `fire_count` (single relaxed atomic add
-in `DispatchCallback`, always-on, ~1 ns per fire) plus a
-Python-side cross-reference via
-`cots_ops.dump_task_resolved_fire_counts(runner_id,
+in `DispatchCallback`, **diag-gated** under `VLLM_COTS_DIAG=1`
+since the §1c.33 review-fix — production path pays zero
+overhead; counters only fire under the same env that gates
+the §1c.24 NVTX scopes) plus a Python-side cross-reference
+via `cots_ops.dump_task_resolved_fire_counts(runner_id,
 task_id_for)`. Atexit dump gated by
 `VLLM_COTS_DUMP_TASK_FIRES=1` to
 `VLLM_COTS_DUMP_TASK_FIRES_FILE=/path/to.json`.
@@ -3324,54 +3326,53 @@ NVTX trace would need to be rerun with the same reset hook to
 get a clean replay-only NVTX count; the current §1c.32 numbers
 are capture-contaminated.
 
-**Likely actual cause**: vLLM's captured FULL graph + Python
-orchestration interplay. Each forward at B=1 produces SOME
-Python orchestration (for boundary work between captured
-fragments) AND replays the captured FULL graph. If the
-captured graph's recorded `cudaLaunchHostFunc(dispatch_cb)`
-nodes AND the Python operator wrapper BOTH fire `dispatch_cb`
-per forward, we get ~2 fires per slab per forward.
+**Production stance after §1c.33 review-fix**: native eager
+remains the Phase 2 path. The remaining +88 ms captured-vs-eager
+gap is most likely a combination of wait-kernel per-op cost,
+`cudaGraphLaunch` overhead, and the lost CPU/GPU overlap window
+— none of which has a small clean fix. The diagnostic
+infrastructure (per-task fire counter under
+`VLLM_COTS_DIAG=1`, atexit dump under
+`VLLM_COTS_DUMP_TASK_FIRES=1`, post-capture reset hook under
+`VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE=1`) is in
+place if anyone revisits.
 
-Cross-check against §1c.32 NVTX (with warmup):
+§1c.33 closes. No behavior change beyond the diag-gated
+counter + dump infrastructure.
 
-| NVTX scope | eager (count) | m3 (count) | m3/eager |
-|---|---:|---:|---:|
-| `cots:py_submit_gemm` | 14,448 | **10,192** | **0.71×** |
-| `cots:dispatch_cb`    | 14,448 | **19,488** | **1.35×** |
+##### Retracted first-pass hypothesis (preserved for the record)
 
-In eager, py_submit_gemm == dispatch_cb (1:1) — every Python
-call to the custom op fires the host_fn once. In M3,
-py_submit_gemm DROPS by ~30% (because captured replays don't
-re-run Python) but dispatch_cb GOES UP by ~35% (because the
-captured host_fn nodes fire on every replay). The cross-check
-confirms: capture is firing dispatch_cb extra without going
-through the Python wrapper.
-
-**Provisional read** (pending the reset-isolated rerun
-above): the captured host_fn semantics mean the host_fn node
-fires whenever the graph replays. Eager fires once per
-Python-side dispatch; capture fires once per replay regardless
-of whether Python wanted that op for this token. IF the
-reset-isolated rerun confirms replay-only M3 fires/slab
-≫ eager's, the levers to reduce it would be:
-
-* Pruning captured `dispatch_cb` nodes whose recorded
-  num_tokens at capture time is "trash" (e.g., capture-time
-  warmup decisions that aren't reused), OR
-* Skipping dispatch entirely when `runtime_num_tokens == 0`
-  by conditioning the captured node on a control predicate
-  — not currently supported by CUDA Graph host_fn.
-
-Neither is a small code change. The reviewer's pragmatic
-advice ("unless graph capture is mandatory for the thesis
-narrative, use native eager as the production path for Phase
-2 and backlog this as a capture-specific optimization")
-stands. The diagnostic is now in place if anyone wants to
-revisit; the production stance is **native eager for Phase
-2**.
-
-§1c.33 closes. No behavior change in this commit (counter +
-dump infrastructure only).
+> The block below was written BEFORE the reset-isolated rerun
+> arrived. It hypothesized that M3 fires extra `dispatch_cb`
+> nodes via captured-graph + Python interplay (~2 fires per
+> slab per forward). The reset-isolated rerun (above) showed
+> replay-only fires are within 1% of eager (7224 vs 7280), so
+> the hypothesis was wrong: it was inferring from
+> capture-contaminated counts. Kept here as a worked example
+> of "diagnose from clean data, not aggregated counts".
+>
+> **Original hypothesis (retracted):** vLLM's captured FULL
+> graph + Python orchestration interplay. Each forward at B=1
+> produces SOME Python orchestration (for boundary work
+> between captured fragments) AND replays the captured FULL
+> graph. If the captured graph's recorded
+> `cudaLaunchHostFunc(dispatch_cb)` nodes AND the Python
+> operator wrapper BOTH fire `dispatch_cb` per forward, we get
+> ~2 fires per slab per forward.
+>
+> **Original cross-check (also retracted — the underlying
+> NVTX counts were capture-contaminated):**
+>
+> | NVTX scope | eager | m3 | m3/eager |
+> |---|---:|---:|---:|
+> | `cots:py_submit_gemm` | 14,448 | 10,192 | 0.71× |
+> | `cots:dispatch_cb`    | 14,448 | 19,488 | 1.35× |
+>
+> The reading was that capture fires `dispatch_cb` extra
+> without going through the Python wrapper — true at face
+> value, but the "extra" fires were the capture-warmup
+> recording phase, not replay. A reset-hooked NVTX rerun
+> would show the replay-only counts essentially match.
 
 ---
 
