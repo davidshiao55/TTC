@@ -4789,71 +4789,139 @@ the known-good architectural fix only. The bucket-vs-shape
 substitution remains the right direction but requires a
 different mechanism.
 
-### Next investigation: C++-side bucket-capacity sourcing
+### Commit-2 attempt: C++ clamp at `slab.bucket_capacity_tokens` (LANDED AS SAFETY NET, DOES NOT REDUCE PERF)
 
-The conceptually cleanest path (without touching vLLM's
+The conceptually cleanest local fix (without touching vLLM's
 compile config or Inductor): source `num_tokens` on the C++
 side from `slab.bucket_capacity_tokens` (already exists per
 §1c.22 — IMMUTABLE, install-time-set, per-(layer, bucket,
 op_kind)) instead of from the Python-passed `num_tokens`
 argument.
 
-Sketch:
+Implemented as a clamp at the C++ side:
 
 ```cpp
-// CotsCpuInfer::submit_on_stream — currently uses passed num_tokens
-slab->num_tokens.store(num_tokens, std::memory_order_release);
-// D2H byte count
-const size_t bytes = static_cast<size_t>(num_tokens) * width_bytes;
-
-// PROPOSED: use slab.bucket_capacity_tokens (immutable,
-// install-time-correct per-task)
-slab->num_tokens.store(slab->bucket_capacity_tokens,
-                       std::memory_order_release);
-const size_t bytes = static_cast<size_t>(slab->bucket_capacity_tokens)
-                     * width_bytes;
+// CotsCpuInfer::submit_on_stream and CotsCpuInfer::y_pinned_view
+num_tokens = std::min(num_tokens, slab->bucket_capacity_tokens);
+// Then all subsequent sizing (slab.num_tokens.store, D2H bytes,
+// 2D copy height, returned tensor shape) uses the clamped value.
 ```
 
-Python-side keeps `int(x.shape[0])` for VIEW SHAPE alignment
-in the operator (Inductor-baked, used only to ensure
-`y_dst.shape == out.shape[0]` for `index_copy_`). The passed
-`num_tokens` arg becomes documentation-only (or removed
-from the API entirely).
+Python-side keeps `int(x.shape[0])` for view-shape alignment
+in the operator (Inductor-baked; used only for index_copy_
+consistency with `out`). The Python-side UVA assertion is
+relaxed to `src.numel() <= dst.numel()` and `tail-dim match`
+(commit-2 in this section).
 
-Effects:
-- D2H copies `bucket × in_dim × bf16` bytes — TIGHT per bucket.
-- UVA copies `bucket × cpu_out_dim × bf16` bytes — TIGHT per bucket.
-- `slab.num_tokens` stored as `bucket` (not the Inductor-baked
-  large constant). Without §1c.21 override, worker GEMMs do
-  bucket-many rows — which for B=1 decode is 1, not >64.
-- §1c.21 override becomes a tighter clamp from bucket → live
-  (for prefill where live < bucket, e.g., live=5 at bucket=8).
-  May become removable for decode-heavy workloads.
+### Why commit-2 does not subsume the §1c.21 override
 
-The C++ submit also needs to verify that `x_gpu` has at least
-`bucket_capacity_tokens` rows available — under vLLM v1's
-persistent buffer model this is true by construction (the
-buffer is sized to `max_num_batched_tokens ≥
-max_cudagraph_capture_size ≥ bucket`), but should be checked.
+The expectation was: clamping `slab.num_tokens` at the per-task
+bucket capacity means a B=1 decode submitting against the
+bucket=1 slab would set `slab.num_tokens = 1`; the worker
+would do 1-row GEMM without the §1c.21 override.
 
-The UVA `_uva_copy_trusted_host_into_gpu` assertion would
-need a `src.numel() <= dst.numel()` form: src from C++ is
-bucket-sized (`y_pinned_view(task_id,
-slab.bucket_capacity_tokens)`); dst is the operator's
-Inductor-baked-sized view. Triton kernel writes
-`src.numel()` elements into dst's prefix; dst's tail stays
-stale, which is harmless because downstream only consumes
-the first `live_count ≤ bucket` rows.
+Empirical result (Qwen2.5-7B, B=1, output=128, same workload):
+override-OFF still regresses to **65.65s** (vs 2.74s
+override-ON anchor). No change from commit-1.
 
-Open risks before landing the C++ fix:
-1. Does the captured graph's `x_gpu.data_ptr()` always
-   point to a buffer with ≥ `bucket_capacity_tokens` rows of
-   storage? Need to verify under both PIECEWISE-only and FULL
-   modes.
-2. Does Inductor's view-of-x_gpu inside the compiled function
-   propagate a smaller-than-max storage that would cause the
-   C++ D2H to read past valid memory?
-3. Coverage / parity tests must continue to pass.
+C++ counter diagnostic with commit-2 in place + override OFF:
+
+```
+nt_qkv distribution: same as without commit-2 — small bins
+                     have ~112 entries (capture-time only);
+                     76% (3864) land in nt_gt_64.
+worker_eff_n_nt_gt_64 = 39760  (≈ all replays + most captures)
+worker_eff_n_nt_le_1  =   112  (capture-time only)
+```
+
+The histogram of which slab each worker call read from
+implies that **all replays land on slabs with
+`bucket_capacity_tokens > 64`** — NOT the bucket=1 slabs
+the dispatcher is supposedly routing to. The clamp didn't
+help because the slabs being read have large bucket
+capacity to begin with; clamping `min(passed, large) = passed`.
+
+### Deeper root cause: captured task_id is shared across FULL captures
+
+The captured `cots_submit_gemm` call has `task_id` as a Python
+integer argument. `task_id = self._task_id_for[(layer_idx,
+bucket, op_kind)]` is computed inside the operator at trace
+time — using `bucket = offloader._current_bucket` (or
+`_bucket_for(int(x.shape[0]))` as fallback).
+
+At ENGINE INIT compile/warmup, `on_dispatch` has not fired
+(it's invoked only from `execute_model` per-forward). So
+`_current_bucket = None`. The operator falls back to
+`_bucket_for(int(x.shape[0]))`. `int(x.shape[0])` is the
+Inductor-baked SymInt hint — typically the max captured
+bucket or persistent-buffer max. `_bucket_for(hint)` returns
+the largest captured bucket.
+
+So at trace time, `bucket = largest_captured_size` for every
+trace. `task_id_for_(layer, largest_size, op_kind)` is baked
+into every captured `cots_submit_gemm`. **Every FULL captured
+graph references the SAME large-bucket slab via the same
+task_id**, regardless of which bucket size the FULL capture
+nominally represents.
+
+At runtime, `on_dispatch` correctly sets `_current_bucket=1`
+for a B=1 decode — but that update is consumed only by the
+streamer's slot-repair logic (which runs OOG per-forward).
+The CAPTURED operator-side code (frozen at compile time)
+keeps referencing the same large-bucket task_id. Replay-time
+worker calls hit the large-bucket slab; without the §1c.21
+override, the worker does `slab.bucket_capacity = largest_size`
+rows of GEMM.
+
+This is why:
+- The §1c.21 override is genuinely necessary (and remains
+  load-bearing).
+- The bucket-key fix (commit-1) is architecturally correct
+  but its effect is hidden — `_current_bucket` is correct
+  per-forward, but the operator-side code that consumes
+  `_current_bucket` was frozen at compile time.
+- Commit-2's C++ clamp doesn't help — the slab being addressed
+  already has bucket_capacity = largest_size.
+
+### Status of commit-2
+
+Landed (as a safety net + correctness invariant): clamp is a
+defense-in-depth — even if a future change passes a
+larger-than-bucket value, the slab's stored num_tokens stays
+within bucket_capacity. No perf delta in the canonical bench.
+
+### What a real fix needs (Phase 2 backlog)
+
+Two paths to break the "one shared task_id across FULL captures"
+behavior:
+
+1. **Force per-bucket re-specialization at compile**. vLLM's
+   `compilation_config.compile_sizes = list(_capture_buckets)`
+   would tell Inductor to specialize at each captured bucket
+   size. Then each FULL captured graph would trace with a
+   different concrete `int(x.shape[0])`, so the operator's
+   `_bucket_for(int(x.shape[0]))` would resolve to different
+   buckets per-graph, so different task_ids would bake in per
+   captured graph. Risk: more compile time, more code-cache.
+   Needs measurement.
+
+2. **Move task_id selection out of the captured graph**. A
+   pre-replay hook (similar to `on_dispatch` but consumed by
+   the C++ side) writes the current `bucket` into a side
+   channel; the captured `cots_submit_gemm` reads task_id from
+   that side channel rather than from a baked Python int. This
+   is conceptually clean but requires a captured-graph-safe
+   indirection — likely a small CUDA tensor holding `bucket`
+   that the host_func reads at replay. Similar shape to §1c.23,
+   which was rejected on perf grounds. Worth re-evaluating
+   now that we know it's the only path that doesn't depend on
+   Inductor specialization.
+
+Both paths are deferred to Phase 2 (or a dedicated Phase 1c
+follow-up). Until then, the §1c.21 override is the production
+mechanism; commit-1 + commit-2 land the architectural
+prerequisites (single OOG entry point, bucket-capacity
+clamp) so the future fix can land cleanly.
 
 ### Coverage
 
@@ -4869,10 +4937,18 @@ Open risks before landing the C++ fix:
 
 ### Status
 
-- Commit-1 (this commit): pre-hook un-registration +
-  `on_dispatch` + `ForwardDispatchInfo` — CLOSED.
-- C++-side bucket-capacity sourcing — OPEN, next
-  investigation.
+- Commit-1: pre-hook un-registration + `on_dispatch` +
+  `ForwardDispatchInfo` — CLOSED. Architectural fix landed.
+- Commit-2: C++ clamp at `slab.bucket_capacity_tokens` in
+  `submit_on_stream` + `y_pinned_view` — LANDED AS SAFETY
+  NET. No observable perf delta because captured task_ids
+  share a single large-bucket slab; the clamp's `min(passed,
+  large) = passed` is a no-op for those slabs. Defense in
+  depth.
+- Real fix (per-FULL-capture task_id differentiation) —
+  OPEN. Two candidate paths: (1) vLLM `compile_sizes` forced
+  re-specialization, (2) side-channel task_id dispatch with
+  captured indirection.
 
 ---
 
