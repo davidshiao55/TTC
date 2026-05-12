@@ -37,4 +37,10 @@ wandb/
 .idea/
 *.swp
 .DS_Store
-.claude
+
+# Claude Code local state is machine-specific. Keep shared project rules
+# trackable under .claude/rules/.
+.claude/*
+!.claude/rules/
+!.claude/rules/**
+CLAUDE.local.md
