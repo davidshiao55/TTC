@@ -231,6 +231,15 @@ def test_native_dispatch_state_is_required_and_per_runner() -> None:
         cots_ops._COTS_ACTIVE_DISPATCH.pop(rid_b, None)
 
 
+def test_native_transfer_rows_are_bounded_by_bucket_and_tensor_rows() -> None:
+    """Task bucket is capacity; transfer rows must not overread tensors."""
+    assert cots_ops._bounded_transfer_rows(1, 8192, "test") == 1
+    assert cots_ops._bounded_transfer_rows(8192, 256, "test") == 256
+    assert cots_ops._bounded_transfer_rows(512, 512, "test") == 512
+    with pytest.raises(AssertionError, match="transfer row count"):
+        cots_ops._bounded_transfer_rows(8, 0, "test")
+
+
 def test_gpu_model_runner_publishes_dispatch_for_dummy_forwards() -> None:
     """Profile/warmup/capture forwards must publish OOG dispatch state too."""
     from vllm.v1.worker import gpu_model_runner as gmr
