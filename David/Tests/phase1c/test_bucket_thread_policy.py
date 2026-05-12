@@ -199,6 +199,52 @@ def test_cpu_num_threads_by_bucket_rejects_bad_value() -> None:
         off._runner.close()
 
 
+def test_native_full_graph_routing_guard_detects_nonuniform_geometry() -> None:
+    """§1c.35: task-id dispatch is now OOG, but routing geometry is not.
+
+    FULL graph + native can proceed only when Python-side COTS routing
+    geometry is uniform across buckets. Non-uniform Planner routing must
+    fail loudly until that geometry moves behind the same dispatch boundary.
+    """
+    from vllm.config.offload import CotsOffloadConfig
+
+    cfg = CotsOffloadConfig(f_cpu_store=0.0)
+    off = cots.CotsOffloader(config=cfg)
+    off._capture_buckets = (1, 4)
+
+    class Handle:
+        n_cpu = 10
+        n_prefetch_by_bucket = {1: 0, 4: 0}
+        n_cpu_compute_by_bucket = {1: 10, 4: 10}
+
+    h = Handle()
+    off._handles = [h]  # type: ignore[list-item]
+    assert off._native_routing_uniform_across_buckets()
+
+    h.n_prefetch_by_bucket = {1: 0, 4: 2}
+    h.n_cpu_compute_by_bucket = {1: 10, 4: 8}
+    assert not off._native_routing_uniform_across_buckets()
+
+
+def test_native_operator_bucket_requires_dispatch_state() -> None:
+    """Native operators must not fall back to shape-derived buckets."""
+    from vllm.config.offload import CotsOffloadConfig
+
+    cfg = CotsOffloadConfig(f_cpu_store=0.0)
+    off = cots.CotsOffloader(config=cfg)
+    off._capture_buckets = (1, 4)
+    runner = cots.NativeCotsRunner(dry_run=True)
+    try:
+        off._runner = runner
+        with pytest.raises(RuntimeError, match="dispatch state was published"):
+            off._operator_bucket(8192)
+
+        off._current_bucket = 4
+        assert off._operator_bucket(8192) == 4
+    finally:
+        runner.close()
+
+
 # --- Worker affinity ------------------------------------------------------
 
 

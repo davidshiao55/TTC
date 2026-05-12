@@ -107,13 +107,14 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   CUDA-tensors-and-scalar-ids only; pinned buffers reached via
   slab pointers in C++)
 - §1c.21 — **CLOSED**: live unpadded token count plumbed from
-  `gpu_model_runner.execute_model` →
-  `BaseOffloader.set_runtime_num_tokens` →
-  `CotsCpuInfer::set_runtime_num_tokens`. Worker reads override at
-  host-callback time and uses it for all CPU-side row arithmetic;
-  captured graph shape stays at the bucket. native_capture_real at
-  output_len=128 collapsed from 119.33 s → 2.76 s (43× speedup),
-  matching native_eager_real (~2.60 s).
+  `gpu_model_runner.execute_model` into the native COTS worker.
+  The Python-facing hook is now `BaseOffloader.set_live_num_tokens`
+  (`set_runtime_num_tokens` remains a legacy alias / C++ internal
+  method). Worker reads the live-row cap at host-callback time and
+  uses it for all CPU-side row arithmetic; captured graph shape
+  stays at the bucket. native_capture_real at output_len=128
+  collapsed from 119.33 s → 2.76 s (43× speedup), matching
+  native_eager_real (~2.60 s).
 - §1c.22 — **ACTIVE** (controlled diagnostic complete; live-masked
   transfer prototype justified). Default-cap capture-mode COTS
   delta (`native_capture_real − none_capture` at matched cap
@@ -330,7 +331,7 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   if CPU lags often, occupies SM time — diag counters
   surface this. See §1c.29 below.
 - §1c.31 — Commit-3-real review followup: (a) B=4 eager
-  slab-clamp fix (§1c.21 override is now a CAP not a row
+  slab-clamp fix (§1c.21 live-token value is a CAP, not a row
   count; new diag counter `worker_clamp_override_count`); (b)
   bench summary.json suffixed per (output_len, f) so
   workload-grid runs don't overwrite each other's metadata;
@@ -360,36 +361,28 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   overlap window. Reviewer's production guidance (native
   eager for Phase 2; capture + M3 stay backlogged) stands.
   See §1c.33 below.
-- §1c.35 — **PARTIAL CLOSURE**: bucket-key axis of the
-  §1c.21 family of bugs. §1c.21 patched the CPU GEMM row
-  count via a side-channel override
-  (`runtime_num_tokens`), but the BUCKET KEY axis
-  (`_current_bucket`, used to select the per-bucket dispatch
-  table entry / slab / closure) was still derived from
-  `anchor.shape[0]` inside the in-graph pre-hook — saturated
-  to the persistent buffer max under FULL CUDA Graph
-  capture. Landed (commit-1): un-register the in-graph
-  pre-hook; introduce `ForwardDispatchInfo` +
-  `on_dispatch` as the single OOG entry point for
-  per-forward state. `_current_bucket` is now set from
-  `batch_descriptor.num_tokens` (the dispatcher's
-  authoritative value) at every forward in both eager and
-  graph modes. The §1c.21 override remains load-bearing:
-  the bucket-vs-shape A/B (override on vs off) showed
-  override-OFF still regresses (65.65s vs 2.74s anchor),
-  because the captured `cots_submit_gemm` num_tokens
-  argument is baked from `int(x.shape[0])` — which
-  Inductor specializes to a single large constant across
-  ALL bucket captures under `FULL_AND_PIECEWISE` + BACKED
-  dynamic shapes. C++ submit-time histogram confirms 76%
-  of submits land in `nt_gt_64`, **even though** the
-  on_dispatch logs show `_current_bucket=1` for every B=1
-  decode forward — meaning the dispatcher routes correctly
-  but the captured-graph num_tokens constant does not
-  match. Next investigation: source num_tokens from
-  `slab.bucket_capacity_tokens` on the C++ side
-  (immutable, install-time per (layer, bucket, op_kind))
-  — bypasses Inductor specialization entirely. See §1c.35
+- §1c.35 — **CLOSED**: bucket/key/task axis of the §1c.21
+  family of bugs. The final design has two first-class token
+  counts instead of an optional "override": the CUDA Graph
+  bucket is the capacity selected by vLLM's
+  `BatchDescriptor.num_tokens`, while `num_tokens_unpadded`
+  is the live row count used to cap CPU GEMM work. The
+  in-graph pre-hook is unregistered; `GPUModelRunner`
+  publishes `ForwardDispatchInfo` out of graph before every
+  scheduler, dummy/profile, warmup, capture, and replay
+  forward. Native custom ops no longer accept compile-visible
+  `task_id` / `num_tokens` scalars. Their schema carries only
+  stable call-site identity `(runner_id, layer_idx,
+  op_kind_code)`; the Python custom-op impl resolves
+  `(layer_idx, active_bucket, op_kind) -> task_id` from
+  out-of-graph dispatch state at eager execution / CUDA Graph
+  capture time, then calls the unchanged C++ runner boundary.
+  Live-token capping is unconditional default behavior via
+  `set_live_num_tokens`; the old `set_runtime_num_tokens`
+  name remains only as a compatibility alias / C++ internal
+  method. A guard now rejects native FULL CUDA Graph mode when
+  per-bucket Python-side routing geometry is non-uniform,
+  because that geometry is still compile-visible. See §1c.35
   below.
 
 ---
@@ -1914,36 +1907,42 @@ row counts:
 - `slab.num_tokens` — graph bucket capacity (e.g., 256). Frozen at
   capture time; sizes the captured cudaMemcpyAsync byte count, the
   slab's pinned x/y buffers, and the worker's upper-bound check.
-- `runtime_num_tokens` — live rows to compute. Set OUT OF GRAPH by
-  `gpu_model_runner.execute_model` from
-  `scheduler_output.total_num_scheduled_tokens` BEFORE every
-  forward. Worker effective rows = `min(runtime_num_tokens,
+- `live_num_tokens` — live rows to compute. Originally plumbed as
+  `runtime_num_tokens`; after §1c.35 the Python-facing hook is
+  `set_live_num_tokens` and the old name remains only as a legacy
+  alias / C++ internal method. Set OUT OF GRAPH from
+  `scheduler_output.total_num_scheduled_tokens` before every
+  forward. Worker effective rows = `min(live_num_tokens,
   slab.num_tokens)` (§1c.31 clamp); see §1c.31 below for the
   rationale. Pre-§1c.31 the contract was the stronger
-  `runtime_num_tokens <= slab.num_tokens` enforced by TORCH_CHECK,
-  but that hard-failed under eager mode where the global override
-  applies to whatever slab fires next regardless of bucket size.
-  The worker's `at::linear` shapes, scratch slicing, and y_pinned
-  write region key off the clamped value.
+  `live_num_tokens <= slab.num_tokens` enforced by TORCH_CHECK, but
+  that hard-failed under eager mode where the global live cap applies
+  to whatever slab fires next regardless of bucket size. The worker's
+  `at::linear` shapes, scratch slicing, and y_pinned write region key
+  off the clamped value.
 
 Plumb-through:
-1. `gpu_model_runner.execute_model` calls
-   `get_offloader().set_runtime_num_tokens(num_tokens_unpadded)`
-   BEFORE the FULL/PIECEWISE/eager dispatch — covers all paths.
-2. `BaseOffloader.set_runtime_num_tokens(actual)` — no-op default;
-   `CotsOffloader` override pushes through `cots_ops` to
+1. `gpu_model_runner.execute_model` now calls
+   `GPUModelRunner._publish_offloader_dispatch(...)`, which pushes
+   `ForwardDispatchInfo(batch_descriptor, num_tokens_unpadded)`
+   before the FULL/PIECEWISE/eager dispatch — covers all paths.
+2. `BaseOffloader.set_live_num_tokens(actual)` is the current hook;
+   `CotsOffloader` pushes through `cots_ops.set_live_num_tokens` to
    `CotsCpuInfer::set_runtime_num_tokens(int32_t n)` (atomic
-   release-store, validates n >= 0).
+   release-store, validates n >= 0). `set_runtime_num_tokens` remains
+   as a compatibility alias.
 3. `RunSlabOnWorker` reads via acquire-load:
    ```
-   effective_n = (override > 0) ? override : slab.num_tokens
+   effective_n = (live_cap > 0) ? live_cap : slab.num_tokens
    TORCH_CHECK(effective_n <= slab.num_tokens)
    ```
 
 `CotsOffloader.prepare_before_forward` stays Dynamo-clean (no
 pybind calls) because the first-decoder pre-hook is traced into
-the captured graph; the C++-side runtime push happens at the
-out-of-graph model-runner boundary instead.
+the captured graph; the C++-side live-row push happens at the
+out-of-graph model-runner boundary instead. §1c.35 later removes
+the in-graph pre-hook registration for native bucket state and
+centralizes the boundary in `on_dispatch`.
 
 ### Real-model anchor (post-fix)
 
@@ -1977,17 +1976,17 @@ worker_eff_n_nt_gt_64: 3,920     (capture-time forwards only)
 
 Submit-time histogram still shows ~76% at `nt_gt_64` — that's
 expected and unchanged because `x_gpu.shape[0]` (passed to submit)
-is the captured bucket size by construction. The override
-mechanism makes the WORKER ignore that bucket and process only
-`runtime_num_tokens` rows.
+is the captured bucket size by construction. The live-token cap
+makes the WORKER ignore padded rows and process only live rows.
 
 ### Coverage
 
 `David/Tests/phase1c/test_runtime_num_tokens_override.py` (4 tests):
 1. `set_runtime_num_tokens` smaller than bucket → worker processes
-   only first n rows; rest of y_pinned untouched.
-2. `runtime_num_tokens=0` → fall back to `slab.num_tokens`.
-3. `runtime_num_tokens > slab.num_tokens` → clamp to `slab.num_tokens`
+   only first n rows; rest of y_pinned untouched. The test retains
+   the historical C++/legacy method name.
+2. live cap = 0 → fall back to `slab.num_tokens`.
+3. live cap > `slab.num_tokens` → clamp to `slab.num_tokens`
    AND increment `worker_clamp_override_count` (§1c.31 contract
    change; was: hard-fail TORCH_CHECK pre-§1c.31).
 4. Negative value rejected at the Python boundary.
@@ -3428,9 +3427,9 @@ wait-side. Requirements:
 
 Three follow-ups on the §1c.29 wrap-up:
 
-1. **B=4 eager slab-clamp fix.** The §1c.21 live-token
-   override was applied as a required row count instead of a
-   cap. Under eager mode, `set_runtime_num_tokens()` applies
+1. **B=4 eager slab-clamp fix.** The §1c.21 live-token value
+   was originally applied as a required row count instead of a
+   cap. Under eager mode, the C++ live-token field applies
    globally per CotsCpuInfer to whatever slab fires next,
    regardless of which bucket sized that slab. B=4 prefill at
    `input_len=8` → 32 tokens, but an MLP slab keyed by the
@@ -3441,7 +3440,7 @@ Three follow-ups on the §1c.29 wrap-up:
    B=4 eager arm of the workload-grid bench.
 
    Fix in `csrc/cots/cots_cpu_infer.cpp` RunSlabOnWorker: clamp
-   `effective_n = min(override_n, slab_cap)` instead of
+   `effective_n = min(live_cap, slab_cap)` instead of
    hard-failing, and increment `worker_clamp_override_count_`
    (new field) so the clamp event is observable via
    `get_counters()`. The slab's pinned buffer is sized for
@@ -4339,8 +4338,8 @@ the eager path):
 Same pattern as the B=1 grid — M3 loses to eager at B=4
 too. The original "slab-sizing bug" diagnosis here was
 wrong (corrected by the reviewer and resolved in §1c.31):
-the actual cause was the §1c.21 live-token override being
-applied as a required row count instead of a cap. See
+the actual cause was the §1c.21 live-token value being applied
+as a required row count instead of a cap. See
 §1c.31 below; the clamp fix landed `worker_clamp_override_count
 = 133` for this B=4 eager run.
 
@@ -4568,387 +4567,235 @@ to highest invasiveness):
 
 ---
 
-## 1c.35: Bucket-key axis of §1c.21 — pre-hook un-register + `on_dispatch` (PARTIAL CLOSURE)
+## 1c.35: Bucket/key/task axis of §1c.21 — OOG dispatch state + native task resolution (CLOSED)
 
-### Backstory: §1c.21 was the row axis only
+### Final model
 
-§1c.21 closed the CPU GEMM **row count** axis: under FULL CUDA
-Graph capture, `slab.num_tokens` was the captured bucket size
-(e.g., 256), so the worker did 256-row GEMMs for a B=1 decode.
-The fix plumbed a separate `runtime_num_tokens` override from
-`gpu_model_runner.execute_model` to the C++ worker; the worker
-reads `effective_n = min(override, slab.num_tokens)` and only
-processes live rows.
+The final design makes two token counts first-class:
 
-What §1c.21 did **not** fix: the **bucket-key axis**. The
-offloader's `_current_bucket` (used by operators to look up
-`n_prefetch_by_bucket[b]`, `n_cpu_compute_by_bucket[b]`,
-operator-side slab/closure selection) was still derived from
-`anchor.shape[0]` inside an in-graph forward pre-hook
-(`_first_decoder_pre_hook`). Under `torch.compile(fullgraph=True)`
-the pre-hook is traced, and `anchor.shape[0]` resolves to the
-**persistent input buffer's max** (≈ `max_num_batched_tokens`),
-not the dispatched bucket. The pre-hook then saturated
-`_current_bucket` to `_capture_buckets[-1]` for every forward
-regardless of which bucket the dispatcher actually picked.
+| Count | Meaning | Owner |
+|---|---|---|
+| `BatchDescriptor.num_tokens` | CUDA Graph bucket capacity / dispatched padded row count | vLLM dispatcher |
+| `num_tokens_unpadded` | Semantic live row count inside that bucket | scheduler/model runner |
 
-Probe at B=1 decode on Qwen2.5-Math-1.5B FULL_AND_PIECEWISE
-mode confirmed:
+The bucket is an upper bound used for graph capture, slab allocation,
+D2H/UVA byte counts, and per-bucket task selection. The live count is
+the amount of useful CPU GEMM work inside that bucket. CPU offload
+should not multiply padded rows just because CUDA Graph capture needs a
+fixed replay shape, so live-token capping is now default behavior, not
+a debug/experiment mode.
 
-```
+`set_live_num_tokens(live)` is the Python-facing hook. The old
+`set_runtime_num_tokens` name remains only as a compatibility alias and
+as the current C++ method name on `CotsCpuInfer`.
+
+### Bug anatomy
+
+§1c.21 fixed the CPU row-count symptom by pushing the live unpadded
+token count to the native worker. That made the worker compute
+`effective_n = min(live, slab.num_tokens)` instead of blindly doing
+bucket-sized GEMMs for B=1 decode.
+
+The remaining bug had two axes:
+
+1. **Bucket key axis.** `_current_bucket` was derived inside an
+   in-graph forward pre-hook from `anchor.shape[0]`. Under
+   `torch.compile(fullgraph=True)`, that shape is the persistent input
+   buffer / SymInt hint, not the dispatched `BatchDescriptor` bucket.
+   The pre-hook therefore saturated `_current_bucket` to the largest
+   capture bucket.
+
+2. **Native task-id axis.** Even after `_current_bucket` was corrected
+   out of graph, the native custom-op schema still accepted
+   compile-visible Python ints:
+
+   ```python
+   vllm.cots_submit_gemm(x_gpu, runner_id, task_id, num_tokens)
+   vllm.cots_sync_then_uva(..., runner_id, task_id, num_tokens)
+   ```
+
+   `task_id` was computed from `(layer_idx, bucket, op_kind)` during
+   Dynamo/Inductor tracing. If bucket resolution fell back to
+   `int(x.shape[0])`, Inductor specialized that SymInt to one large
+   Python integer, so every FULL capture baked the same large-bucket
+   `task_id`.
+
+Probe at B=1 decode confirmed the dispatcher itself was correct:
+
+```text
 cudagraph_dispatcher returns: BatchDescriptor(num_tokens=1, ...)  [FULL]
-offloader pre-hook:           anchor.shape[0]=8192 → _current_bucket=512
+old offloader pre-hook:       anchor.shape[0]=8192 -> _current_bucket=512
 ```
 
-The captured graph references slab_512 (largest bucket) even
-though the dispatcher routed to the bucket=1 captured FULL
-graph. Under Phase 1c's uniform dispatch table this is
-behaviorally silent (every bucket maps to the same
-`(f_cpu_compute, f_prefetch)` pair), but the moment the Planner
-emits per-bucket variation it would silently discard those
-outputs.
+After the first bucket-key fix, `on_dispatch` logs showed
+`_current_bucket=1` for B=1 FULL replay, but the benchmark still
+regressed when the live-token cap was disabled. C++ counters showed the
+native worker still reading large-bucket slabs. The captured graph was
+using the right vLLM bucket graph but the COTS custom op inside that
+graph still referenced a large-bucket `task_id`.
 
-### Resolution shipped (commit-1)
+### Failed approaches
 
-Remove the architectural cause: the in-graph pre-hook is no
-longer registered. Replace it with a single OOG entry point
-(`on_dispatch`) called from `gpu_model_runner.execute_model`
-BEFORE every forward (FULL/PIECEWISE/eager). Mirrors §1c.21's
-plumb-through pattern; collapses the legacy
-`set_runtime_num_tokens` call site into the same call:
+**Substitute the operator descriptor bucket for `int(x.shape[0])`.**
+This tried to pass `op_descriptor[1]` into C++ instead of the
+Inductor-baked shape. It failed during engine init / compile because
+the same operator body was specialized at multiple concrete shape
+values while the Python attribute carrying the active bucket was not a
+per-specialization value. Operator views, runner byte counts, and UVA
+destination shapes disagreed inside the same compiled function.
+
+**Clamp C++ submit sizes at `slab.bucket_capacity_tokens`.**
+This landed as a useful invariant, but it did not solve the regression.
+The clamp only helps if the graph reaches the correct slab. The real
+failure was that all captured replays referenced a large-bucket slab, so
+`min(passed, large_bucket_capacity)` was still large.
+
+**Keep a disable/enable env for live-token capping.**
+This was rejected as the steady-state design. It made a semantic rule
+look like a debug override and forced the planner/runtime contract to
+carry an unnecessary mode bit. The planner can treat bucket size as an
+upper bound; the runtime already knows the live row count and should
+always give CPU work the live cap.
+
+### Structural fix
+
+The fix removes bucket and task selection from compile-visible scalar
+arguments.
+
+`GPUModelRunner` now has a single publishing boundary:
 
 ```python
-# vllm/v1/worker/gpu_model_runner.py:4037 (replacing the
-# previous standalone set_runtime_num_tokens call)
-get_offloader().on_dispatch(
-    ForwardDispatchInfo(
-        batch_descriptor=batch_desc,
-        num_tokens_unpadded=num_tokens_unpadded,
+def _publish_offloader_dispatch(batch_desc, num_tokens_unpadded):
+    get_offloader().on_dispatch(
+        ForwardDispatchInfo(
+            batch_descriptor=batch_desc,
+            num_tokens_unpadded=num_tokens_unpadded,
+        )
     )
-)
 ```
 
-`ForwardDispatchInfo` (added to `vllm/model_executor/offloader/base.py`)
-is a frozen dataclass carrying every per-forward field the offloader
-needs. Future Phase 2 per-forward state (attention-side KV pool
-sizing, suffix lengths, ...) can land here without another
-vLLM-side edit — single boundary by design.
+This is called before scheduler forwards and before dummy/profile,
+warmup, and CUDA Graph capture forwards. FULL replay still goes through
+`CudaGraphManager.replay`, which pushes the live count and prepares the
+bucket before replay.
 
-`CotsOffloader.on_dispatch` (vllm/model_executor/offloader/cots.py)
-sets `_current_bucket = _bucket_for(batch_descriptor.num_tokens)`,
-mirrors the streamer's bucket, runs layer-0 slot repair on
-copy_stream, drains via `sync_prev_onload()`, then pushes the
-live unpadded count to the C++ worker via the existing §1c.21
-override. The pre-hook installation
-(`self._install_bucket_prehook()`) is now disabled (the method
-itself stays in the file for backward compat with unit tests
-that bypass `execute_model`).
+`CotsOffloader.on_dispatch` owns the full pre-forward ordering:
 
-NEW path (`vllm/v1/worker/gpu/cudagraph_utils.py:224/291`)
-calls `prepare_before_forward` + `set_runtime_num_tokens`
-directly — unchanged, still works (and now no longer
-clobbered by the in-graph pre-hook because that's
-un-registered).
+1. `prepare_before_forward(batch_descriptor.num_tokens)` sets
+   `_current_bucket` from the authoritative vLLM dispatch bucket,
+   mirrors streamer state, and performs layer-0 slot repair out of
+   graph.
+2. `NativeCotsRunner.set_active_dispatch(bucket, live)` publishes the
+   active bucket/live pair into `cots_ops`.
+3. `sync_prev_onload()` drains copy-stream repair into the compute
+   stream.
+4. `set_live_num_tokens(num_tokens_unpadded)` publishes the live-row cap
+   to the native worker.
 
-Verification: probe re-run shows
-`_current_bucket=1` for every B=1 decode in FULL mode (was 512);
-`_current_bucket=8` for prefill at PIECEWISE bucket=8 padded
-from prompt=5. Matches dispatcher's `BatchDescriptor.num_tokens`
-exactly.
+The native custom-op schemas are now:
 
-### Bucket-vs-shape A/B (the part that didn't work)
-
-Hypothesis: with the bucket-key fix above in place, the
-captured graph references the correct per-bucket slab; therefore
-`slab.num_tokens` would already match the live count for B=1
-decode (`slab_1.num_tokens = 1`), making the §1c.21 override
-redundant for decode.
-
-Bench (`David/Benchmarks/phase1c/bench_bucket_key_fix_ab.py`
-on Qwen2.5-7B, B=1, input=8, output=128, f=0.05, t=16):
-
-```
-arm                                              avg_latency
-─────────────────────────────────────────────────────────────
-fix_on, override_on  (control)                   2.7455 s
-fix_on, override_off (hypothesis test)          65.6548 s
-─────────────────────────────────────────────────────────────
-override_off − override_on = +62.91 s   →   FAIL
+```python
+vllm.cots_submit_gemm(x_gpu, runner_id, layer_idx, op_kind_code)
+vllm.cots_sync_then_uva(y_gpu, gpu_anchor_a, gpu_anchor_b,
+                        submit_anchor, runner_id, layer_idx,
+                        op_kind_code)
 ```
 
-Hypothesis disproved. The override is still load-bearing.
+At eager execution / CUDA Graph capture time, `cots_ops` resolves:
 
-### Why the override is still needed (Inductor specialization)
-
-Diagnostic counter dump (`VLLM_COTS_DIAG=1
-VLLM_COTS_DUMP_COUNTERS=1`) shows the captured-graph
-`num_tokens` constant baked into `cots_submit_gemm`:
-
-```
-nt_qkv distribution (5096 total submits):
-  ≤1:    112    (captures only — 28 layers × 2 op_kinds × 2 warmups)
-  ≤2:    112
-  ≤4:    112
-  ≤8:    112
-  ≤16:   112
-  ≤32:   224
-  ≤64:   448
-  >64:  3864   (76% — captures of buckets > 64)
-
-worker_eff_n distribution (override OFF):
-  >64:  39760 / 40992  ≈ 97% of worker runs
+```text
+(runner_id, layer_idx, op_kind_code)
+  + active dispatch state (bucket, live_num_tokens)
+  + installed task map
+  -> task_id, bucket
 ```
 
-The 112 per-small-bin matches exactly the per-bucket warmup
-capture count. There are **no** replay-time submits showing up
-in the small bins — even though every B=1 decode forward routes
-to the bucket=1 captured graph (BUCKET-PROBE confirms
-`_current_bucket=1, padded=1` per forward).
+The C++ boundary remains clean: `submit_on_stream(task_id, bucket, ...)`
+and `y_pinned_view(task_id, bucket)` receive concrete task/bucket values
+after Python custom-op resolution. No extra C++ side-channel was needed
+for task selection because the correct boundary is the Python custom-op
+impl, which runs while CUDA Graph capture is building the per-bucket
+graph.
 
-Mechanism: under vLLM's `cudagraph_mode: FULL_AND_PIECEWISE`
-with `dynamic_shapes_config: BACKED`, Inductor compiles the
-model forward into a single function with the batch dim as a
-SymInt. The COTS operator-side call `num_tokens =
-int(x_gpu.shape[0])` forces Dynamo to specialize the SymInt
-to a concrete Python `int` — and Inductor bakes that one
-constant into the compiled function. The constant is the
-SymInt's *hint*, which vLLM sets to `max_num_batched_tokens`
-(or close to it). Every captured FULL graph subsequently
-wraps the same compiled function, so they all share the same
-baked `num_tokens` constant. The per-bucket FULL captures
-specialize the GPU kernels (Inductor handles SymInt bounds
-in those), but the **custom-op integer argument** is one
-shared value across all buckets.
+Native operators are no longer allowed to fall back to shape-derived
+buckets. `CotsOffloader._operator_bucket` raises for the native runner
+if `on_dispatch` did not publish dispatch state before the operator
+runs. The fallback remains only for Python-runner direct tests and eager
+kill-switch paths.
 
-Result: at REPLAY time, the captured `cots_submit_gemm`
-fires with `num_tokens > 64` regardless of the dispatched
-bucket. `slab.num_tokens` gets stored as that large value.
-Without the §1c.21 override the worker reads
-`slab.num_tokens` directly and does large-N GEMM. With the
-override the worker reads `effective_n = min(override,
-slab.num_tokens)` and shrinks to the live count.
+### Why this is cleaner than the alternatives
 
-The bucket-key fix landed in commit-1 (`_current_bucket`)
-is correct and necessary, but it operates on a different
-axis than what the §1c.21 override addresses. They are
-orthogonal:
+The compile-visible custom-op arguments are now stable call-site
+identity, not runtime dispatch state. Dynamo/Inductor may specialize
+them freely without changing which bucket is selected, because
+`runner_id`, `layer_idx`, and `op_kind_code` are supposed to be constant
+for that call site.
 
-| Axis | What controls it | Status |
-|---|---|---|
-| `_current_bucket` (dispatch table entry, slab selection) | OOG `on_dispatch` → `batch_descriptor.num_tokens` | FIXED in commit-1 |
-| GPU kernel work (Inductor-generated GEMMs) | per-bucket FULL capture specialization | Already correct (vLLM-managed) |
-| Captured PCIe transfer byte counts (D2H, UVA grid) | `int(x.shape[0])` baked by Inductor | NOT fixed — same large constant for all buckets |
-| Captured `slab.num_tokens` (capacity stored at submit) | `int(x.shape[0])` baked by Inductor | NOT fixed |
-| Worker CPU GEMM rows | `effective_n = min(override, slab.num_tokens)` | OK via §1c.21 override |
+The values that vary by forward live behind one out-of-graph boundary:
+`ForwardDispatchInfo`. This matches vLLM's own dispatcher contract and
+does not require forcing per-bucket Inductor specialization, adding an
+env-controlled execution mode, or teaching C++ to infer Python dispatch
+state.
 
-### Why an earlier attempt to substitute `bucket` for `int(x.shape[0])` failed
+The live-token cap stays unconditional because CPU work should scale
+with semantic rows, not padded graph capacity. The planner can still
+reason in buckets: a bucket is a capacity upper bound, and live rows are
+the runtime occupancy inside that bound.
 
-Tried: change `NativeCotsRunner.submit_with_d2h` and
-`wait_and_uva` to pass `op_descriptor[1]` (the dispatched
-bucket, a per-(layer, bucket, op_kind) Python int) instead
-of `int(x_gpu.shape[0])`.
+### Remaining limitation
 
-Result: assertion failures during engine init / compile pass:
+Native FULL CUDA Graph mode is currently allowed only when Python-side
+COTS routing geometry is uniform across capture buckets. Task-id
+selection is now out of graph, but geometry such as
+`n_prefetch_by_bucket`, `n_cpu_compute_by_bucket`, scatter indices, and
+GPU branch shape is still selected in the compiled Python operator
+body. Non-uniform per-bucket Planner tables would therefore still be
+compile-visible.
 
-```
-cots_submit_gemm: num_tokens mismatch — x_gpu.shape[0]=8192,
-  num_tokens arg=512
-```
-
-Then after loosening that assertion:
-
-```
-shape mismatch: src=(512, 256), dst=(8192, 256)
-```
-
-Then after loosening the UVA shape assertion to
-`src.numel() <= dst.numel()`:
-
-```
-src.numel()=131072 > dst.numel()=126976
-  i.e., src=(512, 256), dst=(496, 256)
-```
-
-Root cause: under PIECEWISE compile, Inductor specializes the
-same operator code multiple times at different concrete shape
-values. At some trace `int(x.shape[0])=496` (a captured-bucket
-size); at another `int(x.shape[0])=8192` (the SymInt hint).
-The operator's `_current_bucket`-derived `b` was stale across
-specializations — a Python attribute set by `on_dispatch` at
-the LAST forward, not refreshed per Inductor trace. So the
-operator's view sizing (`y_dst = _y_gpu[:int(x.shape[0]) *
-n_cpu].view(int(x.shape[0]), n_cpu)`) and the runner's
-`bucket`-arg passed to C++ disagreed within the same compiled
-function.
-
-A consistent end-to-end refactor (operator views all sized to
-`bucket`, scatter `out` sized to `bucket`, `out_perm`/`out_pref`
-shape-aligned) hit the wall that Inductor's specializations
-don't map cleanly to captured FULL bucket sizes. Reverted to
-the known-good architectural fix only. The bucket-vs-shape
-substitution remains the right direction but requires a
-different mechanism.
-
-### Commit-2 attempt: C++ clamp at `slab.bucket_capacity_tokens` (LANDED AS SAFETY NET, DOES NOT REDUCE PERF)
-
-The conceptually cleanest local fix (without touching vLLM's
-compile config or Inductor): source `num_tokens` on the C++
-side from `slab.bucket_capacity_tokens` (already exists per
-§1c.22 — IMMUTABLE, install-time-set, per-(layer, bucket,
-op_kind)) instead of from the Python-passed `num_tokens`
-argument.
-
-Implemented as a clamp at the C++ side:
-
-```cpp
-// CotsCpuInfer::submit_on_stream and CotsCpuInfer::y_pinned_view
-num_tokens = std::min(num_tokens, slab->bucket_capacity_tokens);
-// Then all subsequent sizing (slab.num_tokens.store, D2H bytes,
-// 2D copy height, returned tensor shape) uses the clamped value.
-```
-
-Python-side keeps `int(x.shape[0])` for view-shape alignment
-in the operator (Inductor-baked; used only for index_copy_
-consistency with `out`). The Python-side UVA assertion is
-relaxed to `src.numel() <= dst.numel()` and `tail-dim match`
-(commit-2 in this section).
-
-### Why commit-2 does not subsume the §1c.21 override
-
-The expectation was: clamping `slab.num_tokens` at the per-task
-bucket capacity means a B=1 decode submitting against the
-bucket=1 slab would set `slab.num_tokens = 1`; the worker
-would do 1-row GEMM without the §1c.21 override.
-
-Empirical result (Qwen2.5-7B, B=1, output=128, same workload):
-override-OFF still regresses to **65.65s** (vs 2.74s
-override-ON anchor). No change from commit-1.
-
-C++ counter diagnostic with commit-2 in place + override OFF:
-
-```
-nt_qkv distribution: same as without commit-2 — small bins
-                     have ~112 entries (capture-time only);
-                     76% (3864) land in nt_gt_64.
-worker_eff_n_nt_gt_64 = 39760  (≈ all replays + most captures)
-worker_eff_n_nt_le_1  =   112  (capture-time only)
-```
-
-The histogram of which slab each worker call read from
-implies that **all replays land on slabs with
-`bucket_capacity_tokens > 64`** — NOT the bucket=1 slabs
-the dispatcher is supposedly routing to. The clamp didn't
-help because the slabs being read have large bucket
-capacity to begin with; clamping `min(passed, large) = passed`.
-
-### Deeper root cause: captured task_id is shared across FULL captures
-
-The captured `cots_submit_gemm` call has `task_id` as a Python
-integer argument. `task_id = self._task_id_for[(layer_idx,
-bucket, op_kind)]` is computed inside the operator at trace
-time — using `bucket = offloader._current_bucket` (or
-`_bucket_for(int(x.shape[0]))` as fallback).
-
-At ENGINE INIT compile/warmup, `on_dispatch` has not fired
-(it's invoked only from `execute_model` per-forward). So
-`_current_bucket = None`. The operator falls back to
-`_bucket_for(int(x.shape[0]))`. `int(x.shape[0])` is the
-Inductor-baked SymInt hint — typically the max captured
-bucket or persistent-buffer max. `_bucket_for(hint)` returns
-the largest captured bucket.
-
-So at trace time, `bucket = largest_captured_size` for every
-trace. `task_id_for_(layer, largest_size, op_kind)` is baked
-into every captured `cots_submit_gemm`. **Every FULL captured
-graph references the SAME large-bucket slab via the same
-task_id**, regardless of which bucket size the FULL capture
-nominally represents.
-
-At runtime, `on_dispatch` correctly sets `_current_bucket=1`
-for a B=1 decode — but that update is consumed only by the
-streamer's slot-repair logic (which runs OOG per-forward).
-The CAPTURED operator-side code (frozen at compile time)
-keeps referencing the same large-bucket task_id. Replay-time
-worker calls hit the large-bucket slab; without the §1c.21
-override, the worker does `slab.bucket_capacity = largest_size`
-rows of GEMM.
-
-This is why:
-- The §1c.21 override is genuinely necessary (and remains
-  load-bearing).
-- The bucket-key fix (commit-1) is architecturally correct
-  but its effect is hidden — `_current_bucket` is correct
-  per-forward, but the operator-side code that consumes
-  `_current_bucket` was frozen at compile time.
-- Commit-2's C++ clamp doesn't help — the slab being addressed
-  already has bucket_capacity = largest_size.
-
-### Status of commit-2
-
-Landed (as a safety net + correctness invariant): clamp is a
-defense-in-depth — even if a future change passes a
-larger-than-bucket value, the slab's stored num_tokens stays
-within bucket_capacity. No perf delta in the canonical bench.
-
-### What a real fix needs (Phase 2 backlog)
-
-Two paths to break the "one shared task_id across FULL captures"
-behavior:
-
-1. **Force per-bucket re-specialization at compile**. vLLM's
-   `compilation_config.compile_sizes = list(_capture_buckets)`
-   would tell Inductor to specialize at each captured bucket
-   size. Then each FULL captured graph would trace with a
-   different concrete `int(x.shape[0])`, so the operator's
-   `_bucket_for(int(x.shape[0]))` would resolve to different
-   buckets per-graph, so different task_ids would bake in per
-   captured graph. Risk: more compile time, more code-cache.
-   Needs measurement.
-
-2. **Move task_id selection out of the captured graph**. A
-   pre-replay hook (similar to `on_dispatch` but consumed by
-   the C++ side) writes the current `bucket` into a side
-   channel; the captured `cots_submit_gemm` reads task_id from
-   that side channel rather than from a baked Python int. This
-   is conceptually clean but requires a captured-graph-safe
-   indirection — likely a small CUDA tensor holding `bucket`
-   that the host_func reads at replay. Similar shape to §1c.23,
-   which was rejected on perf grounds. Worth re-evaluating
-   now that we know it's the only path that doesn't depend on
-   Inductor specialization.
-
-Both paths are deferred to Phase 2 (or a dedicated Phase 1c
-follow-up). Until then, the §1c.21 override is the production
-mechanism; commit-1 + commit-2 land the architectural
-prerequisites (single OOG entry point, bucket-capacity
-clamp) so the future fix can land cleanly.
+`CotsOffloader.post_init` now hard-fails native FULL graph mode when
+that geometry is non-uniform. The correct future fix is to move routing
+geometry behind the same structural boundary or force a proven
+per-capture specialization scheme for that geometry. Until then,
+uniform routing remains the safe FULL-graph contract.
 
 ### Coverage
 
-- Probe: `David/Tests/phase1c/probe_bucket_dispatch.py` (this
-  commit). Verifies `on_dispatch` resolves `_current_bucket`
-  correctly to the dispatched `BatchDescriptor.num_tokens`
-  in both eager and FULL graph modes.
-- Bench harness: `David/Benchmarks/phase1c/bench_bucket_key_fix_ab.py`
-  (this commit). Runs the override-on vs override-off A/B at
-  the §1c.21 canonical workload. Used to disprove the
-  subsumption hypothesis and to drive the diagnostic counter
-  inspection.
+- `David/Tests/phase1c/probe_bucket_dispatch.py graph` verifies B=1
+  FULL replay publishes the dispatched bucket and generates correctly.
+- `David/Benchmarks/phase1c/bench_bucket_key_fix_ab.py` now runs the
+  default live-token-capped production path only. Historical on/off
+  result files remain for comparison, but the benchmark no longer uses
+  an env-controlled disable arm.
+- `David/Tests/phase1c/test_bucket_thread_policy.py` covers the native
+  FULL graph non-uniform routing guard and the native "no shape fallback
+  without dispatch state" invariant.
+- `David/Tests/phase1c/test_bucket_capacity_immutable.py` keeps the
+  C++ slab-capacity invariant: live-token state and mutable
+  `slab.num_tokens` do not rewrite immutable bucket capacity.
+- `David/Tests/phase1c/test_native_runner_ubatching_hard_fail.py`
+  documents the remaining native ubatching limitation: one global live
+  cap per scheduler batch is not valid for per-ubatch native slices.
+
+### Verification
+
+Latest cleanup verification:
+
+```text
+py_compile edited Python files                         PASS
+focused phase1c pytest suite                           36 passed, 3 skipped
+probe_bucket_dispatch.py graph                         PASS
+git diff --check / git -C vllm diff --check            PASS
+```
 
 ### Status
 
-- Commit-1: pre-hook un-registration + `on_dispatch` +
-  `ForwardDispatchInfo` — CLOSED. Architectural fix landed.
-- Commit-2: C++ clamp at `slab.bucket_capacity_tokens` in
-  `submit_on_stream` + `y_pinned_view` — LANDED AS SAFETY
-  NET. No observable perf delta because captured task_ids
-  share a single large-bucket slab; the clamp's `min(passed,
-  large) = passed` is a no-op for those slabs. Defense in
-  depth.
-- Real fix (per-FULL-capture task_id differentiation) —
-  OPEN. Two candidate paths: (1) vLLM `compile_sizes` forced
-  re-specialization, (2) side-channel task_id dispatch with
-  captured indirection.
+- Bucket key from `BatchDescriptor.num_tokens`: CLOSED.
+- Native task-id selection from OOG dispatch state: CLOSED.
+- Live-token cap as default design: CLOSED.
+- C++ slab-capacity clamp: kept as defense-in-depth.
+- Native FULL graph with non-uniform per-bucket routing geometry: guarded
+  and intentionally blocked until routing geometry is moved behind the
+  same boundary.
 
 ---
 

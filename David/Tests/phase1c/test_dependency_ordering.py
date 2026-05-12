@@ -15,7 +15,7 @@ schemas after the §1c.20 simplification:
     GEMM (preserves overlap; both anchors needed for QKV's two
     independent F.linears). It also reads `submit_anchor` (==
     x_gpu) for the cross-op data dep, and resolves the pinned
-    output via `CotsCpuInfer.y_pinned_view(task_id, num_tokens)`.
+    output via the active dispatch bucket and C++ slab pointer.
 
 A weaker version of this test (output parity under torch.compile)
 would pass even if the compiler hoisted `sync_then_uva` ABOVE the
@@ -36,6 +36,7 @@ if a refactor accidentally switched the marker to the wrong tensor).
 
 from __future__ import annotations
 
+import inspect
 import re
 
 import pytest
@@ -111,6 +112,14 @@ def test_cots_submit_gemm_does_not_take_y_pinned() -> None:
         f"`mutates_args=[..., 'y_pinned']` triggered Inductor's "
         f"functionalization clone. Schema: {schema}"
     )
+    assert "task_id" not in schema and "num_tokens" not in schema, (
+        f"§1c.35: native submit must not take compile-visible task_id "
+        f"or num_tokens scalars. Schema: {schema}"
+    )
+    assert "layer_idx" in schema and "op_kind_code" in schema, (
+        f"§1c.35: native submit should carry only stable call-site "
+        f"identity plus runner_id. Schema: {schema}"
+    )
 
 
 def test_cots_sync_then_uva_takes_submit_anchor() -> None:
@@ -140,19 +149,27 @@ def test_cots_sync_then_uva_does_not_take_y_pinned() -> None:
     CPU buffer (worst case via a GPU intermediate + blocking
     GPU→CPU copy that CUDA Graph capture rejects). The sync impl
     reaches the pinned output via the slab pointer through
-    `CotsCpuInfer.y_pinned_view(task_id, num_tokens)`. The op's
+    `CotsCpuInfer.y_pinned_view(task_id, bucket)`. The op's
     Python-visible args are CUDA tensors + scalar ids only."""
     schema = str(torch.ops.vllm.cots_sync_then_uva.default._schema)
     assert "y_pinned" not in schema, (
         f"§1c.20: cots_sync_then_uva's signature MUST NOT contain "
         f"y_pinned. Inductor would materialize it. Schema: {schema}"
     )
+    assert "task_id" not in schema and "num_tokens" not in schema, (
+        f"§1c.35: native sync must not take compile-visible task_id "
+        f"or num_tokens scalars. Schema: {schema}"
+    )
+    assert "layer_idx" in schema and "op_kind_code" in schema, (
+        f"§1c.35: native sync should carry only stable call-site "
+        f"identity plus runner_id. Schema: {schema}"
+    )
 
 
 def test_cots_sync_then_uva_mutates_only_gpu_args() -> None:
     """§1c.20: under the new schema the mutated set is exactly
     {y_gpu, gpu_anchor_a, gpu_anchor_b} — submit_anchor is read-only,
-    runner_id / task_id / num_tokens are scalars."""
+    runner_id / layer_idx / op_kind_code are scalars."""
     schema = str(torch.ops.vllm.cots_sync_then_uva.default._schema)
     mutated = _schema_mutated_args(schema)
     expected = {"y_gpu", "gpu_anchor_a", "gpu_anchor_b"}
@@ -180,6 +197,79 @@ def test_cots_sync_then_uva_mutates_y_gpu_and_both_anchors() -> None:
         f"cots_sync_then_uva has unexpected mutated args {unexpected}; "
         f"schema: {schema}"
     )
+
+
+def test_native_dispatch_state_is_required_and_per_runner() -> None:
+    """§1c.35: task resolution uses OOG dispatch state keyed by runner_id."""
+    rid_a = 1_000_001
+    rid_b = 1_000_002
+    qkv = cots_ops.op_kind_code("qkv")
+    try:
+        cots_ops._COTS_TASK_ID_FOR[rid_a] = {(0, 1, "qkv"): 11}
+        cots_ops._COTS_TASK_ID_FOR[rid_b] = {(0, 4, "qkv"): 44}
+
+        with pytest.raises(RuntimeError, match="no active COTS dispatch state"):
+            cots_ops._resolve_task_for_dispatch(rid_a, 0, qkv, "test")
+
+        cots_ops.set_active_dispatch_state(rid_a, bucket=1, live_num_tokens=1)
+        cots_ops.set_active_dispatch_state(rid_b, bucket=4, live_num_tokens=2)
+
+        assert cots_ops._resolve_task_for_dispatch(rid_a, 0, qkv, "test") == (
+            11,
+            1,
+            1,
+        )
+        assert cots_ops._resolve_task_for_dispatch(rid_b, 0, qkv, "test") == (
+            44,
+            4,
+            2,
+        )
+    finally:
+        cots_ops._COTS_TASK_ID_FOR.pop(rid_a, None)
+        cots_ops._COTS_TASK_ID_FOR.pop(rid_b, None)
+        cots_ops._COTS_ACTIVE_DISPATCH.pop(rid_a, None)
+        cots_ops._COTS_ACTIVE_DISPATCH.pop(rid_b, None)
+
+
+def test_gpu_model_runner_publishes_dispatch_for_dummy_forwards() -> None:
+    """Profile/warmup/capture forwards must publish OOG dispatch state too."""
+    from vllm.v1.worker import gpu_model_runner as gmr
+
+    source = inspect.getsource(gmr.GPUModelRunner._dummy_run)
+    publish = "self._publish_offloader_dispatch(batch_desc, num_tokens_unpadded)"
+    assert publish in source, (
+        "_dummy_run must publish the active BatchDescriptor before model "
+        "execution. Native COTS custom ops intentionally refuse to infer a "
+        "bucket from tensor shapes when profile/capture forwards bypass "
+        "execute_model."
+    )
+    assert source.index(publish) < source.index("set_forward_context("), (
+        "_dummy_run must publish offloader dispatch state before entering "
+        "the forward context and invoking the model."
+    )
+
+
+def test_gpu_model_runner_dispatch_helper_calls_offloader(monkeypatch) -> None:
+    """The shared helper should pass a ForwardDispatchInfo object through."""
+    from vllm.forward_context import BatchDescriptor
+    from vllm.v1.worker import gpu_model_runner as gmr
+
+    seen = []
+
+    class Recorder:
+        def on_dispatch(self, info):
+            seen.append(info)
+
+    monkeypatch.setattr(gmr, "get_offloader", lambda: Recorder())
+    runner = gmr.GPUModelRunner.__new__(gmr.GPUModelRunner)
+    desc = BatchDescriptor(num_tokens=8, uniform=True)
+
+    runner._publish_offloader_dispatch(desc, 3)
+
+    assert len(seen) == 1
+    assert isinstance(seen[0], gmr.ForwardDispatchInfo)
+    assert seen[0].batch_descriptor is desc
+    assert seen[0].num_tokens_unpadded == 3
 
 
 # --- FX-level: positional ordering inside the captured graph -------------
@@ -250,6 +340,7 @@ def test_fx_graph_orders_submit_before_gpu_gemms_before_sync() -> None:
     """
     runner = _make_dryrun_runner()
     runner_id = runner._runner_id
+    op_kind = cots_ops.op_kind_code("qkv")
 
     # Allocate the inputs the closure consumes. Real values don't
     # matter — we're only inspecting graph structure.
@@ -267,23 +358,21 @@ def test_fx_graph_orders_submit_before_gpu_gemms_before_sync() -> None:
         # §1c.20 schema: y_pinned is no longer a custom-op arg on
         # either op. Submit gets x_gpu/x_pinned + ids; sync gets only
         # CUDA tensors + ids and resolves the pinned view via the
-        # slab pointer in C++ (`y_pinned_view(task_id, num_tokens)`).
+        # slab pointer in C++ (`y_pinned_view(task_id, bucket)`).
         # §1c.20 final schema: BOTH x_pinned and y_pinned are gone
         # from the custom op signatures. The C++ side bundles the
         # x_gpu → slab.x_pinned_ptr D2H into submit_on_stream, and
         # the sync impl reaches the pinned output via
-        # y_pinned_view(task_id, num_tokens). Both ops take only
+        # y_pinned_view(task_id, bucket). Both ops take only
         # CUDA tensors + scalar ids. No CPU view is built in this
         # forward — Inductor would materialize it into a pageable
         # buffer otherwise.
         del x_pin, y_pin
-        torch.ops.vllm.cots_submit_gemm(
-            x, runner_id, 0, x.shape[0]
-        )
+        torch.ops.vllm.cots_submit_gemm(x, runner_id, 0, op_kind)
         out_perm = torch.nn.functional.linear(x, w_perm)
         out_pref = torch.nn.functional.linear(x, w_pref)
         torch.ops.vllm.cots_sync_then_uva(
-            y_gpu, out_perm, out_pref, x, runner_id, 0, x.shape[0]
+            y_gpu, out_perm, out_pref, x, runner_id, 0, op_kind
         )
         return out_perm, out_pref, y_gpu
 
@@ -356,6 +445,7 @@ def test_fx_graph_export_succeeds_without_graph_break() -> None:
     """
     runner = _make_dryrun_runner()
     runner_id = runner._runner_id
+    op_kind = cots_ops.op_kind_code("qkv")
 
     x = torch.randn(4, 16, dtype=torch.bfloat16, device="cuda")
     x_pin = torch.empty(4, 16, dtype=torch.bfloat16, pin_memory=True)
@@ -367,12 +457,10 @@ def test_fx_graph_export_succeeds_without_graph_break() -> None:
     def forward(x, x_pin, y_pin, y_gpu, w_perm, dummy):
         # §1c.20 final schema: both x_pinned and y_pinned dropped.
         del x_pin, y_pin
-        torch.ops.vllm.cots_submit_gemm(
-            x, runner_id, 0, x.shape[0]
-        )
+        torch.ops.vllm.cots_submit_gemm(x, runner_id, 0, op_kind)
         out_perm = torch.nn.functional.linear(x, w_perm)
         torch.ops.vllm.cots_sync_then_uva(
-            y_gpu, out_perm, dummy, x, runner_id, 0, x.shape[0]
+            y_gpu, out_perm, dummy, x, runner_id, 0, op_kind
         )
         return out_perm, y_gpu
 

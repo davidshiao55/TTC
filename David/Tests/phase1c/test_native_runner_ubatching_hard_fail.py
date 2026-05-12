@@ -3,13 +3,13 @@
 microbatching/ubatching, until per-ubatch live counts are plumbed
 (§1c.23 follow-up).
 
-The §1c.21 live-token override
-(`gpu_model_runner.execute_model → BaseOffloader.set_runtime_num_tokens`)
-sets ONE global `runtime_num_tokens` per scheduler batch. Under
-ubatching, COTS operators run on per-ubatch slices but would see the
-override as the FULL batch count, which can over-compute (the worker
-reads past the per-ubatch x_pinned slice into stale data) or trip
-the `runtime_num_tokens > slab.num_tokens` hard-fail.
+The live-token cap
+(`GPUModelRunner._publish_offloader_dispatch →
+BaseOffloader.set_live_num_tokens`) currently sets ONE global
+`live_num_tokens` value per scheduler batch. Under ubatching, COTS
+operators run on per-ubatch slices but would see the cap as the FULL
+batch count, which can over-compute against the per-ubatch x_pinned
+slice.
 
 CotsOffloader.post_init hard-fails at construction when
 `parallel_config.use_ubatching` is True AND `cpu_runner='native'`.

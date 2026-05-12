@@ -1,5 +1,5 @@
 """§1c.22 review-fix: prove `bucket_capacity_tokens` does not change
-when `runtime_num_tokens` or `slab.num_tokens` changes.
+when the live-token cap or `slab.num_tokens` changes.
 
 The TaskSlab has two distinct token-count fields:
   * `num_tokens` — mutable, written per submit_on_stream call (records
@@ -11,8 +11,8 @@ The TaskSlab has two distinct token-count fields:
 
 The test directly exercises CotsCpuInfer (no Python runner involved):
   1. Populate slab with `bucket_capacity_tokens=N`.
-  2. Drive `set_runtime_num_tokens` with a different value → assert
-     bucket_capacity_tokens unchanged.
+  2. Drive the C++ `set_runtime_num_tokens` live-cap field with a
+     different value → assert bucket_capacity_tokens unchanged.
   3. Drive `submit_on_stream` with a different num_tokens (mutates
      slab.num_tokens) → assert bucket_capacity_tokens unchanged.
 """
@@ -58,8 +58,7 @@ def _populate_qkv(ci, task_id: int, bucket: int) -> dict:
 
 
 def test_set_runtime_num_tokens_does_not_touch_bucket_capacity(runner):
-    """`set_runtime_num_tokens` writes a separate atomic, NOT the slab.
-    bucket_capacity_tokens must be unchanged after the call."""
+    """The C++ live-token field is separate from slab capacity."""
     _populate_qkv(runner, task_id=0, bucket=8)
     assert runner.slab_bucket_capacity_tokens(0) == 8
     runner.set_runtime_num_tokens(1)
@@ -119,7 +118,7 @@ def test_replay_bucket_counters_read_capacity_not_num_tokens():
     Method:
       * Dryrun slab populated with bucket_capacity_tokens=64,
         in_dim=cpu_out_dim=32.
-      * `set_runtime_num_tokens(1)` → worker effective_n=1.
+      * live-token cap = 1 → worker effective_n=1.
       * Submit on a CUDA stream with num_tokens=1 (so slab.num_tokens=1
         post-submit, distinct from bucket_capacity_tokens=64).
       * Sync, drain, dump counters.

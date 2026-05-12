@@ -1,18 +1,14 @@
-"""Bucket-key fix A/B: does the new fix subsume §1c.21's runtime override?
+"""Bucket-key fix benchmark: native task selection with live-token cap.
 
-Hypothesis: with the bucket-key fix in `on_dispatch`, the captured graph
-references the correct per-bucket slab (e.g., slab_1 for B=1 decode),
-so `slab.num_tokens` already matches the live count. The §1c.21 override
-(`set_runtime_num_tokens`) then becomes redundant — disabling it should
-not regress wall-clock.
-
-Arms:
-    A. fix_only_override_on   — fix applied, override default ON (control)
-    B. fix_only_override_off  — fix applied, override OFF via env var
+After the native task-id fix, the captured graph references the correct
+per-bucket slab (e.g., slab_1 for B=1 decode). The live-token cap is now
+part of the default design, so
+this script runs the default production path. Historical result filenames
+are kept in `results/bucket_key_fix_ab/` for comparison.
 
 Compares against the §1c.21 historical anchor: 2.76s (post-fix) vs
-119.3s (pre-fix regression). If both A and B come in ~2.7-3.0s,
-the fix subsumes the override.
+119.3s (pre-fix regression). A result near 2.7-3.0s confirms task
+selection is fixed and CPU work remains live-row capped.
 
 Single arm: `cots_005_native_capture_real` at B=1, f=0.05, t=16,
 input=8, output=128. Mirrors `bench_dryrun_vs_native_qwen.py`'s
@@ -77,17 +73,9 @@ def main() -> None:
     # Phase 1c bench uses iters=3, warmup=2. Keep parity.
     iters, warmup = 3, 2
     results = []
-    # A: fix on, override on (control — should match the §1c.21 post-fix anchor)
     results.append(run_arm(
-        "fix_only_override_on",
-        env_extra={},  # default behavior — override active
-        num_iters=iters,
-        warmup=warmup,
-    ))
-    # B: fix on, override off (hypothesis test — fix should subsume override)
-    results.append(run_arm(
-        "fix_only_override_off",
-        env_extra={"VLLM_COTS_DISABLE_RUNTIME_OVERRIDE": "1"},
+        "live_cap_default",
+        env_extra={},
         num_iters=iters,
         warmup=warmup,
     ))
@@ -100,16 +88,9 @@ def main() -> None:
         avg_str = f"{avg:.4f}s" if avg is not None else "FAILED"
         print(f"  {r['name']:<30}  avg_latency={avg_str:<12}  (wall={r['duration']:.1f}s)")
 
-    a, b = results[0].get("avg_latency"), results[1].get("avg_latency")
-    if a is not None and b is not None:
-        delta = b - a
-        print(f"\n  override_off − override_on = {delta:+.4f}s")
-        if abs(delta) < 0.5:
-            print("  CONCLUSION: fix subsumes §1c.21 override (delta within noise)")
-        elif delta > 5.0:
-            print("  CONCLUSION: fix does NOT subsume override (override_off regresses)")
-        else:
-            print("  CONCLUSION: ambiguous — run more iters or investigate")
+    avg = results[0].get("avg_latency")
+    if avg is not None:
+        print("\n  CONCLUSION: default live-token-capped path completed")
 
 
 if __name__ == "__main__":
