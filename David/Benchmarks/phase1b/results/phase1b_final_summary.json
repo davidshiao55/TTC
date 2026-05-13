@@ -1,0 +1,25 @@
+{
+  "phase": "phase1b",
+  "artifact": "compact_final_summary",
+  "raw_results_policy": "Raw benchmark JSON and log outputs are intentionally untracked. Re-run the retained Phase 1b benchmark scripts to regenerate local raw outputs.",
+  "primary_document": "/TTC/David/Docs/phase1b_findings.md",
+  "retained_benchmarks": [
+    "bench_cots_exact_match.py",
+    "bench_cots_collaborative.py",
+    "bench_cots_path_contention.py",
+    "probe_collab_split_sweep.py",
+    "probe_row_prefetch_layout.py"
+  ],
+  "final_decisions": [
+    "Layer-ahead COTS prefetch remains the production prefetch path.",
+    "Three-way dispatch keeps CPU compute, prefetched GPU compute, and GPU-resident compute under Planner control.",
+    "The runtime K/V guard experiment was rejected; the Planner owns routing.",
+    "Row-prefetch uses unified transposed CPU storage instead of a duplicate prefetch source buffer."
+  ],
+  "important_experiments_preserved_in_docs": [
+    "COTS exact-match comparison against native prefetch-defer at matched offloaded GiB",
+    "collaborative CPU plus prefetch split comparison",
+    "path contention comparison between CPU-only, prefetch-only, and collaborative COTS",
+    "row-prefetch layout probe"
+  ]
+}

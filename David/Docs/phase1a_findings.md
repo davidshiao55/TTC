@@ -548,7 +548,7 @@ Two flat-vs-linear curves cross. The crossover regime — where COTS's flat over
 
 #### CPU thread count tuning (`cpu_num_threads`, default 16)
 
-A complete 4-arm × 3-batch × 4-thread decode-heavy sweep (`bench_cots_thread_sweep_decode.py` → `results/thread_sweep_decode/`) plus a 3-cell prefill sweep at f=0.09 (`bench_cots_thread_sweep_prefill.py` → `results/thread_sweep_prefill/`). Cross-run reproducibility was independently verified at CV ≤ 3% per cell over 3 fresh vLLM processes per cell — the thread-count effect dwarfs noise by 1–3 orders of magnitude.
+A complete 4-arm × 3-batch × 4-thread decode-heavy sweep (`bench_cots_thread_sweep_decode.py`) plus a 3-cell prefill sweep at f=0.09 (`bench_cots_thread_sweep_prefill.py`). Raw result files are no longer checked in; the retained compact artifact is `David/Benchmarks/phase1a/results/phase1a_final_summary.json`. Cross-run reproducibility was independently verified at CV ≤ 3% per cell over 3 fresh vLLM processes per cell — the thread-count effect dwarfs noise by 1–3 orders of magnitude.
 
 Decode-heavy slowdown vs row-best (the headline table at the top of §1.13b is at t=16):
 
@@ -615,7 +615,7 @@ A new flag (`CotsOffloadConfig.dry_run`, CLI `--cots-dry-run`; see `vllm/config/
 
 ### Headline table: t × B sweep (`cots_005`, decode-heavy, input=8, output=128)
 
-`results/dryrun_vs_none/summary.json`. `none` is t-invariant: 2.033 s @ B=1, 2.110 s @ B=4.
+Raw `dryrun_vs_none` outputs are no longer checked in; this table is the retained summary. `none` is t-invariant: 2.033 s @ B=1, 2.110 s @ B=4.
 
 | B | t | dryrun (s) | real (s) | orch = dry − none | active CPU-work = real − dry | total = real − none | orch % |
 |---:|---:|---:|---:|---:|---:|---:|---:|

@@ -50,7 +50,7 @@ def _new_runner_with_qkv_slab(
         w_cpu_rows=n_cpu,
     )
     r._task_id_for[(0, num_tokens, "qkv")] = 0
-    cots_ops._register_task_id_for(r._runner_id, r._task_id_for)
+    cots_ops.register_task_id_map(r._runner_id, r._task_id_for)
     r.set_active_dispatch(num_tokens, num_tokens)
     return r, x_pin, y_pin
 
@@ -128,7 +128,7 @@ def test_transposed_x_gpu_is_rejected() -> None:
         x_gpu = base.t()
         assert x_gpu.shape == (num_tokens, in_dim)
         assert x_gpu.stride(1) != 1
-        with pytest.raises(AssertionError, match="stride\\(1\\)"):
+        with pytest.raises(RuntimeError, match="stride\\(1\\)"):
             r.submit_with_d2h(x_gpu, 0, "qkv")
     finally:
         r.close()

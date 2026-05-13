@@ -141,5 +141,5 @@ def test_uva_copy_rejects_pageable_cpu() -> None:
 
     pageable = torch.empty(8, dtype=torch.bfloat16)
     dst = torch.zeros(8, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(AssertionError, match="pinned host memory"):
+    with pytest.raises(RuntimeError, match="pinned host memory"):
         uva_copy_into_gpu(pageable, dst)

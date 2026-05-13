@@ -108,7 +108,11 @@ def _build_block(f_cpu_store: float):
     with set_current_vllm_config(vc):
         layer = _Layer().cuda()
         offloader = CotsOffloader(
-            config=CotsOffloadConfig(f_cpu_store=f_cpu_store, kv_biased=True)
+            config=CotsOffloadConfig(
+                f_cpu_store=f_cpu_store,
+                kv_biased=True,
+                cpu_runner="python",
+            )
         )
         set_offloader(offloader)
         offloader.wrap_modules(iter([layer]))
@@ -178,15 +182,17 @@ def test_fused_mlp_emits_exactly_one_uva_copy():
     x = torch.randn(8, HIDDEN, dtype=torch.bfloat16, device="cuda")
 
     import vllm.model_executor.offloader.cots as cots_mod
+    import vllm.model_executor.offloader.cots_runners as cots_runners_mod
 
     # Phase 1c §1c.20 split the UVA helpers: `uva_copy_into_gpu` is the
     # public eager-path helper (PythonCotsRunner.wait_and_uva); the
     # native-runner captured path uses `_uva_copy_trusted_host_into_gpu`
     # (skips the pinned-storage assertion because the slab pointer's
-    # page-locked-ness is an install-time invariant). Patch BOTH and
-    # require the operator to go through exactly one of them.
+    # page-locked-ness is an install-time invariant). Patch the actual
+    # modules that call them and require the operator to go through
+    # exactly one of the two paths.
     counter = {"calls": 0}
-    real_public = cots_mod.uva_copy_into_gpu
+    real_public = cots_runners_mod.uva_copy_into_gpu
     real_trusted = cots_mod._uva_copy_trusted_host_into_gpu
 
     def counting_public(src, dst):
@@ -198,7 +204,7 @@ def test_fused_mlp_emits_exactly_one_uva_copy():
         return real_trusted(src, dst)
 
     with (
-        patch.object(cots_mod, "uva_copy_into_gpu", counting_public),
+        patch.object(cots_runners_mod, "uva_copy_into_gpu", counting_public),
         patch.object(
             cots_mod,
             "_uva_copy_trusted_host_into_gpu",
@@ -239,7 +245,11 @@ def test_orphan_col_row_raises():
     with set_current_vllm_config(vc):
         layer = OrphanLayer().cuda()
         offloader = CotsOffloader(
-            config=CotsOffloadConfig(f_cpu_store=0.25, kv_biased=True)
+            config=CotsOffloadConfig(
+                f_cpu_store=0.25,
+                kv_biased=True,
+                cpu_runner="python",
+            )
         )
         set_offloader(offloader)
         with pytest.raises(RuntimeError, match="MLP block"):

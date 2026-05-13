@@ -304,40 +304,26 @@ Every stage gated on green tests + a measured invariant before the next started:
 | 4 | Bucket-aware n_threads observed by worker; main-thread `at::get_num_threads` isolation | All assertions pass; risk #3 GREEN (omp pragma contingency unused) |
 | 5 | CUDA graph capture + 50× replay deterministic + parity; collapse ratio capture/eager < 0.7; FX-positional submit < GEMMs < sync via `torch._dynamo.export` | Collapse ratio 0.477 PASS; FX ordering proven; risk #4 GREEN |
 
-§1.14 ABSOLUTE on Qwen2.5-7B + FastTTS (the thesis-locked number)
-status as of Stage 6:
+§1.14 ABSOLUTE on Qwen2.5-7B + FastTTS is now closed by the final
+Phase 1c production validation:
 
-- **Harness landed**: `David/Benchmarks/phase1c/bench_dryrun_vs_native_qwen.py`
-  ports Phase 1a's `bench_cots_dryrun_vs_none.py` with six arms — two
-  no-offload baselines (`none` eager + `none_capture` graph-mode) and
-  four COTS arms covering python/native × eager/capture × dryrun/real.
-  The auto-derived CLI flags
-  `--cots-cpu-runner`, `--cots-cpu-num-threads-by-bucket`, and
-  `--cots-cpu-worker-affinity` are now plumbed through `EngineArgs` so
-  `vllm bench latency` accepts them.
-- **Smoke results committed** (1 iter / 1 warmup, B=1, t=16, f=0.05;
-  see `David/Benchmarks/phase1c/results/dryrun_vs_native_qwen/summary.json`):
-  - `none` (eager baseline)              2.0324 s/gen
-  - `none_capture` (graph baseline)      2.0326 s/gen
-  - `cots_005_python_eager_dryrun`       2.5351 s/gen → orch +0.503 s
-  - `cots_005_native_eager_dryrun`       2.3516 s/gen → orch +0.319 s
-  These are smoke values, NOT settled benchmark numbers; they confirm
-  the harness wiring + reproduce the §1.14 baseline shape.
-- **`native_capture_dryrun` / `native_capture_real` arms BLOCKED** by a
-  pre-hook × `torch.compile(fullgraph=True)` interaction. The Dynamo
-  error at engine init points at `_bucket_for → bisect_left` (Dynamo
-  can't trace `_bisect.bisect_left`). See `phase1c_findings.md §1c.18`
-  for the captured stack and three resolution paths (preferred: make
-  `_bucket_for` Dynamo-traceable by replacing `bisect_left` with a
-  tuple-iteration over a constant `_capture_buckets`; lowest-friction).
-- The synthetic `bench_dryrun_vs_real_native.py` collapse-shape gate
-  (Stage 5, ratio 0.477) is the in-stage Phase 1c sign-off; locking the
-  real-model absolute is a Stage 6 follow-up that needs §1c.18 fixed
-  first.
+- **Default path:** `cpu_runner="native"`, `auto_graph_split=True`,
+  piecewise graph split at the COTS submit/sync custom ops, and
+  `wait_kernel` sync in graph mode.
+- **Retained validation harnesses:**
+  `bench_capture_gap_qwen.py`, `bench_capture_gap_qwen_grid.py`, and
+  `check_capture_piecewise_parity_qwen.py`.
+- **Resolved blockers:** `_bucket_for` is Dynamo-traceable, dispatch
+  bucket/task selection is published out of graph through
+  `CotsOffloader.on_dispatch`, and native slabs cap CPU work to live
+  token rows rather than graph-bucket capacity.
+- **Removed probes:** the dryrun-native bring-up harnesses, fused
+  wait+UVA prototype, and ablation-only tests/results were deleted.
+  Their causal conclusions are preserved in `phase1c_findings.md`.
 
-**Total code (as landed):** ~440 LOC C++ (csrc/cots/) + ~120 LOC Python
-(cots_ops.py) + ~600 LOC Python additions/modifications in cots.py + 95 tests
-+ 3 benchmark scripts.
+See `David/Docs/phase1c_findings.md` and
+`David/Benchmarks/phase1c/results/phase1c_final_summary.json` for the
+production numbers and cleanup policy.
 
 ---
 

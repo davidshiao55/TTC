@@ -15,10 +15,9 @@ Covers:
   * Threading invariance — output must be bit-identical at thr=1 and
     thr=16 (parallel-for splits on N; no cross-thread accumulation).
 
-Like the transposed sibling, these are correctness-only. The
-performance microbench lives in
-`test_stage7_natural_layout_microbench.py` (when written) under the
-`stage7_perf` marker.
+Like the transposed sibling, these are correctness-only. The old Stage
+7 performance probes were bring-up artifacts and are no longer part of
+the retained Phase 1c test suite.
 """
 
 from __future__ import annotations

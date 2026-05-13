@@ -109,16 +109,6 @@ def arm_kwargs(name: str, max_model_len: int) -> dict[str, Any]:
                 "splitting_ops": COTS_SPLITTING_OPS,
             },
         }
-    if name == "piecewise_cots_split_wait_uva_real":
-        return {
-            **base,
-            **legacy_cots,
-            "cots_capture_sync_mode": "wait_uva_kernel",
-            "compilation_config": {
-                "cudagraph_mode": "PIECEWISE",
-                "splitting_ops": COTS_SPLITTING_OPS,
-            },
-        }
     if name == "piecewise_cots_split_inductor_host_callback_real":
         return {
             **base,
@@ -255,7 +245,6 @@ def main() -> int:
             "cots_default_real",
             "capture_wait_kernel_real",
             "piecewise_cots_split_wait_kernel_real",
-            "piecewise_cots_split_wait_uva_real",
         ],
     )
     parser.add_argument("--prompt", default=PROMPT)

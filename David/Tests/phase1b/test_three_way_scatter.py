@@ -36,6 +36,8 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.offloader import CotsOffloader, set_offloader
+from vllm.model_executor.offloader.base import ForwardDispatchInfo
+from vllm.forward_context import BatchDescriptor
 
 HIDDEN = 256
 INTERMEDIATE = 1024
@@ -123,6 +125,7 @@ def _build_mlp(f_cpu_store, f_prefetch):
                 f_cpu_store=f_cpu_store,
                 f_prefetch=f_prefetch,
                 kv_biased=True,
+                cpu_runner="python",
             )
         )
         set_offloader(offloader)
@@ -149,6 +152,7 @@ def _build_qkv(f_cpu_store, f_prefetch):
                 f_cpu_store=f_cpu_store,
                 f_prefetch=f_prefetch,
                 kv_biased=True,
+                cpu_runner="python",
             )
         )
         set_offloader(offloader)
@@ -172,10 +176,12 @@ def _prime_prefetch(offloader):
     prefetch for layer 0 so its slot is populated before forward()."""
     streamer = offloader._streamer
     assert streamer is not None
-    streamer.set_current_bucket(MAX_NUM_TOKENS, offloader._bucket_for)
-    streamer.start(0, offloader._layer_handles[0])
-    streamer.copy_stream.synchronize()
-    torch.cuda.current_stream().wait_stream(streamer.copy_stream)
+    offloader.on_dispatch(
+        ForwardDispatchInfo(
+            batch_descriptor=BatchDescriptor(num_tokens=MAX_NUM_TOKENS),
+            num_tokens_unpadded=MAX_NUM_TOKENS,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +274,7 @@ def test_pure_prefetch_zero_cpu_compute_no_residual_qkv():
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
                 f_cpu_store=0.20, f_prefetch=0.20, kv_biased=True,
+                cpu_runner="python",
             )
         )
         set_offloader(offloader)
@@ -303,6 +310,7 @@ def test_pure_prefetch_qkv_forward_parity():
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
                 f_cpu_store=0.20, f_prefetch=0.20, kv_biased=True,
+                cpu_runner="python",
             )
         )
         set_offloader(offloader)
@@ -380,6 +388,7 @@ def _build_mlp_full_offload(f_prefetch):
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
                 f_cpu_store=1.0, f_prefetch=f_prefetch, kv_biased=True,
+                cpu_runner="python",
             )
         )
         set_offloader(offloader)
@@ -428,6 +437,7 @@ def test_full_offload_qkv_with_cuda_custom_ops(f_prefetch):
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
                 f_cpu_store=1.0, f_prefetch=f_prefetch, kv_biased=True,
+                cpu_runner="python",
             )
         )
         set_offloader(offloader)
@@ -471,6 +481,7 @@ def test_factory_prefetch_installs_machinery_even_with_config_zero():
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
                 f_cpu_store=0.50, f_prefetch=0.0, kv_biased=True,
+                cpu_runner="python",
             ),
             dispatch_table_factory=lambda buckets: {b: (0.30, 0.20) for b in buckets},
         )

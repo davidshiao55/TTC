@@ -1,13 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""§1c.29 commit 1: in-process wait-kernel sync smoke via pybind.
+"""In-process wait-kernel sync smoke via pybind.
 
-The standalone smokes (David/Tests/phase1c/smoke_value_signal/) proved
-the captured-graph value-signal protocol is replay-safe. This test
-mirrors that proof THROUGH the vLLM `_cots_C` pybind so the
-production code path's allocation, install, and launcher logic
-are exercised — without yet flipping the operator path. Commit 2
-will wire the launcher into `cots_sync_then_uva` behind the
-feature flag.
+This exercises the vLLM `_cots_C` pybind path that production uses for
+wait-kernel allocation, install, and launch.
 
 What's tested:
   1. install_wait_kernel_sync_for_task allocates host-mapped pinned slots and
@@ -137,103 +132,6 @@ def test_m3_wait_repeated_replay(infer):
     assert infer.wait_kernel_get_done_slot(0) == 100
 
 
-def test_wait_uva_kernel_copies_bf16_output() -> None:
-    """Experimental wait_uva_kernel path waits, then copies pinned BF16 output
-    into the GPU destination in one captured-node-shaped launcher."""
-    pytest.importorskip("vllm._cots_C")
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    from vllm._cots_C import CotsCpuInfer
-
-    rows, cols = 4, 17
-    x_pinned = torch.empty(rows, cols, dtype=torch.bfloat16, pin_memory=True)
-    y_pinned = torch.empty(rows, cols, dtype=torch.bfloat16, pin_memory=True)
-    y_pinned.copy_(
-        torch.arange(rows * cols, dtype=torch.float32).view(rows, cols).to(
-            torch.bfloat16
-        )
-    )
-    y_gpu = torch.empty(rows, cols, dtype=torch.bfloat16, device="cuda")
-
-    inst = CotsCpuInfer()
-    inst.install(n_slabs=1, max_num_tokens=rows)
-    inst.populate_slab_dryrun(
-        0,
-        rows,
-        x_pinned.data_ptr(),
-        cols,
-        y_pinned.data_ptr(),
-        cols,
-    )
-    inst.install_wait_kernel_sync_for_task(0, fuse_uva_copy=True)
-    inst.wait_kernel_set_req_slot(0, 1)
-    inst.wait_kernel_set_done_slot(0, 1)
-
-    fused = inst.sync_or_wait_and_maybe_uva_on_stream(
-        0,
-        y_gpu.data_ptr(),
-        rows,
-        cols,
-        torch.cuda.current_stream().cuda_stream,
-    )
-    assert fused is True
-    torch.cuda.current_stream().synchronize()
-    torch.testing.assert_close(y_gpu.cpu(), y_pinned, rtol=0, atol=0)
-
-
-def test_wait_uva_kernel_captured_graph_replay() -> None:
-    """The fused wait+UVA kernel is CUDA-graph replay safe."""
-    pytest.importorskip("vllm._cots_C")
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    from vllm._cots_C import CotsCpuInfer
-
-    rows, cols = 3, 11
-    x_pinned = torch.empty(rows, cols, dtype=torch.bfloat16, pin_memory=True)
-    y_pinned = torch.empty(rows, cols, dtype=torch.bfloat16, pin_memory=True)
-    y_gpu = torch.empty(rows, cols, dtype=torch.bfloat16, device="cuda")
-    y_pinned.copy_(
-        torch.arange(rows * cols, dtype=torch.float32).view(rows, cols).to(
-            torch.bfloat16
-        )
-    )
-
-    inst = CotsCpuInfer()
-    inst.install(n_slabs=1, max_num_tokens=rows)
-    inst.populate_slab_dryrun(
-        0,
-        rows,
-        x_pinned.data_ptr(),
-        cols,
-        y_pinned.data_ptr(),
-        cols,
-    )
-    inst.install_wait_kernel_sync_for_task(0, fuse_uva_copy=True)
-    inst.wait_kernel_set_req_slot(0, 0)
-    inst.wait_kernel_set_done_slot(0, 0)
-
-    stream = torch.cuda.Stream()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(stream):
-        with torch.cuda.graph(graph, stream=stream):
-            fused = inst.sync_or_wait_and_maybe_uva_on_stream(
-                0,
-                y_gpu.data_ptr(),
-                rows,
-                cols,
-                stream.cuda_stream,
-            )
-            assert fused is True
-
-    for i in range(1, 101):
-        y_gpu.zero_()
-        inst.wait_kernel_set_req_slot(0, i)
-        inst.wait_kernel_set_done_slot(0, i)
-        graph.replay()
-        torch.cuda.current_stream().synchronize()
-        torch.testing.assert_close(y_gpu.cpu(), y_pinned, rtol=0, atol=0)
-
-
 def test_m3_get_without_install_raises(infer):
     """m3_get_*_slot before install raises (catches mismatched
     install/use ordering bugs)."""
@@ -242,14 +140,12 @@ def test_m3_get_without_install_raises(infer):
 
 
 def test_m3_wait_captured_graph_replay(infer):
-    """§1c.29 commit 1 review-fix: capture wait_kernel_sync_on_stream into a
+    """Capture wait_kernel_sync_on_stream into a
     real torch.cuda.CUDAGraph and replay it 100x. The standalone
-    smoke at David/Tests/phase1c/smoke_value_signal/ exercised the
-    captured-replay property end-to-end; this test proves it for
-    the production wait-kernel + host-mapped-slot path that goes
-    through the _cots_C launcher (cots_wait_done_kernel reading volatile
-    uint32_t cells via cudaHostGetDevicePointer addresses), so
-    commit 2 can rely on it for the operator graph capture.
+    proof is now kept here, through the production wait-kernel +
+    host-mapped-slot path that goes through the _cots_C launcher
+    (cots_wait_done_kernel reading volatile uint32_t cells via
+    cudaHostGetDevicePointer addresses).
 
     Key replay-safety properties exercised:
       (a) The captured kernel re-reads dev_req_slot / dev_done_slot
@@ -295,8 +191,7 @@ def test_m3_wait_captured_graph_replay(infer):
 
 
 def test_m3_wait_captured_graph_lagging_release(infer):
-    """§1c.29 commit 1 review-fix-2: captured-graph lagging case
-    with a definite-block assertion.
+    """Captured-graph lagging case with a definite-block assertion.
 
     Replay the captured wait kernel with done < req, then release
     from a worker thread after a measured delay. Asserts that the

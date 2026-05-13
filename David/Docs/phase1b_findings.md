@@ -461,9 +461,8 @@ the bottleneck — making H2D faster has less to bite into. At B=1, C
 went from "loses to B by 2×" to "beats min(A, B) by 15%". qkv and
 col paths use `narrow(0, ...)` over row-major buffers (whole rows)
 and were already contiguous; the row layout was the single dominant
-bug. Pre-fix data preserved under
-`David/Benchmarks/phase1b/results/collaborative/pre_fix/` for the
-before/after comparison.
+bug. The pre-fix before/after conclusion is preserved here; raw
+result files are no longer checked in.
 
 ---
 
@@ -638,11 +637,10 @@ arms are bit-equal across runs (B ≈ 19.84-20.06 s, `none` =
 drifts within ±2% across all four refactors, all within 3-iter
 measurement variance.
 
-Pre-fix snapshots:
-- `results/collaborative/pre_fix/` — pre-row-fix
-- `pre_dispatch_refactor/` — post-row-fix, pre-active-bucket
-- `pre_deferred_refactor/` — post-active-bucket, pre-deferred-prefetch
-- `pre_precompute_refactor/` — post-deferred-prefetch, pre-pre-compute restructure
+Pre-fix snapshots were used during bring-up to isolate each refactor
+step. Their conclusions are preserved in this document; the raw
+snapshot trees were removed during Phase 1 cleanup and replaced by
+`David/Benchmarks/phase1b/results/phase1b_final_summary.json`.
 
 ---
 

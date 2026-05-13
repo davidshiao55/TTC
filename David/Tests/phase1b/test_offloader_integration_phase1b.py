@@ -2,8 +2,7 @@
 
 Exercises the full Phase 1b path on a 2-layer mini stub:
   1. wrap_modules walks layers, builds handles, applies per-bucket prefetch
-     split, allocates the buffer pool + streamer, installs layer hooks,
-     registers the first-decoder pre-hook.
+     split, allocates the buffer pool + streamer, and installs layer hooks.
   2. post_init verifies enforce_eager + sets eager_fallback_entry.
   3. A forward pass through the layer chain triggers wait_prefetch /
      start_prefetch hooks, which delegate to the streamer's H2D + sync.
@@ -36,7 +35,9 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.offloader import CotsOffloader, set_offloader
+from vllm.model_executor.offloader.base import ForwardDispatchInfo
 from vllm.model_executor.offloader.cots import CotsPrefetchBufferPool
+from vllm.forward_context import BatchDescriptor
 
 HIDDEN = 256
 INTERMEDIATE = 1024
@@ -154,6 +155,7 @@ def _build_phase1b(f_cpu_store, f_prefetch):
                 f_cpu_store=f_cpu_store,
                 f_prefetch=f_prefetch,
                 kv_biased=True,
+                cpu_runner="python",
             )
         )
         set_offloader(offloader)
@@ -162,6 +164,15 @@ def _build_phase1b(f_cpu_store, f_prefetch):
             _populate_weights(layer)
         offloader.post_init()
     return layers, offloader
+
+
+def _dispatch(offloader: CotsOffloader, n: int = MAX_NUM_TOKENS) -> None:
+    offloader.on_dispatch(
+        ForwardDispatchInfo(
+            batch_descriptor=BatchDescriptor(num_tokens=n),
+            num_tokens_unpadded=n,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +228,7 @@ def test_phase1b_layer_forward_hooks_wired():
     # and repairs layer 0, then each forward waits for the current layer
     # and starts prefetch for the next layer before compute.
     out = x
+    _dispatch(offloader)
     for layer in layers:
         out = layer(out)
     torch.cuda.synchronize()
@@ -238,17 +250,20 @@ def test_phase1b_dispatch_table_populated_in_wrap_modules():
         assert abs(f_pref - 0.05) < 1e-9, f"f_prefetch mismatch at {bucket}"
 
 
-def test_phase1b_first_decoder_pre_hook_registered():
-    """Pre-hook is on the first offloaded layer — it caches the active
-    bucket on every model forward."""
+def test_phase1b_dispatch_boundary_prepares_layer0():
+    """The final runtime uses OOG dispatch to cache the active bucket and
+    prepare layer 0 before the layer chain runs."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
     layers, offloader = _build_phase1b(f_cpu_store=0.20, f_prefetch=0.05)
     assert offloader._streamer is not None
-    # `_forward_pre_hooks` is a dict of registered hooks on the module.
-    pre_hooks = layers[0]._forward_pre_hooks
-    assert len(pre_hooks) >= 1, "expected first-decoder pre-hook"
+    _dispatch(offloader)
+    assert offloader._current_bucket == offloader._bucket_for(MAX_NUM_TOKENS)
+    for h in offloader._layer_handles[0]:
+        if h.max_n_prefetch == 0:
+            continue
+        assert h.prefetch_owner_in_slot[h.slot_idx] is h
 
 
 def test_phase1b_post_init_fallback_entry_matches_largest_bucket():

@@ -41,12 +41,14 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.offloader import CotsOffloader, set_offloader
+from vllm.model_executor.offloader.base import ForwardDispatchInfo
 from vllm.model_executor.offloader.cots import (
     CotsLinearHandle,
     CotsPrefetchBufferPool,
     WeightPrefetchStreamer,
     _complement,
 )
+from vllm.forward_context import BatchDescriptor
 
 
 HIDDEN = 256
@@ -158,6 +160,7 @@ def _build(f_cpu_store, f_prefetch, n_layers=N_LAYERS, capture_sizes=None):
                 f_cpu_store=f_cpu_store,
                 f_prefetch=f_prefetch,
                 kv_biased=True,
+                cpu_runner="python",
             )
         )
         set_offloader(offloader)
@@ -166,6 +169,15 @@ def _build(f_cpu_store, f_prefetch, n_layers=N_LAYERS, capture_sizes=None):
             _populate_weights(layer)
         offloader.post_init()
     return layers, offloader
+
+
+def _dispatch(offloader: CotsOffloader, n: int = MAX_NUM_TOKENS) -> None:
+    offloader.on_dispatch(
+        ForwardDispatchInfo(
+            batch_descriptor=BatchDescriptor(num_tokens=n),
+            num_tokens_unpadded=n,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +304,7 @@ def test_layer0_precompute_hook_starts_layer1_prefetch():
             assert h.prefetch_available_rows_in_slot[h.slot_idx] == 0
 
     x = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=DTYPE, device="cuda")
+    _dispatch(offloader)
     _ = layers[0](x)
     torch.cuda.synchronize()
 
@@ -332,6 +345,7 @@ def test_operators_use_active_bucket():
     # the dispatch + slot invariants do not raise.)
     x_small = torch.randn(8, HIDDEN, dtype=DTYPE, device="cuda")
     out_small = x_small
+    _dispatch(offloader, int(x_small.shape[0]))
     for layer in layers:
         out_small = layer(out_small)
     torch.cuda.synchronize()
@@ -343,6 +357,7 @@ def test_operators_use_active_bucket():
     # needed; but the path is exercised).
     x_big = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=DTYPE, device="cuda")
     out_big = x_big
+    _dispatch(offloader, int(x_big.shape[0]))
     for layer in layers:
         out_big = layer(out_big)
     torch.cuda.synchronize()
@@ -368,11 +383,11 @@ def test_owner_mismatch_raises():
         if h.kind == "qkv" and h.max_n_prefetch > 0
     )
 
-    # Poison: claim a different handle owns the slot.
     other = object()  # any sentinel != h
-    h.prefetch_owner_in_slot[h.slot_idx] = other  # type: ignore[assignment]
 
-    streamer.set_current_bucket(MAX_NUM_TOKENS, lambda _n: MAX_NUM_TOKENS)
+    _dispatch(offloader)
+    # Poison after dispatch fills the slot: claim a different handle owns it.
+    h.prefetch_owner_in_slot[h.slot_idx] = other  # type: ignore[assignment]
     x = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=DTYPE, device="cuda")
     with pytest.raises(AssertionError, match="slot owner mismatch"):
         _ = layers[0](x)

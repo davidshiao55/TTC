@@ -7,8 +7,8 @@ A C++ exception inside a worker task must:
       reaching a normal stream-synchronize after the failing task);
   (b) be stored on the CotsCpuInfer (`has_error_` + `last_error_msg_`);
   (c) re-raise as a Python RuntimeError on the NEXT entry-point call
-      (submit / sync / populate_slab / submit_dryrun_burst) — the
-      `check_error()` guard at the top of every entry point.
+      (submit / sync / populate_slab) — the `check_error()` guard at
+      the top of every entry point.
 
 The Python runner naturally re-raises through `future.result()`; the
 native runner needs the same surfacing so a silent worker death doesn't

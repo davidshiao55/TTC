@@ -239,7 +239,11 @@ def test_mini_decoder_offload_e2e(f_cpu_store):
 
         # Set up the offloader the way create_offloader would.
         offloader = CotsOffloader(
-            config=CotsOffloadConfig(f_cpu_store=f_cpu_store, kv_biased=True)
+            config=CotsOffloadConfig(
+                f_cpu_store=f_cpu_store,
+                kv_biased=True,
+                cpu_runner="python",
+            )
         )
         set_offloader(offloader)
 
@@ -359,7 +363,11 @@ def test_lookup_dispatch_rounds_up():
     with set_current_vllm_config(vllm_config):
         layer = MiniDecoderLayer().cuda()
         offloader = CotsOffloader(
-            config=CotsOffloadConfig(f_cpu_store=0.1, kv_biased=True)
+            config=CotsOffloadConfig(
+                f_cpu_store=0.1,
+                kv_biased=True,
+                cpu_runner="python",
+            )
         )
         set_offloader(offloader)
         offloader.wrap_modules(iter([layer]))
@@ -397,7 +405,11 @@ def test_quantized_layer_rejected():
         layer.qkv_proj.quant_method = FakeQuantMethod()
 
         offloader = CotsOffloader(
-            config=CotsOffloadConfig(f_cpu_store=0.1, kv_biased=True)
+            config=CotsOffloadConfig(
+                f_cpu_store=0.1,
+                kv_biased=True,
+                cpu_runner="python",
+            )
         )
         set_offloader(offloader)
         with pytest.raises(RuntimeError, match="unquantized"):

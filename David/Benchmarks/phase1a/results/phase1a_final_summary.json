@@ -1,0 +1,28 @@
+{
+  "phase": "phase1a",
+  "artifact": "compact_final_summary",
+  "raw_results_policy": "Raw benchmark JSON, log, and PDF outputs are intentionally untracked. Re-run the retained Phase 1a benchmark scripts to regenerate local raw outputs.",
+  "primary_document": "/TTC/David/Docs/phase1a_findings.md",
+  "retained_benchmarks": [
+    "bench_cots_vs_native_decode.py",
+    "bench_cots_vs_native_prefill.py",
+    "bench_cots_dryrun_vs_none.py",
+    "bench_cots_thread_sweep_decode.py",
+    "bench_cots_thread_sweep_prefill.py",
+    "microbench_thread_sweep_mlp.py",
+    "probe_cots_overlap.py",
+    "smoke_qwen25_7b.py"
+  ],
+  "final_decisions": [
+    "Column/row COTS split is mathematically exact and remains covered by unit tests.",
+    "WQKV uses KV-biased column assignment so K/V head groups land on the CPU slice first.",
+    "The Phase 1a Python runner is retained only as the eager kill-switch path after Phase 1c.",
+    "Dry-run decomposition remains a diagnostic for separating host orchestration from active CPU work."
+  ],
+  "important_experiments_preserved_in_docs": [
+    "COTS-vs-native decode and prefill comparisons",
+    "thread-count sweeps for CPU matmul behavior",
+    "dryrun-vs-real-vs-none decomposition",
+    "Nsight overlap probe validating concurrent CPU/GPU work"
+  ]
+}

@@ -39,7 +39,7 @@ def test_uva_copy_rejects_non_pinned_src():
     """Contract: src must be pinned (otherwise UVA mapping is invalid)."""
     src = torch.randn(64, 64, dtype=torch.bfloat16)  # NOT pinned
     dst = torch.empty(64, 64, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(AssertionError):
+    with pytest.raises(RuntimeError):
         uva_copy_into_gpu(src, dst)
 
 
@@ -47,7 +47,7 @@ def test_uva_copy_shape_dtype_must_match():
     src = torch.randn(64, 64, dtype=torch.bfloat16).pin_memory()
     dst_wrong_shape = torch.empty(64, 32, dtype=torch.bfloat16, device="cuda")
     dst_wrong_dtype = torch.empty(64, 64, dtype=torch.float32, device="cuda")
-    with pytest.raises(AssertionError):
+    with pytest.raises(RuntimeError):
         uva_copy_into_gpu(src, dst_wrong_shape)
-    with pytest.raises(AssertionError):
+    with pytest.raises(RuntimeError):
         uva_copy_into_gpu(src, dst_wrong_dtype)

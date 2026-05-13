@@ -26,6 +26,9 @@ dist/
 *.log
 wandb/
 
+# Local experiment outputs
+/results/
+
 # Nsight Systems profiling artifacts (binary, large)
 *.nsys-rep
 *.sqlite

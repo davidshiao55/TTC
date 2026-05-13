@@ -6,7 +6,6 @@ Fresh-run harness for the capture-vs-eager decision gate:
   * native_eager_real is the bar to beat.
   * capture_wait_kernel_real must beat native_eager_real to keep chasing
     capture mode.
-  * capture_wait_uva_real is the experimental fused wait+UVA prototype.
 
 Default output directory:
     /TTC/results/phase1c_capture_gap/<timestamp>/
@@ -34,6 +33,12 @@ OUTPUT_LEN = 128
 BATCH_SIZE = 1
 F_CPU_STORE = 0.05
 CPU_THREADS = 16
+DEFAULT_ARMS = [
+    "native_eager_real",
+    "cots_default_real",
+    "capture_wait_kernel_real",
+    "piecewise_cots_split_wait_kernel_real",
+]
 
 DEFAULT_PIECEWISE_SPLITTING_OPS = [
     "vllm::unified_attention",
@@ -110,10 +115,6 @@ def arms(*, f_cpu_store: float, cpu_threads: int) -> dict[str, list[str]]:
         + ["--cots-dry-run", "--cots-capture-sync-mode", "wait_kernel"],
         "capture_wait_kernel_real": legacy_cots_base
         + ["--cots-capture-sync-mode", "wait_kernel"],
-        "capture_wait_uva_dryrun": legacy_cots_base
-        + ["--cots-dry-run", "--cots-capture-sync-mode", "wait_uva_kernel"],
-        "capture_wait_uva_real": legacy_cots_base
-        + ["--cots-capture-sync-mode", "wait_uva_kernel"],
         "piecewise_host_callback_dryrun": legacy_cots_base
         + ["--cots-dry-run"]
         + piecewise_graph,
@@ -134,12 +135,6 @@ def arms(*, f_cpu_store: float, cpu_threads: int) -> dict[str, list[str]]:
         + piecewise_cots_split_graph,
         "piecewise_cots_split_wait_kernel_real": legacy_cots_base
         + ["--cots-capture-sync-mode", "wait_kernel"]
-        + piecewise_cots_split_graph,
-        "piecewise_cots_split_wait_uva_dryrun": legacy_cots_base
-        + ["--cots-dry-run", "--cots-capture-sync-mode", "wait_uva_kernel"]
-        + piecewise_cots_split_graph,
-        "piecewise_cots_split_wait_uva_real": legacy_cots_base
-        + ["--cots-capture-sync-mode", "wait_uva_kernel"]
         + piecewise_cots_split_graph,
         "piecewise_cots_split_inductor_host_callback_dryrun": legacy_cots_base
         + ["--cots-dry-run"]
@@ -240,7 +235,15 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--f-cpu-store", type=float, default=F_CPU_STORE)
     parser.add_argument("--cpu-threads", type=int, default=CPU_THREADS)
-    parser.add_argument("--only-arms", nargs="*", default=None)
+    parser.add_argument(
+        "--only-arms",
+        nargs="*",
+        default=DEFAULT_ARMS,
+        help=(
+            "Arms to run. Defaults to the final production comparison. "
+            "Pass an explicit list to re-run legacy/dryrun diagnostics."
+        ),
+    )
     parser.add_argument(
         "--extra-flag",
         action="append",
@@ -252,11 +255,7 @@ def main() -> int:
 
     args.results_dir.mkdir(parents=True, exist_ok=True)
     all_arms = arms(f_cpu_store=args.f_cpu_store, cpu_threads=args.cpu_threads)
-    selected = (
-        all_arms
-        if args.only_arms is None
-        else {name: all_arms[name] for name in args.only_arms}
-    )
+    selected = {name: all_arms[name] for name in args.only_arms}
 
     print(
         f"[setup] model={args.model} input={args.input_len} "
@@ -317,12 +316,10 @@ def main() -> int:
     if isinstance(eager, float):
         for candidate in (
             "capture_wait_kernel_real",
-            "capture_wait_uva_real",
             "piecewise_host_callback_real",
             "piecewise_wait_kernel_real",
             "piecewise_cots_split_host_callback_real",
             "piecewise_cots_split_wait_kernel_real",
-            "piecewise_cots_split_wait_uva_real",
         ):
             cand = rows.get(candidate, {}).get("mean")
             if isinstance(cand, float):

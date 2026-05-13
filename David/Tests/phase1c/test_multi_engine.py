@@ -36,6 +36,8 @@ from vllm.config import (
 )
 from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.offloader import CotsOffloader, cots_ops, set_offloader
+from vllm.model_executor.offloader.base import ForwardDispatchInfo
+from vllm.forward_context import BatchDescriptor
 
 pytestmark = pytest.mark.needs_cuda
 
@@ -118,6 +120,15 @@ def _build_qkv_offloader(
     return layer, offloader
 
 
+def _dispatch(offloader: CotsOffloader) -> None:
+    offloader.on_dispatch(
+        ForwardDispatchInfo(
+            batch_descriptor=BatchDescriptor(num_tokens=MAX_NUM_TOKENS),
+            num_tokens_unpadded=MAX_NUM_TOKENS,
+        )
+    )
+
+
 def test_two_runners_have_distinct_runner_ids() -> None:
     """Trivial registry sanity: each NativeCotsRunner gets a unique id,
     and each id resolves to a distinct `CotsCpuInfer` in the registry
@@ -173,8 +184,10 @@ def test_two_offloaders_produce_independent_outputs() -> None:
         assert off_a._runner._runner_id != off_b._runner._runner_id
 
         set_offloader(off_a)
+        _dispatch(off_a)
         out_a, _ = layer_a.qkv_proj(x)
         set_offloader(off_b)
+        _dispatch(off_b)
         out_b, _ = layer_b.qkv_proj(x)
 
         # Different weights → different outputs.
@@ -189,6 +202,7 @@ def test_two_offloaders_produce_independent_outputs() -> None:
         # registry entry didn't get clobbered by the second's
         # construction).
         set_offloader(off_a)
+        _dispatch(off_a)
         out_a_again, _ = layer_a.qkv_proj(x)
         torch.testing.assert_close(out_a_again, out_a, rtol=0, atol=0)
     finally:
@@ -211,17 +225,21 @@ def test_interleaved_forwards_do_not_cross_talk() -> None:
 
     try:
         set_offloader(off_a)
+        _dispatch(off_a)
         out_a_first, _ = layer_a.qkv_proj(x)
         out_a_first = out_a_first.clone()
         set_offloader(off_b)
+        _dispatch(off_b)
         out_b_first, _ = layer_b.qkv_proj(x)
         out_b_first = out_b_first.clone()
 
         for _ in range(10):
             set_offloader(off_a)
+            _dispatch(off_a)
             out_a_n, _ = layer_a.qkv_proj(x)
             torch.testing.assert_close(out_a_n, out_a_first, rtol=0, atol=0)
             set_offloader(off_b)
+            _dispatch(off_b)
             out_b_n, _ = layer_b.qkv_proj(x)
             torch.testing.assert_close(out_b_n, out_b_first, rtol=0, atol=0)
     finally:

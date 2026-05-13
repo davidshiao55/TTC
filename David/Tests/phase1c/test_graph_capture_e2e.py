@@ -15,10 +15,10 @@ That means
       same graph on the same input produce identical output (catches
       stale-userData UB in the slab pool, plan §risk register #2).
 
-These are the technical preconditions for Stage 5's headline orch
-gate. The §1.14 absolute-numbers comparison (target orch ≤ 0.05
-s/generate) lives in `bench_dryrun_vs_real_native.py` and Stage 6
-locks it on the real Qwen2.5-7B workload.
+These are the technical preconditions for the final Phase 1c graph
+path. Real-model production validation lives in
+`bench_capture_gap_qwen.py`, `bench_capture_gap_qwen_grid.py`, and
+`check_capture_piecewise_parity_qwen.py`.
 """
 
 from __future__ import annotations
@@ -46,6 +46,8 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.offloader import CotsOffloader, set_offloader
+from vllm.model_executor.offloader.base import ForwardDispatchInfo
+from vllm.forward_context import BatchDescriptor
 
 pytestmark = pytest.mark.needs_cuda
 
@@ -202,10 +204,18 @@ def _capture_replay_compare(
     every replay matches the eager reference. Models the
     cudagraph_utils.py:267 boundary: prepare_before_forward +
     sync_prev_onload BEFORE the captured region."""
+    def dispatch() -> None:
+        n = int(x.shape[0])
+        offloader.on_dispatch(
+            ForwardDispatchInfo(
+                batch_descriptor=BatchDescriptor(num_tokens=n),
+                num_tokens_unpadded=n,
+            )
+        )
+
     # Eager reference (no capture). post_init has already fired so the
     # offloader is fully installed.
-    offloader.prepare_before_forward(int(x.shape[0]))
-    offloader.sync_prev_onload()
+    dispatch()
     out_eager = forward(x)
     if isinstance(out_eager, tuple):
         out_eager = out_eager[0]
@@ -217,11 +227,11 @@ def _capture_replay_compare(
     # graph replay).
     g = torch.cuda.CUDAGraph()
     # Pre-capture warmup (any first-time allocations / pool ops).
+    dispatch()
     _ = forward(x)
     torch.cuda.current_stream().synchronize()
 
-    offloader.prepare_before_forward(int(x.shape[0]))
-    offloader.sync_prev_onload()
+    dispatch()
     with torch.cuda.graph(g):
         out_captured = forward(x)
         if isinstance(out_captured, tuple):
@@ -229,6 +239,7 @@ def _capture_replay_compare(
         offloader.join_after_forward()
 
     # First replay.
+    dispatch()
     g.replay()
     torch.cuda.current_stream().synchronize()
     captured_first = out_captured.clone()
@@ -238,6 +249,7 @@ def _capture_replay_compare(
     # same output every time. Catches stale-userData UB in the slab
     # pool (plan §risk register #2).
     for i in range(n_replays):
+        dispatch()
         g.replay()
         torch.cuda.current_stream().synchronize()
         torch.testing.assert_close(
@@ -363,22 +375,31 @@ def test_capture_then_eager_then_capture_again_works() -> None:
     )
     torch.manual_seed(41)
     x = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    def dispatch() -> None:
+        n = int(x.shape[0])
+        offloader.on_dispatch(
+            ForwardDispatchInfo(
+                batch_descriptor=BatchDescriptor(num_tokens=n),
+                num_tokens_unpadded=n,
+            )
+        )
+
     try:
         # 1. Eager.
-        offloader.prepare_before_forward(int(x.shape[0]))
-        offloader.sync_prev_onload()
+        dispatch()
         out_eager_1, _ = layer.qkv_proj(x)
         out_eager_1 = out_eager_1.clone()
 
         # 2. Capture + replay.
         g = torch.cuda.CUDAGraph()
+        dispatch()
         _ = layer.qkv_proj(x)
         torch.cuda.current_stream().synchronize()
-        offloader.prepare_before_forward(int(x.shape[0]))
-        offloader.sync_prev_onload()
+        dispatch()
         with torch.cuda.graph(g):
             out_captured, _ = layer.qkv_proj(x)
             offloader.join_after_forward()
+        dispatch()
         g.replay()
         torch.cuda.current_stream().synchronize()
         torch.testing.assert_close(
@@ -386,8 +407,7 @@ def test_capture_then_eager_then_capture_again_works() -> None:
         )
 
         # 3. Eager again — must still produce the right answer.
-        offloader.prepare_before_forward(int(x.shape[0]))
-        offloader.sync_prev_onload()
+        dispatch()
         out_eager_2, _ = layer.qkv_proj(x)
         out_eager_2 = out_eager_2.clone()
         torch.testing.assert_close(
@@ -395,6 +415,7 @@ def test_capture_then_eager_then_capture_again_works() -> None:
         )
 
         # 4. Replay AGAIN — captured graph still works after eager pass.
+        dispatch()
         g.replay()
         torch.cuda.current_stream().synchronize()
         torch.testing.assert_close(

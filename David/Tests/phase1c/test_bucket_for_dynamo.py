@@ -18,8 +18,8 @@ Two parts:
    ...` here; the fix removes that failure mode.
 
 If THIS test passes, the §1c.18 blocker is closed at the unit level.
-The real-model anchor in `bench_dryrun_vs_native_qwen.py` is the
-end-to-end gate.
+The real-model anchors are the retained capture-gap and piecewise
+parity benches in `David/Benchmarks/phase1c/`.
 """
 
 from __future__ import annotations

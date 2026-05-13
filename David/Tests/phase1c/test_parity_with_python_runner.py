@@ -39,6 +39,8 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.offloader import CotsOffloader, set_offloader
+from vllm.model_executor.offloader.base import ForwardDispatchInfo
+from vllm.forward_context import BatchDescriptor
 
 pytestmark = pytest.mark.needs_cuda
 
@@ -185,6 +187,15 @@ def _build_mlp(
     return layer, offloader, gate, up, down
 
 
+def _dispatch(offloader: CotsOffloader, n: int = MAX_NUM_TOKENS) -> None:
+    offloader.on_dispatch(
+        ForwardDispatchInfo(
+            batch_descriptor=BatchDescriptor(num_tokens=n),
+            num_tokens_unpadded=n,
+        )
+    )
+
+
 @pytest.mark.parametrize(
     "f_cpu_store",
     [0.10, 0.25, 0.50],
@@ -200,6 +211,7 @@ def test_qkv_native_matches_python(f_cpu_store: float) -> None:
     _, off_py, _ = _build_qkv(
         f_cpu_store=f_cpu_store, f_prefetch=0.0, cpu_runner="python"
     )
+    _dispatch(off_py)
     out_py, _ = off_py._layer_modules[0].qkv_proj(x)
     set_offloader.__wrapped__ if hasattr(set_offloader, "__wrapped__") else None
     # Tear down the python offloader before constructing the native one
@@ -211,6 +223,7 @@ def test_qkv_native_matches_python(f_cpu_store: float) -> None:
     _, off_nat, _ = _build_qkv(
         f_cpu_store=f_cpu_store, f_prefetch=0.0, cpu_runner="native"
     )
+    _dispatch(off_nat)
     out_nat, _ = off_nat._layer_modules[0].qkv_proj(x)
     if off_nat._runner is not None:
         off_nat._runner.close()
@@ -234,6 +247,7 @@ def test_mlp_native_matches_python(f_cpu_store: float) -> None:
     _, off_py, *_ = _build_mlp(
         f_cpu_store=f_cpu_store, f_prefetch=0.0, cpu_runner="python"
     )
+    _dispatch(off_py)
     out_py = off_py._layer_modules[0].mlp(x)
     if off_py._runner is not None:
         off_py._runner.close()
@@ -241,6 +255,7 @@ def test_mlp_native_matches_python(f_cpu_store: float) -> None:
     _, off_nat, *_ = _build_mlp(
         f_cpu_store=f_cpu_store, f_prefetch=0.0, cpu_runner="native"
     )
+    _dispatch(off_nat)
     out_nat = off_nat._layer_modules[0].mlp(x)
     if off_nat._runner is not None:
         off_nat._runner.close()
@@ -255,21 +270,17 @@ def test_mlp_native_matches_python(f_cpu_store: float) -> None:
     ids=["fcpu_010", "fcpu_050"],
 )
 def test_no_streamer_native_forward_succeeds(f_cpu_store: float) -> None:
-    """Phase 1c §design-decision 11 / Stage 3: at f_prefetch=0 the
-    streamer is None and the operator's old `streamer.current_bucket`
-    read path was unreachable. The native runner's lazy fallback now
-    rebuilds the descriptor with `_bucket_for(num_tokens)` at submit
-    time, so a forward succeeds even without the pre-hook firing
-    first. This test deliberately bypasses the parent layer's forward
-    (calls qkv_proj directly) so `_current_bucket` stays None — only
-    the runner's fallback path is exercised."""
+    """At f_prefetch=0 the streamer is None, but final native COTS still
+    runs once the production OOG dispatch boundary has published the
+    active bucket."""
     torch.manual_seed(7)
     x = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
     _, off, _ = _build_qkv(
         f_cpu_store=f_cpu_store, f_prefetch=0.0, cpu_runner="native"
     )
     assert off._streamer is None  # f_prefetch=0
-    assert off._current_bucket is None  # pre-hook hasn't fired
+    assert off._current_bucket is None
+    _dispatch(off)
     out, _ = off._layer_modules[0].qkv_proj(x)
     assert out.shape == (MAX_NUM_TOKENS, off._handles[0].out_dim)
     if off._runner is not None:
@@ -284,15 +295,7 @@ def _prime_prefetch(offloader: CotsOffloader) -> None:
     without going through the layer-forward hook chain."""
     streamer = offloader._streamer
     assert streamer is not None
-    streamer.set_current_bucket(MAX_NUM_TOKENS, offloader._bucket_for)
-    # Phase 1c: also set the offloader's _current_bucket so the
-    # operator's read path sees a non-None bucket directly (the runner
-    # fallback would handle it too, but this matches the production
-    # pre-hook flow more faithfully).
-    offloader._current_bucket = offloader._bucket_for(MAX_NUM_TOKENS)
-    streamer.start(0, offloader._layer_handles[0])
-    streamer.copy_stream.synchronize()
-    torch.cuda.current_stream().wait_stream(streamer.copy_stream)
+    _dispatch(offloader)
 
 
 @pytest.mark.parametrize(

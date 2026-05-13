@@ -36,6 +36,8 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.offloader import CotsOffloader, set_offloader
+from vllm.model_executor.offloader.base import ForwardDispatchInfo
+from vllm.forward_context import BatchDescriptor
 
 HIDDEN = 256
 INTERMEDIATE = 1024
@@ -194,6 +196,7 @@ def _build_and_run(f_cpu_store, f_prefetch, x, per_layer_weights):
                 f_cpu_store=f_cpu_store,
                 f_prefetch=f_prefetch,
                 kv_biased=True,
+                cpu_runner="python",
             )
         )
         set_offloader(offloader)
@@ -203,6 +206,13 @@ def _build_and_run(f_cpu_store, f_prefetch, x, per_layer_weights):
         offloader.post_init()
 
         out = x
+        n = int(x.shape[0])
+        offloader.on_dispatch(
+            ForwardDispatchInfo(
+                batch_descriptor=BatchDescriptor(num_tokens=n),
+                num_tokens_unpadded=n,
+            )
+        )
         for layer in layers:
             out = layer(out)
         torch.cuda.synchronize()

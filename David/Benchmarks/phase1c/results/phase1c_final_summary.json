@@ -1,0 +1,37 @@
+{
+  "phase": "1c",
+  "date_utc": "2026-05-13",
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "dtype": "bfloat16",
+  "f_cpu_store": 0.05,
+  "cpu_threads": 16,
+  "production_default": {
+    "cpu_runner": "native",
+    "auto_graph_split": true,
+    "cots_capture_sync_mode": "wait_kernel",
+    "split_ops": [
+      "vllm::cots_submit_gemm",
+      "vllm::cots_sync_then_uva"
+    ]
+  },
+  "focused_decode_b1_in8_out128_seconds_per_generate": {
+    "native_eager_real": 2.5357,
+    "piecewise_cots_split_wait_kernel_real": 2.4573,
+    "delta_split_vs_eager_ms": -78.4,
+    "notes": "2 warmups, 5 measured iterations, 2 repeats; normal compile cache enabled; greedy parity exact."
+  },
+  "grid_b1_b4_input_8_128_512_output_32_128": {
+    "cells": 12,
+    "split_wins_vs_native_eager": 12,
+    "split_wins_vs_full_capture_wait_kernel": 12,
+    "split_beats_eager_by_at_least_50ms": 8,
+    "split_beats_full_capture_by_at_least_50ms": 10,
+    "notes": "The split path was fastest on the tested grid; short decode cells can win by less than the 50 ms decision margin."
+  },
+  "rejected_prototypes_preserved_as_findings": [
+    "full CUDA Graph capture with host_callback sync",
+    "fused wait_uva_kernel",
+    "M2 kernel-counter synchronization",
+    "probe-only COTS ablations"
+  ]
+}

@@ -18,10 +18,9 @@ Covers:
     not matter, so we can assert bit-exact equality against a
     reference implementation.
 
-These tests deliberately do NOT run the long performance microbench
-(`test_stage7_layout_microbench.py`, marked `stage7_perf`). They
-cover correctness only; pytest by default skips `stage7_perf`-marked
-tests via `addopts = -m "not stage7_perf"` in `pytest.ini`.
+These tests deliberately cover correctness only. The old Stage 7
+performance microbench was a bring-up probe and is no longer part of
+the retained Phase 1c test suite.
 """
 
 from __future__ import annotations

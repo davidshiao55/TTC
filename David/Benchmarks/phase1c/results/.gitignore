@@ -1,6 +1,4 @@
-# §1c.24: nsys traces are 80MB+ each and regenerable from the bench
-# command lines documented in phase1c_findings.md §1c.24. SQLite files
-# are regenerable from .nsys-rep via `nsys export -t sqlite`. Keep
-# only .log (wall-clock + counter dumps) and .json (bench output).
-*.nsys-rep
-*.sqlite
+# Raw Phase 1c benchmark outputs are regenerable and should stay out of git.
+*
+!.gitignore
+!phase1c_final_summary.json
