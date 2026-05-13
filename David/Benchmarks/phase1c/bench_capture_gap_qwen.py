@@ -135,6 +135,12 @@ def arms(*, f_cpu_store: float, cpu_threads: int) -> dict[str, list[str]]:
         "piecewise_cots_split_wait_kernel_real": legacy_cots_base
         + ["--cots-capture-sync-mode", "wait_kernel"]
         + piecewise_cots_split_graph,
+        "piecewise_cots_split_wait_uva_dryrun": legacy_cots_base
+        + ["--cots-dry-run", "--cots-capture-sync-mode", "wait_uva_kernel"]
+        + piecewise_cots_split_graph,
+        "piecewise_cots_split_wait_uva_real": legacy_cots_base
+        + ["--cots-capture-sync-mode", "wait_uva_kernel"]
+        + piecewise_cots_split_graph,
         "piecewise_cots_split_inductor_host_callback_dryrun": legacy_cots_base
         + ["--cots-dry-run"]
         + piecewise_cots_split_inductor_graph,
@@ -316,6 +322,7 @@ def main() -> int:
             "piecewise_wait_kernel_real",
             "piecewise_cots_split_host_callback_real",
             "piecewise_cots_split_wait_kernel_real",
+            "piecewise_cots_split_wait_uva_real",
         ):
             cand = rows.get(candidate, {}).get("mean")
             if isinstance(cand, float):

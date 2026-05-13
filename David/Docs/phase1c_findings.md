@@ -5157,6 +5157,74 @@ Smoke validation:
   `2.6367` s.
 - Explicit `piecewise_cots_split_wait_kernel_real`: `2.4195` s.
 
+### Split-path fused wait+UVA follow-up
+
+After making split `wait_kernel` the default candidate, we tested whether
+the previously rejected fused `wait_uva_kernel` mechanism helps on the
+new split path. The hypothesis was different from the full-capture
+attempt: once COTS sync/UVA are outside captured graph nodes, fusing the
+GPU wait and pinned-output copy into one CUDA kernel might remove one
+launch per COTS boundary without changing decoding or outputs.
+
+Harness changes:
+
+- Added `piecewise_cots_split_wait_uva_dryrun` and
+  `piecewise_cots_split_wait_uva_real` to
+  `/TTC/David/Benchmarks/phase1c/bench_capture_gap_qwen.py`.
+- Added `piecewise_cots_split_wait_uva_real` to the parity harness
+  `/TTC/David/Benchmarks/phase1c/check_capture_piecewise_parity_qwen.py`.
+
+Parity artifact:
+
+- `/TTC/results/phase1c_capture_gap/split_wait_uva_parity_20260513/summary.json`
+
+Greedy output parity remained exact against `native_eager_real`:
+
+- `piecewise_cots_split_wait_kernel_real`: token parity `true`, text
+  parity `true`
+- `piecewise_cots_split_wait_uva_real`: token parity `true`, text parity
+  `true`
+
+Focused timing artifact:
+
+- `/TTC/results/phase1c_capture_gap/split_wait_uva_ab_20260513/summary.json`
+
+Same focused workload as above, 2 warmups, 5 measured iterations,
+2 repeats:
+
+| Arm | Repeat 0 (s) | Repeat 1 (s) | Mean (s) | Delta vs eager |
+|---|---:|---:|---:|---:|
+| `native_eager_real` | 2.5346 | 2.5408 | 2.5377 | baseline |
+| `piecewise_cots_split_wait_kernel_real` | 2.4437 | 2.4414 | 2.4426 | -95.1 ms |
+| `piecewise_cots_split_wait_uva_real` | 2.4520 | 2.4321 | 2.4420 | -95.7 ms |
+
+The fused arm was only `0.6 ms/generate` faster on the mean and changed
+sign between repeats (`+8.2 ms` slower on repeat 0, `-9.4 ms` faster on
+repeat 1). This is noise, not a decision-quality win.
+
+Counters artifact:
+
+- `/TTC/results/phase1c_capture_gap/split_wait_uva_counters_20260513/summary.json`
+
+Replay-only counter shape was identical for both split arms:
+
+- `dispatch_cb_count = 7224`
+- `submit_count_qkv = 3612`
+- `submit_count_mlp = 3612`
+- `d2h_replay_bucket_bytes = 156950528`
+- `uva_record_count = 7224`
+- `uva_replay_bucket_bytes = 84080640`
+- `worker_busy_total_ns`: `2341990228` for wait-kernel vs
+  `2341969128` for wait+UVA
+
+The fused path records the same UVA byte volume from C++ instead of the
+separate Python/Triton copy path, but the end-to-end latency does not
+move meaningfully. Decision: do **not** change the default from
+`wait_kernel` to `wait_uva_kernel`. Keep `wait_uva_kernel` as an
+experimental arm for future diagnostics; stop optimizing this particular
+mechanism for Phase 1c unless a later workload shows a larger launch-bound
+component.
+
 ---
 
 ## Conclusion
