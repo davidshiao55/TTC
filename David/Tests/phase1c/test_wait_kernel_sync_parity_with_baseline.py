@@ -32,6 +32,7 @@ from vllm.config import (
     VllmConfig,
     set_current_vllm_config,
 )
+from vllm.forward_context import BatchDescriptor
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -39,6 +40,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.offloader import CotsOffloader, set_offloader
+from vllm.model_executor.offloader.base import ForwardDispatchInfo
 
 pytestmark = pytest.mark.needs_cuda
 
@@ -178,11 +180,27 @@ def _build_mlp(*, f_cpu_store: float, m3: bool) -> tuple[_MlpLayer, CotsOffloade
     return layer, offloader
 
 
+def _publish_dispatch(offloader: CotsOffloader, num_tokens: int) -> None:
+    """Publish the same OOG dispatch state the real GPUModelRunner sends.
+
+    Native COTS custom ops intentionally reject implicit tensor-shape
+    bucket inference. These unit tests drive layers directly, so they
+    must provide the dispatch boundary explicitly before eager, capture,
+    and replay forwards.
+    """
+    offloader.on_dispatch(
+        ForwardDispatchInfo(
+            batch_descriptor=BatchDescriptor(num_tokens=int(num_tokens), uniform=True),
+            num_tokens_unpadded=int(num_tokens),
+        )
+    )
+
+
 def _capture_replay(*, offloader: CotsOffloader, forward, x: torch.Tensor):
     """Run forward eagerly (warmup), then capture a graph + replay 5×.
     Returns the eager output AND a list of replay outputs (clones)."""
-    offloader.prepare_before_forward(int(x.shape[0]))
-    offloader.sync_prev_onload()
+    num_tokens = int(x.shape[0])
+    _publish_dispatch(offloader, num_tokens)
     out_eager = forward(x)
     if isinstance(out_eager, tuple):
         out_eager = out_eager[0]
@@ -190,11 +208,11 @@ def _capture_replay(*, offloader: CotsOffloader, forward, x: torch.Tensor):
     torch.cuda.current_stream().synchronize()
 
     g = torch.cuda.CUDAGraph()
+    _publish_dispatch(offloader, num_tokens)
     _ = forward(x)  # pre-capture warmup
     torch.cuda.current_stream().synchronize()
 
-    offloader.prepare_before_forward(int(x.shape[0]))
-    offloader.sync_prev_onload()
+    _publish_dispatch(offloader, num_tokens)
     with torch.cuda.graph(g):
         out_captured = forward(x)
         if isinstance(out_captured, tuple):
@@ -203,6 +221,7 @@ def _capture_replay(*, offloader: CotsOffloader, forward, x: torch.Tensor):
 
     replays = []
     for _ in range(5):
+        _publish_dispatch(offloader, num_tokens)
         g.replay()
         torch.cuda.current_stream().synchronize()
         replays.append(out_captured.clone())

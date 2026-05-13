@@ -137,6 +137,103 @@ def test_m3_wait_repeated_replay(infer):
     assert infer.wait_kernel_get_done_slot(0) == 100
 
 
+def test_wait_uva_kernel_copies_bf16_output() -> None:
+    """Experimental wait_uva_kernel path waits, then copies pinned BF16 output
+    into the GPU destination in one captured-node-shaped launcher."""
+    pytest.importorskip("vllm._cots_C")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm._cots_C import CotsCpuInfer
+
+    rows, cols = 4, 17
+    x_pinned = torch.empty(rows, cols, dtype=torch.bfloat16, pin_memory=True)
+    y_pinned = torch.empty(rows, cols, dtype=torch.bfloat16, pin_memory=True)
+    y_pinned.copy_(
+        torch.arange(rows * cols, dtype=torch.float32).view(rows, cols).to(
+            torch.bfloat16
+        )
+    )
+    y_gpu = torch.empty(rows, cols, dtype=torch.bfloat16, device="cuda")
+
+    inst = CotsCpuInfer()
+    inst.install(n_slabs=1, max_num_tokens=rows)
+    inst.populate_slab_dryrun(
+        0,
+        rows,
+        x_pinned.data_ptr(),
+        cols,
+        y_pinned.data_ptr(),
+        cols,
+    )
+    inst.install_wait_kernel_sync_for_task(0, fuse_uva_copy=True)
+    inst.wait_kernel_set_req_slot(0, 1)
+    inst.wait_kernel_set_done_slot(0, 1)
+
+    fused = inst.sync_or_wait_and_maybe_uva_on_stream(
+        0,
+        y_gpu.data_ptr(),
+        rows,
+        cols,
+        torch.cuda.current_stream().cuda_stream,
+    )
+    assert fused is True
+    torch.cuda.current_stream().synchronize()
+    torch.testing.assert_close(y_gpu.cpu(), y_pinned, rtol=0, atol=0)
+
+
+def test_wait_uva_kernel_captured_graph_replay() -> None:
+    """The fused wait+UVA kernel is CUDA-graph replay safe."""
+    pytest.importorskip("vllm._cots_C")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm._cots_C import CotsCpuInfer
+
+    rows, cols = 3, 11
+    x_pinned = torch.empty(rows, cols, dtype=torch.bfloat16, pin_memory=True)
+    y_pinned = torch.empty(rows, cols, dtype=torch.bfloat16, pin_memory=True)
+    y_gpu = torch.empty(rows, cols, dtype=torch.bfloat16, device="cuda")
+    y_pinned.copy_(
+        torch.arange(rows * cols, dtype=torch.float32).view(rows, cols).to(
+            torch.bfloat16
+        )
+    )
+
+    inst = CotsCpuInfer()
+    inst.install(n_slabs=1, max_num_tokens=rows)
+    inst.populate_slab_dryrun(
+        0,
+        rows,
+        x_pinned.data_ptr(),
+        cols,
+        y_pinned.data_ptr(),
+        cols,
+    )
+    inst.install_wait_kernel_sync_for_task(0, fuse_uva_copy=True)
+    inst.wait_kernel_set_req_slot(0, 0)
+    inst.wait_kernel_set_done_slot(0, 0)
+
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        with torch.cuda.graph(graph, stream=stream):
+            fused = inst.sync_or_wait_and_maybe_uva_on_stream(
+                0,
+                y_gpu.data_ptr(),
+                rows,
+                cols,
+                stream.cuda_stream,
+            )
+            assert fused is True
+
+    for i in range(1, 101):
+        y_gpu.zero_()
+        inst.wait_kernel_set_req_slot(0, i)
+        inst.wait_kernel_set_done_slot(0, i)
+        graph.replay()
+        torch.cuda.current_stream().synchronize()
+        torch.testing.assert_close(y_gpu.cpu(), y_pinned, rtol=0, atol=0)
+
+
 def test_m3_get_without_install_raises(infer):
     """m3_get_*_slot before install raises (catches mismatched
     install/use ordering bugs)."""

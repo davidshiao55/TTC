@@ -28,19 +28,16 @@ The substrate ships with three end-to-end-verified gates:
    (Stage 5).
 
 The §1.14 absolute orch-collapse target (`orch ≤ 0.05 s/generate` on
-Qwen2.5-7B + FastTTS) is **NOT yet met**. The synthetic
-multi-layer collapse-shape sanity check passes (`collapse_ratio =
-0.477`, Stage 5), and after the §1c.18 / §1c.19 / §1c.20 chain of
-fixes the real-model harness `bench_dryrun_vs_native_qwen.py`
-runs the `cots_005_native_capture_dryrun` and
-`cots_005_native_capture_real` arms end-to-end. The settled
-multi-iter numbers (B=1, t=16, f=0.05; see §1c.20 for the full
-table) reveal that **capture mode is currently WORSE than
-native+eager** — orch +0.497 s vs +0.316 s — and
-`native_capture_real` is wildly slow at 119 s/generate. The
-architectural blockers are closed; the perf shortfall is now a
-diagnostic problem tracked as §1c.21 (perf investigation). Status:
-**runs end-to-end, perf needs nsys diagnosis**.
+Qwen2.5-7B + FastTTS) was not met by the first full-capture native
+path. The synthetic multi-layer collapse-shape sanity check passed
+(`collapse_ratio = 0.477`, Stage 5), but §1c.20-§1c.35 showed that
+capturing COTS submit/sync host work inside full CUDA graphs creates
+driver-side replay backpressure. §1c.36 supersedes the early
+"capture loses to eager" status: a COTS-aware piecewise split keeps
+the COTS CPU boundary outside captured graph nodes, preserves greedy
+output parity, and beats native eager on the focused Qwen2.5-7B grid.
+Native eager and legacy full capture remain regression baselines and
+explicit opt-out paths.
 
 Hardware: NVIDIA RTX 4090 (24 GB), Intel i9-14900KF (AVX2, no
 AVX512/AMX), DDR5. PyTorch 2.10.0+cu128, MKL enabled, oneDNN BF16,
@@ -384,6 +381,19 @@ COTS extension (oneDNN owns the worker's intra-op threading).
   per-bucket Python-side routing geometry is non-uniform,
   because that geometry is still compile-visible. See §1c.35
   below.
+- §1c.36 — **CLOSED / DEFAULT UPDATED**: capture-gap investigation
+  after §1c.35. Fresh timing confirmed legacy full capture still
+  loses to native eager on the focused Qwen2.5-7B workload, and
+  fused wait+UVA does not close the gap. The winning structure is
+  COTS-aware piecewise graph splitting: split at
+  `vllm::cots_submit_gemm` and `vllm::cots_sync_then_uva`, keep
+  COTS submit/wait/UVA outside captured graph nodes, and use
+  `wait_kernel` sync. The path preserves greedy output parity,
+  works with normal compile cache via partial in-memory fallback,
+  beats native eager across the tested Qwen2.5-7B grid, and is now
+  the default COTS graph policy behind
+  `CotsOffloadConfig.auto_graph_split=True`. Legacy full capture is
+  still reachable with `--no-cots-auto-graph-split`. See §1c.36.
 
 ---
 
@@ -4799,6 +4809,356 @@ git diff --check / git -C vllm diff --check            PASS
 
 ---
 
+## 1c.36: Capture-gap investigation and fast split default
+
+Date: 2026-05-13.
+
+This section merges the fresh capture-gap investigation that was
+temporarily tracked in `phase1c_capture_gap_findings.md`. The objective
+was stricter than the earlier "make capture less bad" gate: COTS graph
+mode must beat `native_eager_real` on the focused Qwen2.5-7B workload
+without changing decoding behavior, sampling, output parity, placement
+fractions, or CPU/GPU math.
+
+### Focus workload and artifacts
+
+The focused workload was:
+
+- Model: `Qwen/Qwen2.5-7B-Instruct`
+- Dtype: BF16
+- Input/output: `input_len=8`, `output_len=128`
+- Batch: `1`
+- COTS: `f_cpu_store=0.05`, `cpu_num_threads=16`
+- Timing command directory: `/TTC/FastTTS-thesis`
+- Timing env: no COTS diagnostic env vars unless explicitly noted
+
+Primary artifacts:
+
+- Production timing:
+  `/TTC/results/phase1c_capture_gap/20260513T0735Z/summary.json`
+- Counters-only run:
+  `/TTC/results/phase1c_capture_gap/20260513T0735Z_counters/`
+- Nsight traces and stats:
+  `/TTC/results/phase1c_capture_gap/20260513T0735Z_nsys/`
+- Focused harness:
+  `/TTC/David/Benchmarks/phase1c/bench_capture_gap_qwen.py`
+- Grid harness:
+  `/TTC/David/Benchmarks/phase1c/bench_capture_gap_qwen_grid.py`
+- Parity harness:
+  `/TTC/David/Benchmarks/phase1c/check_capture_piecewise_parity_qwen.py`
+
+### Fresh full-capture timing
+
+Initial fresh timing used 2 warmups, 5 measured iterations, and 2
+repeats:
+
+| Arm | Mean seconds / generate |
+|---|---:|
+| `none_capture` | 2.0322 |
+| `native_eager_dryrun` | 2.3353 |
+| `native_eager_real` | 2.5327 |
+| `capture_host_callback_dryrun` | 2.5090 |
+| `capture_host_callback_real` | 2.7197 |
+| `capture_wait_kernel_dryrun` | 2.3821 |
+| `capture_wait_kernel_real` | 2.6325 |
+| `capture_wait_uva_dryrun` | 2.3978 |
+| `capture_wait_uva_real` | 2.6603 |
+
+Decision deltas versus `native_eager_real`:
+
+- `capture_wait_kernel_real`: `+99.8 ms/generate`
+- `capture_wait_uva_real`: `+127.7 ms/generate`
+
+Legacy full capture therefore failed the production gate. The wait-kernel
+path was still faster than host-callback full capture, but it did not
+beat native eager. The experimental fused `wait_uva_kernel` path also
+failed the optimization gate.
+
+Counters after CUDA Graph capture showed the fused wait+UVA prototype did
+not remove the dominant bottleneck:
+
+- `submit_count_qkv = 28`
+- `submit_count_mlp = 28`
+- `uva_record_count = 56`
+- `d2h_replay_bucket_bytes = 156950528`
+- `uva_replay_bucket_bytes = 84080640`
+- worker busy time:
+  - `wait_kernel`: `2.3377 s`
+  - `wait_uva_kernel`: `2.3551 s`
+
+Nsight showed the capture trace dominated by wait-kernel and graph /
+synchronization behavior, not a small standalone UVA-copy node. The
+conclusion was to stop patching around the UVA copy and instead change
+the graph structure.
+
+### COTS-aware piecewise split
+
+The structural fix was to split at the two COTS custom ops:
+
+- `vllm::cots_submit_gemm`
+- `vllm::cots_sync_then_uva`
+
+This keeps COTS submit/sync/UVA orchestration outside captured CUDA graph
+nodes while still allowing the surrounding GPU-only pieces to use
+piecewise CUDA graphs. It is not an algorithm-level change: scheduler
+behavior, sampling, offload fractions, and CPU/GPU math are unchanged.
+
+Artifacts:
+
+- Timing:
+  `/TTC/results/phase1c_capture_gap/cots_split_grid_nocache_20260513T0938Z/summary.json`
+- Parity:
+  `/TTC/results/phase1c_capture_gap/cots_split_parity_20260513T0950Z/summary.json`
+- Counters:
+  `/TTC/results/phase1c_capture_gap/cots_split_counters_20260513T0955Z/`
+- Nsight:
+  `/TTC/results/phase1c_capture_gap/cots_split_nsys_20260513T0958Z/`
+
+At this point `VLLM_DISABLE_COMPILE_CACHE=1` was required because the
+custom split triggered a Torch AOT cache pickle failure during startup.
+That affected initialization/caching, not measured replay latency.
+
+Focused timing:
+
+| Arm | Mean seconds / generate | Delta vs `native_eager_real` |
+|---|---:|---:|
+| `native_eager_real` | 2.5441 | baseline |
+| `capture_wait_kernel_real` | 2.6233 | +79.2 ms |
+| `piecewise_cots_split_host_callback_real` | 2.5230 | -21.1 ms |
+| `piecewise_cots_split_wait_kernel_real` | 2.4337 | -110.4 ms |
+
+The winning arm passed the optimization gate: both repeats beat native
+eager by more than 50 ms/generate (`2.4348`, `2.4327` seconds).
+
+Greedy generation parity against `native_eager_real` was exact:
+
+- `piecewise_cots_split_host_callback_real`: token parity `true`, text
+  parity `true`
+- `piecewise_cots_split_wait_kernel_real`: token parity `true`, text
+  parity `true`
+
+Replay-only counters for one measured generation of
+`piecewise_cots_split_wait_kernel_real` after post-capture reset:
+
+- `worker_run_count = 7224`
+- `dispatch_cb_count = 7224`
+- `submit_count_qkv = 3612`
+- `submit_count_mlp = 3612`
+- `uva_record_count = 7224`
+- `d2h_replay_bucket_bytes = 156950528`
+- `uva_replay_bucket_bytes = 84080640`
+- `worker_busy_total_ns = 2324669956`
+- `worker_queue_wait_total_ns = 18876190`
+
+Nsight tracing perturbed absolute latency, so production timing remained
+the gate. The trace still validated the mechanism:
+
+- `cudaGraphLaunch`: `18048` calls, `130.7 ms` total. The previous
+  full-capture wait-kernel trace had `156` calls but `2338 ms` total,
+  meaning graph launch was blocking behind graph-internal CPU waits.
+- `cots_wait_done_kernel`: `7168` launches, all with
+  `graphNodeId = NULL`.
+- `_uva_copy_kernel`: `7168` launches, all with `graphNodeId = NULL`.
+- The previous capture-only `triton_poi_fused_7` overhead did not
+  appear.
+- Total measured GPU kernel time was `2265.8 ms`; memcpy time was
+  `12.1 ms`.
+
+The overhead can be overcome, but not by fusing small wait/UVA nodes
+inside the full captured graph. The winning structure is to split COTS
+custom ops out of CUDA Graph capture and use wait-kernel sync there.
+
+### Inductor-partition probe
+
+A follow-up tested a cache-safe variant with the same COTS split ops but
+`use_inductor_graph_partition=true`.
+
+Artifacts:
+
+- Timing:
+  `/TTC/results/phase1c_capture_gap/cots_split_inductor_grid_20260513/summary.json`
+- Parity:
+  `/TTC/results/phase1c_capture_gap/cots_split_inductor_parity_20260513/summary.json`
+- One-iteration cache probe:
+  `/TTC/results/phase1c_capture_gap/cots_split_inductor_partition_probe_20260513.json`
+
+This variant fixed the compile-cache startup blocker: the first run saved
+normal vLLM/AOT compile artifacts, and later runs loaded the compiled
+graph and AOT function from cache. However, it did not preserve the
+performance win:
+
+| Arm | Mean seconds / generate | Delta vs `native_eager_real` |
+|---|---:|---:|
+| `native_eager_real` | 2.5324 | baseline |
+| `piecewise_cots_split_inductor_host_callback_real` | 2.6612 | +128.8 ms |
+| `piecewise_cots_split_inductor_wait_kernel_real` | 2.5769 | +44.5 ms |
+
+Greedy parity still matched `native_eager_real` exactly. The decision was
+to keep Inductor partition as a cache-regression diagnostic, not the
+performance default.
+
+### Fast split with normal compile cache
+
+The fast Dynamo FX-level COTS split no longer needs
+`VLLM_DISABLE_COMPILE_CACHE=1` for the focused workload.
+
+Fresh investigation showed the cache failure was not caused by the COTS
+custom ops themselves. The first failing subgraph was an embedding /
+RMSNorm block. After removing the compile-visible
+`RMSNorm.forward_native()` use of `self.weight.data`, the same PyTorch
+AOTAutograd serialization failure remained on the plain
+embedding/RMSNorm subgraph. The root issue is nested standalone subgraph
+serialization under vLLM's top-level AOT compile/cache path, not model
+math or decoding.
+
+Implemented behavior:
+
+- Add env-gated piecewise compile diagnostics under
+  `VLLM_COTS_COMPILE_CACHE_DEBUG=1`.
+- For the fast COTS piecewise split, skip top-level vLLM AOT precompile
+  because PyTorch cannot serialize all nested standalone subgraphs.
+- Keep normal `torch.compile`/Inductor execution and normal vLLM compile
+  cache enabled.
+- If an individual standalone subgraph is not serializable, use its
+  in-memory compiled callable for the current process and continue
+  caching the serializable subgraphs.
+
+Artifacts:
+
+- Host-callback cache probe:
+  `/TTC/results/phase1c_capture_gap/fast_split_cache_partial_fallback2_20260513/summary.json`
+- Wait-kernel cache probe:
+  `/TTC/results/phase1c_capture_gap/fast_split_wait_cache_probe_20260513/summary.json`
+- Focused timing:
+  `/TTC/results/phase1c_capture_gap/fast_split_cache_timing_20260513/summary.json`
+- Parity:
+  `/TTC/results/phase1c_capture_gap/fast_split_cache_parity_20260513/summary.json`
+
+Cache behavior observed for the wait-kernel probe:
+
+- vLLM cache directory:
+  `/root/.cache/vllm/torch_compile_cache/0fff06f0e8/rank_0_0/backbone`
+- Serializable subgraphs cached: `1`, `2`, `4`, and `140`.
+- The unsaveable subgraphs ran from in-memory compiled callables.
+
+Fresh timing, same focused workload, no diagnostic env vars, 2 warmups,
+5 measured iterations, 2 repeats:
+
+| Arm | Mean seconds / generate | Delta vs `native_eager_real` |
+|---|---:|---:|
+| `native_eager_real` | 2.5357 | baseline |
+| `piecewise_cots_split_wait_kernel_real` | 2.4573 | -78.4 ms |
+
+The fast split still passed the optimization gate with normal compile
+cache enabled: both repeats beat native eager by more than 50 ms/generate
+(`2.4548`, `2.4599` seconds vs `2.5359`, `2.5355` seconds). Greedy
+parity remained exact.
+
+Decision:
+
+- Use `piecewise_cots_split_wait_kernel_real` as the current default
+  candidate for the focused Phase 1c/Phase 2 performance path.
+- Keep `native_eager_real` as the safe fallback and regression baseline.
+- Keep the Inductor-partition split as a cache-regression diagnostic.
+- Treat the remaining limitation as warm-start/cache quality, not runtime
+  correctness: the cache is partial because many nested standalone
+  subgraphs are still runtime-only.
+
+### Workload grid versus full capture
+
+Before changing defaults, a broader grid compared:
+
+- `native_eager_real`
+- `capture_wait_kernel_real` (best full-capture comparator)
+- `piecewise_cots_split_wait_kernel_real` (fast COTS split)
+
+Grid settings:
+
+- Model: `Qwen/Qwen2.5-7B-Instruct`
+- Dtype: BF16
+- `f_cpu_store=0.05`
+- `cpu_num_threads=16`
+- `batch={1,4}`
+- `input_len={8,128,512}`
+- `output_len={32,128}`
+- 1 warmup, 3 measured iterations, 1 repeat
+
+Artifacts:
+
+- Grid summary:
+  `/TTC/results/phase1c_capture_gap/grid_fast_vs_full_20260513/grid_summary.json`
+- Per-cell summaries:
+  `/TTC/results/phase1c_capture_gap/grid_fast_vs_full_20260513/`
+
+| B | Input | Output | Eager (s) | Full capture (s) | Split (s) | Split vs eager | Split vs full |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 8 | 32 | 0.6348 | 0.6655 | 0.6137 | -21.1 ms | -51.8 ms |
+| 1 | 8 | 128 | 2.5475 | 2.6384 | 2.4399 | -107.7 ms | -198.5 ms |
+| 1 | 128 | 32 | 0.6684 | 0.6804 | 0.6282 | -40.2 ms | -52.2 ms |
+| 1 | 128 | 128 | 2.5607 | 2.6379 | 2.4626 | -98.1 ms | -175.3 ms |
+| 1 | 512 | 32 | 0.7106 | 0.7109 | 0.6931 | -17.5 ms | -17.8 ms |
+| 1 | 512 | 128 | 2.6315 | 2.6607 | 2.5081 | -123.4 ms | -152.6 ms |
+| 4 | 8 | 32 | 0.8122 | 0.8571 | 0.7517 | -60.5 ms | -105.3 ms |
+| 4 | 8 | 128 | 3.0753 | 3.2880 | 2.9384 | -136.9 ms | -349.5 ms |
+| 4 | 128 | 32 | 1.0872 | 1.1992 | 1.0474 | -39.8 ms | -151.8 ms |
+| 4 | 128 | 128 | 3.4514 | 3.5145 | 3.2368 | -214.6 ms | -277.7 ms |
+| 4 | 512 | 32 | 2.6507 | 1.9136 | 1.8661 | -784.7 ms | -47.6 ms |
+| 4 | 512 | 128 | 4.2436 | 4.0767 | 3.9770 | -266.6 ms | -99.8 ms |
+
+Observations:
+
+- Split won all 12/12 cells against eager.
+- Split won all 12/12 cells against full capture.
+- Split beat eager by at least 50 ms in 8/12 cells.
+- Split beat full capture by at least 50 ms in 10/12 cells.
+- Full capture beat eager only in the `batch=4,input_len=512` cells.
+  Split still beat full capture there, but the short-decode margin was
+  only 47.6 ms.
+- For short decode, especially `output_len=32`, split can be fastest but
+  below the 50 ms decision margin. For `output_len=128`, split is
+  decisively fastest across this grid.
+
+The grid supports making fast split the default COTS graph policy on the
+tested Qwen2.5-7B, BF16, `f_cpu_store=0.05` surface. It does not prove
+universal fastest behavior across other `f_cpu_store` values, models,
+14B, or future Phase 2 attention-offload settings.
+
+### Default change
+
+Implemented a config-level default, not a benchmark-only shortcut:
+
+- `CotsOffloadConfig.auto_graph_split=True` is now the default.
+- For native COTS with CUDA graphs (`enforce_eager=False`), unset
+  `splitting_ops`, and `f_cpu_store > 0`, vLLM now defaults to:
+  - `cudagraph_mode=PIECEWISE` when the configured mode includes full
+    graphs;
+  - COTS graph split points: `vllm::cots_submit_gemm` and
+    `vllm::cots_sync_then_uva`;
+  - `cots_capture_sync_mode=wait_kernel` when the field is left at its
+    legacy `host_callback` value.
+- `--no-cots-auto-graph-split` preserves the old behavior for
+  full-capture and host-callback A/B experiments.
+- The Phase 1c harness now has a `cots_default_real` arm for the new
+  default, while `capture_*` and explicit `piecewise_*` arms pass the
+  opt-out flag so old comparisons keep their original meaning.
+
+Smoke validation:
+
+- Artifact:
+  `/TTC/results/phase1c_capture_gap/default_patch_smoke_20260513/summary.json`
+- Settings: focused Qwen grid cell, `input_len=8`, `output_len=128`,
+  `batch=1`, `f_cpu_store=0.05`, `cpu_num_threads=16`, 1 warmup and
+  1 measured iteration.
+- `cots_default_real`: `2.4369` s. Its log confirms
+  `cudagraph_mode=PIECEWISE`, `cots_capture_sync_mode=wait_kernel`, and
+  COTS split ops in `splitting_ops` without passing explicit split/sync
+  flags.
+- `capture_wait_kernel_real` with `--no-cots-auto-graph-split`:
+  `2.6367` s.
+- Explicit `piecewise_cots_split_wait_kernel_real`: `2.4195` s.
+
+---
+
 ## Conclusion
 
 Phase 1c delivers the Phase-1a/1b → Phase 2 substrate transition as a
@@ -4831,10 +5191,18 @@ Python-thin / C++-substrate split:
    bench passes (ratio 0.477 ≤ 0.70). §1.14 absolute generate-
    equivalent locked separately on Qwen2.5-7B + FastTTS.
 
-5. **Default flipped to native** (Stage 5). The user-visible
-   behavior change carried by Phase 1c. Existing
-   `enforce_eager=True` workflows are unchanged; defaulted
-   workflows now use the production path with capture enabled.
+5. **Default runner flipped to native** (Stage 5). The user-visible
+   substrate change carried by Phase 1c. Existing
+   `enforce_eager=True` workflows are unchanged; COTS uses the
+   native runner by default.
+
+6. **Default graph policy flipped to fast split** (§1c.36). Native
+   COTS with CUDA graphs now defaults to piecewise CUDA graphs,
+   COTS submit/sync split points, and wait-kernel sync via
+   `CotsOffloadConfig.auto_graph_split=True`. Native eager and
+   legacy full capture remain explicit regression baselines; the old
+   full-capture behavior is reachable with
+   `--no-cots-auto-graph-split`.
 
 The architecture remains the three-layer split from Phase 1a (storage
 / execution / operators) plus Phase 1b's prefetch sibling. Phase 1c's
