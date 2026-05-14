@@ -116,7 +116,12 @@ def _make_vllm_config(custom_ops: str = "none"):
     return vc
 
 
-def _build_mlp(f_cpu_store, f_prefetch):
+def _build_mlp(
+    f_cpu_store,
+    f_prefetch,
+    *,
+    dry_run=False,
+):
     vc = _make_vllm_config()
     with set_current_vllm_config(vc):
         layer = _MlpLayer().cuda()
@@ -126,6 +131,7 @@ def _build_mlp(f_cpu_store, f_prefetch):
                 f_prefetch=f_prefetch,
                 kv_biased=True,
                 cpu_runner="python",
+                dry_run=dry_run,
             )
         )
         set_offloader(offloader)
@@ -143,7 +149,7 @@ def _build_mlp(f_cpu_store, f_prefetch):
     return layer, offloader, gate, up, down
 
 
-def _build_qkv(f_cpu_store, f_prefetch):
+def _build_qkv(f_cpu_store, f_prefetch, *, dry_run=False):
     vc = _make_vllm_config()
     with set_current_vllm_config(vc):
         layer = _QkvLayer().cuda()
@@ -153,6 +159,7 @@ def _build_qkv(f_cpu_store, f_prefetch):
                 f_prefetch=f_prefetch,
                 kv_biased=True,
                 cpu_runner="python",
+                dry_run=dry_run,
             )
         )
         set_offloader(offloader)
@@ -182,6 +189,32 @@ def _prime_prefetch(offloader):
             num_tokens_unpadded=MAX_NUM_TOKENS,
         )
     )
+
+
+def test_mlp_counts_snap_to_64_channel_grid():
+    """MLP store/prefetch counts use the profiled 64-channel snap grid.
+
+    For this test model, raw f_cpu_store=0.20 requests ~205 channels and
+    raw f_prefetch=0.10 requests ~102 channels. They should snap to 192 and
+    128, respectively, for both the gate/up half and matched down input.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    _, offloader, _, _, _ = _build_mlp(f_cpu_store=0.20, f_prefetch=0.10)
+    bucket = offloader._capture_buckets[0]
+    handles = {h.kind: h for h in offloader._handles}
+
+    col = handles["col"]
+    row = handles["row"]
+    assert col.n_cpu_per_half == 192
+    assert col.n_cpu == 384
+    assert col.n_prefetch_by_bucket[bucket] == 256
+    assert col.n_cpu_compute_by_bucket[bucket] == 128
+
+    assert row.n_cpu == 192
+    assert row.n_prefetch_by_bucket[bucket] == 128
+    assert row.n_cpu_compute_by_bucket[bucket] == 64
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +402,40 @@ def test_pure_prefetch_mlp_forward_parity():
     ref = F.linear(silu_full, down, None)
     atol = MLP_BLOCK_RTOL * float(ref.abs().max())
     torch.testing.assert_close(out, ref, rtol=BF16_RTOL, atol=atol)
+
+
+def test_dry_run_pure_prefetch_mlp_skips_prefetched_compute():
+    """Public COTS dry-run preserves control flow but omits active offloaded
+    work. In pure-prefetch mode, the MLP output should therefore equal only the
+    GPU-resident permanent block, not the full unsplit reference."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    layer, offloader, gate, up, down = _build_mlp(
+        f_cpu_store=0.20, f_prefetch=0.20, dry_run=True
+    )
+    assert offloader.dry_run is True
+    bucket = offloader._capture_buckets[0]
+    for h in offloader._handles:
+        assert h.n_cpu_compute_by_bucket[bucket] == 0
+
+    if offloader._streamer is not None:
+        _prime_prefetch(offloader)
+
+    x = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    out = layer.mlp(x)
+
+    gpu_mlp1 = F.linear(x, layer.mlp.gate_up_proj.weight, None)
+    gpu_silu = layer.mlp.act_fn(gpu_mlp1)
+    perm_ref = F.linear(gpu_silu, layer.mlp.down_proj.weight, None)
+    full_gate_up = F.linear(x, torch.cat([gate, up], dim=0), None)
+    full_silu = F.silu(full_gate_up[:, :INTERMEDIATE]) * full_gate_up[:, INTERMEDIATE:]
+    full_ref = F.linear(full_silu, down, None)
+
+    atol = MLP_BLOCK_RTOL * float(perm_ref.abs().max())
+    torch.testing.assert_close(out, perm_ref, rtol=BF16_RTOL, atol=atol)
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(out, full_ref, rtol=BF16_RTOL, atol=atol)
 
 
 # ---------------------------------------------------------------------------
