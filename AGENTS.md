@@ -170,6 +170,8 @@ Detailed analysis lives in `David/Docs/`:
 | `attention_offload_design.md` | Two-pool KV, CPU suffix attention, batch size tradeoff |
 | `pcie_bandwidth_allocation_design.md` | Why all PCIe goes to weight prefetch |
 | `phase0_findings.md` | First-iteration Profiler output on RTX 4090 + Qwen2.5-7B |
-| `phase1a_findings.md` | Phase 1a (static col/row split) implementation + measurements |
-| `phase1b_findings.md` | Phase 1b (layer-ahead prefetch + three-way dispatch) implementation + measurements |
-| `phase1c_findings.md` | Phase 1c (native CPU runner + CUDA Graph capture) implementation + measurements |
+| `phase1_findings.md` | Phase 1 source of truth: final production COTS path + current results |
+| `phase1a_findings.md` | Appendix: static split prototype facts that survived |
+| `phase1b_findings.md` | Appendix: three-way dispatch and layer-ahead prefetch decisions |
+| `phase1c_findings.md` | Appendix: native CPU runner and graph-compatible runtime |
+| `phase1_analysis_findings.md` | Appendix: free-regime and KV-throughput result tables |

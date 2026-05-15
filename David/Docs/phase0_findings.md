@@ -2,6 +2,12 @@
 
 This document records findings from Phase 0 pre-implementation benchmarking — the **first iteration of the Profiler's output** (see `profiler_design.md`). It establishes baseline numbers for RTX 4090 + Qwen2.5-7B + BF16 and validates the measurement methodology future profile runs will reuse.
 
+Reader note after Phase 1 cleanup: this file remains a Phase 0 profiler record.
+It still contains historical references to the Phase 1a/1b/1c milestone docs
+because those references explain how specific measurements motivated later
+implementation work. For the final production COTS path and current Phase 1
+numbers, use `phase1_findings.md`.
+
 Hardware: NVIDIA RTX 4090 (24 GB), Intel i9-14900KF (AVX2, no AVX512/AMX), DDR5.
 PyTorch 2.10.0+cu128, MKL enabled, oneDNN enabled.
 
