@@ -75,7 +75,6 @@ def _force_mlp_worker_error():
         w_down_ptr=w_down.data_ptr(),
         w_down_rows=out_dim,
         w_down_cols=inter_per_half,
-        intermediate_per_half=inter_per_half,
     )
     keepalive = (x_pin, y_pin, w_gate, w_up, w_down)
     return ci, keepalive

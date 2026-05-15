@@ -66,7 +66,6 @@ def _force_mlp_worker_error():
         w_down_ptr=w_down.data_ptr(),
         w_down_rows=out_dim,
         w_down_cols=inter_per_half,
-        intermediate_per_half=inter_per_half,
     )
     return ci, (x_pin, y_pin, w_gate, w_up, w_down)
 
@@ -191,7 +190,6 @@ def test_sync_or_wait_launches_kernel_when_has_error_already_set():
         w_down_ptr=w_down.data_ptr(),
         w_down_rows=out_dim,
         w_down_cols=inter_per_half,
-        intermediate_per_half=inter_per_half,
     )
     # Dryrun slab needs valid pinned pointers even though the
     # worker never reads them — the slab struct fields must be

@@ -35,7 +35,7 @@ pytestmark = pytest.mark.needs_cuda
 
 HIDDEN = 256
 DN_N_PREF = 64       # offset into n_cpu_total — the load-bearing case
-DN_N_CPU = 128       # = w_down_rows = intermediate_per_half (matched)
+DN_N_CPU = 128       # = w_down_rows
 N_CPU_TOTAL_DN = DN_N_PREF + DN_N_CPU  # 192
 INTERMEDIATE_PER_HALF = DN_N_CPU       # = w_gate_rows = w_up_rows
 NUM_TOKENS = 16
@@ -48,26 +48,42 @@ def _alloc_pinned(*shape: int, dtype: torch.dtype = torch.bfloat16) -> torch.Ten
     return torch.empty(*shape, dtype=dtype, pin_memory=True)
 
 
-def _ref_natural_at_linear(
+def _ref_production_mlp_block(
     x: torch.Tensor, w_gate: torch.Tensor, w_up: torch.Tensor,
-    w_down_nat: torch.Tensor,
+    w_down_transposed: torch.Tensor,
 ) -> torch.Tensor:
-    """Python reference computing y = down(silu(gate(x)) * up(x)) using
-    PyTorch-natural F.linear semantics. `w_down_nat` is the (out_dim,
-    dn_n_cpu) natural-layout view (i.e., the OLD storage layout) — we
-    use this as the ground-truth reference."""
+    """Reference the production MLP CPU semantics from exposed GEMM helpers.
+
+    The native worker rounds gate/up to BF16, computes SwiGLU into BF16
+    scratch, then feeds the transposed down GEMM. Using the same GEMM helpers
+    keeps this test focused on slab layout and post-narrow pointers rather
+    than PyTorch/oneDNN's slightly different BF16 accumulation choices.
+    """
     import torch.nn.functional as F
-    gate_out = F.linear(x, w_gate)
-    up_out = F.linear(x, w_up)
-    z = F.silu(gate_out) * up_out
-    return F.linear(z, w_down_nat)
+
+    infer = CotsCpuInfer()
+    gate_out = torch.empty(
+        x.shape[0], w_gate.shape[0], dtype=torch.bfloat16, pin_memory=True
+    )
+    up_out = torch.empty_like(gate_out)
+    infer.run_bf16_gemm_natural_inline(x, w_gate, gate_out)
+    infer.run_bf16_gemm_natural_inline(x, w_up, up_out)
+    z = (F.silu(gate_out.float()) * up_out.float()).to(torch.bfloat16)
+    y = torch.empty(
+        x.shape[0],
+        w_down_transposed.shape[1],
+        dtype=torch.bfloat16,
+        pin_memory=True,
+    )
+    infer.run_bf16_gemm_transposed_inline(z, w_down_transposed, y)
+    return y
 
 
 def test_native_runner_contig_down_proj_matches_python():
     """End-to-end parity: populate an MLP slab with the post-Stage-7-C
     transposed-storage down-proj layout, drive the slab through the
-    host-callback path, and confirm output matches Python F.linear on
-    the equivalent natural-layout view."""
+    host-callback path, and confirm output matches the production BF16
+    scratch reference."""
     torch.manual_seed(0)
 
     gate_full = torch.randn(
@@ -91,10 +107,6 @@ def test_native_runner_contig_down_proj_matches_python():
         "contiguous (no strided fallback path)"
     )
     assert dn_w_view.shape == (DN_N_CPU, HIDDEN)
-
-    # Natural-layout view of the same data, for the Python reference.
-    # `dn_w_view.t()` is (HIDDEN, DN_N_CPU) — what F.linear expects.
-    dn_w_natural_ref = dn_w_view.t().contiguous()
 
     x_for_mlp = torch.randn(
         NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, pin_memory=True
@@ -124,7 +136,6 @@ def test_native_runner_contig_down_proj_matches_python():
         w_down_ptr=dn_w_view.data_ptr(),  # POST-narrow
         w_down_rows=DN_N_CPU,
         w_down_cols=HIDDEN,
-        intermediate_per_half=INTERMEDIATE_PER_HALF,
     )
 
     stream = torch.cuda.current_stream().cuda_stream
@@ -136,7 +147,7 @@ def test_native_runner_contig_down_proj_matches_python():
     torch.cuda.current_stream().synchronize()
     assert not ci.has_error()
 
-    y_ref = _ref_natural_at_linear(x_for_mlp, gate_full, up_full, dn_w_natural_ref)
+    y_ref = _ref_production_mlp_block(x_for_mlp, gate_full, up_full, dn_w_view)
 
     torch.testing.assert_close(y_pinned, y_ref, rtol=BF16_RTOL, atol=BF16_ATOL)
 
@@ -176,7 +187,6 @@ def test_native_runner_contig_down_proj_offset_pointer_is_load_bearing():
         w_up_rows=INTERMEDIATE_PER_HALF,
         w_down_rows=DN_N_CPU,
         w_down_cols=HIDDEN,
-        intermediate_per_half=INTERMEDIATE_PER_HALF,
         n_threads=1,
     )
 

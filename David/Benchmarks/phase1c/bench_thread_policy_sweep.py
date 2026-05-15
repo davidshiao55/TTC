@@ -43,9 +43,7 @@ def _bench_one(
     """Time `n_iters` slab dispatches at the given (batch, n_threads)
     cell. Returns wall-clock stats per cycle in microseconds."""
     ci = CotsCpuInfer()
-    ci.install(
-        n_slabs=1, scratch_max_tokens=batch, scratch_max_intermediate_per_half=0
-    )
+    ci.install(n_slabs=1, max_num_tokens=batch)
     x_pinned = torch.empty(batch, k, dtype=torch.bfloat16, pin_memory=True)
     y_pinned = torch.empty(batch, n, dtype=torch.bfloat16, pin_memory=True)
     w_cpu = torch.randn(n, k, dtype=torch.bfloat16, pin_memory=True)

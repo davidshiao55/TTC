@@ -1,12 +1,13 @@
 # Phase 1 Analysis: Free Regime And KV-Throughput
 
-Date: 2026-05-14
+Date: 2026-05-15
 
 Status: free-regime sweep, COTS-vs-native prefetch comparison, COTS
-prefetch-gap decomposition, push-free-zone follow-up probes, and adjusted
-KV-throughput focused probe are complete on current Phase 1c code. The old
-full KV-throughput grid is no longer recommended because the free-regime sweep
-shows CPU-heavy variants are dominated and prefetch-only is not close to free.
+prefetch-gap decomposition, CPU-compute gap decomposition, push-free-zone
+follow-up probes, remaining CPU-gap attribution, and adjusted KV-throughput
+focused probe are complete on current Phase 1c code. The old full KV-throughput
+grid is no longer recommended because the free-regime sweep shows CPU-heavy
+variants are dominated and prefetch-only is not close to free.
 
 ## Purpose
 
@@ -19,9 +20,11 @@ COTS substrate:
    and is the gap from exposed H2D copies or from COTS overhead?
 3. **Free-zone expansion:** which knobs or implementation directions can move
    pure prefetch into the 5% latency band?
-4. **Free regime:** for each COTS variant, how much weight can be offloaded
+4. **CPU-compute gap:** how far does current CPU-only COTS get toward the old
+   Phase 0 mathematical overlap bound?
+5. **Free regime:** for each COTS variant, how much weight can be offloaded
    while staying within 5% of no-offload latency at the same workload?
-5. **KV-throughput crossover:** can the extra GPU KV-cache capacity unlocked by
+6. **KV-throughput crossover:** can the extra GPU KV-cache capacity unlocked by
    weight offload raise offline throughput above no-offload at
    `gpu_memory_utilization=0.75`?
 
@@ -45,6 +48,12 @@ cd /TTC/FastTTS-thesis
   /TTC/David/Benchmarks/phase1_analysis/bench_cots_prefetch_gap.py \
   --exp --keep-going --batch-sizes 64 --modes graph \
   --f-values 0.005 0.01 0.02 0.0357 --repeat 3
+
+/opt/conda/envs/thesis/bin/python \
+  /TTC/David/Benchmarks/phase1_analysis/bench_cots_cpu_gap.py \
+  --exp --batch-sizes 1 --modes graph \
+  --thread-counts 4 8 16 \
+  --f-values 0.0068 0.0135 0.02 0.0357 0.05
 
 /opt/conda/envs/thesis/bin/python \
   /TTC/David/Benchmarks/phase1_analysis/bench_cots_free_regime.py \
@@ -593,6 +602,22 @@ grid points differ by less than benchmark noise. For this setup, `64` MLP
 channels per half and one QKV KV-head pair are already small memory steps
 while avoiding observed kernel-shape cliffs.
 
+Follow-up QKV 64-snap diagnostic source:
+`/TTC/results/phase1_analysis/cpu_gap/20260515T_qkv_snap64_t4_probe/`.
+This temporarily allowed partial K/V chunks in total 64-row QKV steps while
+keeping the rest of the placement unchanged. It did not beat the head-aligned
+production rule. At requested `f=0.0135`, head-aligned QKV stayed at zero rows
+and measured `1.060x`, while QKV 64-snap added `64` QKV rows and measured
+`1.122x`. At requested `f=0.0200`, head-aligned measured `1.050x`, while
+QKV 64-snap again added `64` rows and measured `1.121x`. Near the first QKV
+edge, requested `f=0.0280` measured essentially the same (`1.116x`
+head-aligned with `256` QKV rows versus `1.115x` 64-snap with `128` QKV
+rows), so the finer row step does not recover a new free point. Requested
+`f=0.0270` hit a torch-inductor startup failure in this diagnostic hook, but
+`f=0.0280` covers the same snapped QKV row count. Conclusion: keep the
+head-aligned QKV rule in production and do not switch QKV to uniform 64-row
+snapping for the free-regime CPU path.
+
 Implementation note: COTS now snaps MLP gate/up half channels and matched down
 input channels to the nearest multiple of `64`, with halfway cases rounded up
 and no hard `128` minimum. A focused confirmation reran the formerly bad
@@ -650,6 +675,208 @@ The completed sweep supports the reduced-grid intuition:
 So future free-regime reruns can be much cheaper: run CPU-only and 50/50
 collaborative at low batch, and run prefetch-only at high batch, with only
 `none` baselines at the selected batch sizes.
+
+## CPU-Compute Gap To The Math Bound
+
+CPU-only was rerun after the snap64/prefetch cleanup because the old
+free-regime sweep used a coarser grid and predated several production-path
+changes. The diagnostic harness is:
+`/TTC/David/Benchmarks/phase1_analysis/bench_cots_cpu_gap.py`.
+
+The measurement compares no-offload against COTS CPU-only
+(`f_prefetch=0`) and COTS dry-run. For CPU-only, dry-run is not a pure control
+floor: it keeps the reduced GPU-resident split shape and skips CPU GEMM, so it
+is often faster than no-offload. That is useful because the free condition is
+exactly whether real CPU work fits inside the GPU work removed by the split.
+
+Default-thread grid source:
+`/TTC/results/phase1_analysis/cpu_gap/20260514T_b1_t16_grid/summary.md`.
+
+Thread-count follow-up used `B=1`, graph mode, `input_len=8`,
+`output_len=128`, `gpu_memory_utilization=0.75`. It covered
+`t={4,8,16}` first, then a focused `t=24` probe on the boundary and
+high-CPU cells.
+
+| requested f | actual target-byte f | qkv rows | MLP half channels | best t | best slowdown | verdict |
+|---:|---:|---:|---:|---:|---:|---|
+| 0.0068 | 0.0063 | 0 | 128 | 16 | 1.059 | lose |
+| 0.0135 | 0.0125 | 0 | 256 | 4 | 1.060 | lose |
+| 0.0200 | 0.0188 | 0 | 384 | 4 | 1.0501 | boundary |
+| 0.0236 | 0.0219 | 0 | 448 | 4 | 1.051 | boundary/lose |
+| 0.0270 | 0.0250 | 0 | 512 | 4 | 1.049 | free |
+| 0.0280 | 0.0292 | 256 | 512 | 4 | 1.116 | lose |
+| 0.0300 | 0.0323 | 256 | 576 | 4 | 1.122 | lose |
+| 0.0357 | 0.0385 | 256 | 704 | 8 | 1.121 | lose |
+| 0.0500 | 0.0510 | 256 | 960 | 24 | 1.152 | lose |
+
+Boundary repeat sources:
+
+- `/TTC/results/phase1_analysis/cpu_gap/20260514T_b1_t4_boundary_3rep/summary.md`
+- `/TTC/results/phase1_analysis/cpu_gap/20260514T_b1_t4_mlp_edge_2rep/summary.md`
+- `/TTC/results/phase1_analysis/cpu_gap/20260514T_b1_t4_qkv_edge_2rep/summary.md`
+- `/TTC/results/phase1_analysis/cpu_gap/20260515T_b1_t24_probe/summary.md`
+
+The current production path can push CPU-only to about `2.5%` of Phase-1
+target bytes within the 5% latency band, but only while the split is MLP-only.
+The first QKV snap (`256` rows = one K/V head pair) is the practical cliff:
+requested `f=0.027` has no QKV rows and measures `1.049x`, while requested
+`f=0.028` adds the first QKV pair and jumps to `1.116x`.
+
+The focused `t=24` probe does not change that boundary. It measured
+`1.053x` at requested `f=0.027` and `1.127x` at requested `f=0.028`, so
+`t=4` remains the best boundary setting. `t=24` is only useful at heavier CPU
+work: requested `f=0.05` improved from `1.181x` at `t=4` to `1.152x` at
+`t=24`, still well outside the free regime.
+
+Compared with the old Phase 0 isolated-overlap math (`B=1` free at uniform
+`f_cpu≈5%`), current end-to-end COTS reaches roughly half of the byte fraction
+before crossing the 5% wall. The missing half is not primarily dry control
+overhead; dry-run is faster than no-offload at larger fractions because the
+GPU residual path is smaller. The exposed active CPU path is the limiter,
+especially for WQKV where the available GPU overlap window is only about
+`38 us` per layer in the Phase 0 table. Thread tuning helps at the MLP-only
+edge (`t=4` is best), but it does not make the first QKV pair free.
+
+Interpretation: CPU-only free regime is real but narrow. The useful planner
+rule for current code is:
+
+- For CPU-compute-only at `B=1`, allow MLP-only CPU compute up to about
+  `512` MLP half channels (`actual_f≈0.025`) when a 5% latency tax is
+  acceptable.
+- Avoid CPU-computed QKV in the free regime unless a future implementation
+  reduces WQKV submit/sync/return cost or gives WQKV a longer overlap window.
+- At larger batch sizes, continue to treat CPU-only as a diagnostic/negative
+  control, not a throughput-search candidate.
+
+#### Remaining CPU Gap Diagnosis
+
+Focused counter source:
+`/TTC/results/phase1_analysis/cpu_gap/20260515T_counter_boundary3/`.
+
+These historical counter-enabled runs used `VLLM_COTS_COUNTERS=1`, a
+temporary runner-close JSON dump hook, and
+`VLLM_COTS_RESET_COUNTERS_AFTER_CUDAGRAPH_CAPTURE=1`, so the EngineCore
+subprocess dumped replay-time worker counters at shutdown. The JSON dump hook
+was removed after the cleanup; the deterministic offloader shutdown hook was
+kept so the native runner is drained before the
+registry entry is released. The diagnostic confirms that the boundary is not a
+queueing or transfer artifact:
+
+| cell | latency | slowdown | CPU tasks | worker busy | queue wait | D2H bytes | UVA bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| MLP 512, QKV 0 (`f=0.027`) | 2.1186 s | 1.049x | 3,612 MLP | 1.222 s | 14 ms | 78.5 MB | 78.5 MB |
+| MLP 512 + QKV 256 (`f=0.028`) | 2.2575 s | 1.117x | 3,612 MLP + 3,612 QKV | 1.393 s | 19 ms | 157.0 MB | 84.1 MB |
+
+Adding the first QKV KV-head pair adds only `~171 ms` of worker busy time, but
+about `~139 ms` of that shows up as end-to-end latency. In other words, the
+QKV CPU work is almost fully exposed. Per QKV task this is roughly `47 us`,
+which is already larger than the Phase 0 WQKV GPU overlap window
+(`~38 us/layer`). By contrast, the MLP-only worker busy is much larger in
+absolute terms (`1.222 s`), but only about `140 ms` is exposed, so most MLP CPU
+work is overlapped.
+
+The current public `--cots-dry-run` now skips active CPU custom ops entirely:
+the dry cells have zero submit/worker/UVA counters. That is the desired
+control-plane semantic, but it means real-minus-dry is "active COTS work"
+rather than "CPU GEMM only."
+
+Temporary MLP-only closure probes then forced QKV to remain on GPU while
+varying the MLP CPU slice. This hook was diagnostic-only and is not kept in
+production. Because QKV is disabled in these probes, the harness-reported
+`actual_f`/`qkv rows` columns are not the right geometry; the table below uses
+the corrected MLP-only target-byte fraction:
+
+| MLP half channels | corrected target-byte f | best observed t | best slowdown | verdict |
+|---:|---:|---:|---:|---|
+| 512 | 0.0250 | 4 | 1.049x | free |
+| 576 | 0.0281 | 8 | 1.048x | free |
+| 640 | 0.0313 | 24 | 1.055x | boundary/lose |
+| 704 | 0.0344 | 8/24 | 1.052x | boundary/lose |
+| 960 | 0.0469 | 4 | 1.113x | lose |
+| 1024 | 0.0500 | 4 | 1.181x | lose |
+
+Sources:
+
+- `/TTC/results/phase1_analysis/cpu_gap/20260515T_mlp_only_t4_probe/`
+- `/TTC/results/phase1_analysis/cpu_gap/20260515T_mlp_only_704_t4_t8/`
+- `/TTC/results/phase1_analysis/cpu_gap/20260515T_mlp_only_704_t16_t24/`
+- `/TTC/results/phase1_analysis/cpu_gap/20260515T_mlp_only_640_t8_t24/`
+- `/TTC/results/phase1_analysis/cpu_gap/20260515T_mlp_only_576_t8_t24/`
+
+This answers the closure question. The gap is not mathematically impossible:
+the runtime does overlap most MLP CPU work. But current code cannot reach the
+old uniform `~5%` Phase 0 overlap bound end-to-end. Avoiding QKV only moves
+the free boundary from about `512` to about `576` MLP half channels
+(`2.5%` → `2.8%` of Phase-1 target bytes), not to `5%`. At larger MLP slices,
+the native MLP worker itself becomes too slow and leaks through the overlap
+window.
+
+Actionable implications:
+
+- **Planner:** CPU-compute free-regime dispatch should be module-specific.
+  Keep `qkv_cpu_compute=0` in the free zone; spend any CPU-compute budget on
+  MLP first. Uniform `f_cpu_compute` pulls in the first QKV pair too early and
+  creates the observed cliff.
+- **Current safe target:** for `B=1` decode, use MLP-only CPU compute up to
+  `512-576` half channels if the 5% latency gate matters.
+- **To reach 5%:** the MLP worker path needs a real speedup, not just planner
+  retargeting. For the 960-channel MLP-only probe, active work was
+  `~302 ms` above dry but the 5% budget allowed only `~174 ms`, so the exposed
+  active term must drop by roughly `40%`. For 1024 channels, the needed
+  reduction is closer to `60%`.
+- **Likely implementation levers:** reuse persistent worker scratch instead of
+  per-task `at::empty` allocations, fuse/inline the SwiGLU intermediate path,
+  reduce BF16 GEMM overhead for skinny decode shapes, and keep QKV on GPU
+  unless a future WQKV CPU path gets below the `~38 us/layer` overlap window or
+  gains a longer scheduling window.
+
+#### MLP Gate/Up/SwiGLU CPU Kernel Probe
+
+The custom-kernel pass measured two MLP worker candidates:
+
+- BF16 scratch: one fused gate/up/SwiGLU pass into BF16
+  `z=silu(gate)*up`, then the existing BF16 transposed down kernel.
+- FP32 scratch: one fused gate/up/SwiGLU pass into FP32 `z`, then a new
+  FP32xBF16 down kernel. This was rejected for production because it changes
+  intermediate precision and had a few noisier microbench cells.
+
+Microbench source:
+`/TTC/results/phase1_analysis/mlp_kernel/20260515T_fused_candidates.json`.
+For the decode-relevant `M=1` shapes, both custom variants were typically
+`~1.5-1.8x` faster than the old worker sequence; at `M=4`, the gain was
+usually `~1.25-1.35x`. Max absolute differences against the old BF16 path
+were about `2e-6` to `4e-6` in the scaled synthetic check.
+
+End-to-end source:
+
+- Legacy graph, `f=0.05,t=4`:
+  `/TTC/results/phase1_analysis/cpu_gap/20260515T_mlp_legacy_t4_graph_f0p05/summary.md`.
+- Fused graph, `f=0.05,t=4`:
+  `/TTC/results/phase1_analysis/cpu_gap/20260515T_mlp_fused_bf16z_t4_probe/summary.md`.
+- Default fused graph smoke:
+  `/TTC/results/phase1_analysis/cpu_gap/20260515T_mlp_fused_default_graph_f0p05_smoke/summary.md`.
+- Boundary graph with compile cache disabled:
+  `/TTC/results/phase1_analysis/cpu_gap/20260515T_mlp_legacy_t4_graph_f0p027_no_compile_cache/summary.md`
+  and
+  `/TTC/results/phase1_analysis/cpu_gap/20260515T_mlp_fused_bf16z_t4_graph_f0p027_no_compile_cache/summary.md`.
+
+At the heavier `f=0.05` graph point, the BF16-scratch path improves real
+latency from `2.3453 s` to about `2.2398 s`, reducing slowdown from roughly
+`1.167x` to `1.115x`. At the practical free-boundary point (`f=0.027`,
+MLP-only, `t=4`), the new path and old path are effectively tied
+(`2.1018 s` vs `2.1075 s` in the no-compile-cache graph rerun). That means
+the custom kernel helps where MLP CPU work is exposed, but it does not move
+the current 5% free boundary: the boundary cell was already mostly overlapped.
+
+Implementation decision after cleanup: production COTS has only the
+BF16-scratch gate/up/SwiGLU fast path. The FP32-scratch candidate, runtime MLP
+kernel selector, and old MLP worker fallback were removed so the production
+path is structurally obvious.
+
+Benchmark caveat: MLP-only graph cells around `f=0.02-0.028` currently expose
+a vLLM/TorchInductor standalone compile-cache failure that also reproduces on
+the legacy path. Use `VLLM_DISABLE_COMPILE_CACHE=1` for these diagnostic graph
+sweeps until that cache-key issue is fixed.
 
 ### KV-Throughput Implication
 
