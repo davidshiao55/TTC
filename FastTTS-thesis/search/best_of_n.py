@@ -41,18 +41,6 @@ def _best_of_n_search(
     tokenizer = generator.get_tokenizer()
     max_model_len = generator.config.generator_vllm_config.get("max_model_len", 4096)
 
-    # No `stop` strings + no iteration loop, so both SBE and prefix-aware
-    # scheduling (only invoked from common._duplicate_beams) are no-ops for
-    # this strategy. A `fasttts` BoN config differs from `baseline` only in
-    # GPU memory split (generator-heavy allocation).
-    sampling_params = SamplingParams(
-        temperature=search_config.temperature,
-        max_tokens=max_model_len,
-        top_p=search_config.top_p,
-        include_stop_str_in_output=True,
-        n=search_config.n,
-    )
-
     completed_beams: List[Beam] = []
     total_generator_latency_s = 0.0
     total_verifier_latency_s = 0.0
@@ -66,6 +54,29 @@ def _best_of_n_search(
             add_generation_prompt=True,
             continue_final_message=False,
             tokenize=False,
+        )
+        prompt_token_ids = tokenizer.apply_chat_template(
+            conv,
+            add_generation_prompt=True,
+            continue_final_message=False,
+            tokenize=True,
+        )
+        max_new_tokens = max_model_len - len(prompt_token_ids)
+        if max_new_tokens <= 0:
+            raise ValueError(
+                f"best_of_n prompt length ({len(prompt_token_ids)}) leaves no "
+                f"generation room under max_model_len={max_model_len}"
+            )
+
+        # BoN is a single-shot strategy: ignore the step-level
+        # search_config.max_tokens and let each sample run to EOS or the
+        # remaining context window.
+        sampling_params = SamplingParams(
+            temperature=search_config.temperature,
+            max_tokens=max_new_tokens,
+            top_p=search_config.top_p,
+            include_stop_str_in_output=True,
+            n=search_config.n,
         )
 
         start_time = time.time()

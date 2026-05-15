@@ -16,8 +16,11 @@ from tqdm.auto import tqdm
 
 from vllm import LLM
 from vllm.config import CompilationConfig, is_init_field
+from vllm.config.compilation import CompilationMode
 from vllm.config.model import ModelDType, TokenizerMode
 from vllm.engine.arg_utils import EngineArgs, HfOverrides, PoolerConfig, RunnerOption
+from vllm.entrypoints.chat_utils import ChatTemplateConfig, load_chat_template
+from vllm.entrypoints.pooling.io_processor_factories import init_pooling_io_processors
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -46,9 +49,15 @@ def _build_compilation_config(
     if compilation_config is None:
         return CompilationConfig()
     if isinstance(compilation_config, int):
-        return CompilationConfig(level=compilation_config)
+        return CompilationConfig(mode=CompilationMode(compilation_config))
     if isinstance(compilation_config, dict):
-        valid = {k: v for k, v in compilation_config.items() if is_init_field(CompilationConfig, k)}
+        compilation_config = dict(compilation_config)
+        if "level" in compilation_config and "mode" not in compilation_config:
+            compilation_config["mode"] = CompilationMode(compilation_config.pop("level"))
+        valid = {
+            k: v for k, v in compilation_config.items()
+            if is_init_field(CompilationConfig, k)
+        }
         return CompilationConfig(**valid)
     return compilation_config
 
@@ -152,12 +161,21 @@ class TTSLLM(LLM):
     def _bootstrap_llm_attributes(self) -> None:
         """Populate attributes that ``LLM.generate`` / ``LLM.encode`` expect."""
         self.model_config = self.llm_engine.model_config
-        self.renderer = getattr(self.llm_engine, "renderer", None)
+        self.renderer = self.llm_engine.renderer
         self.runner_type = self.model_config.runner_type
         self.supported_tasks = self.llm_engine.get_supported_tasks()
-        self.pooling_io_processors = {}
-        self.io_processor = getattr(self.llm_engine, "io_processor", None)
-        self.input_processor = getattr(self.llm_engine, "input_processor", None)
+        self.pooling_task = self.model_config.get_pooling_task(self.supported_tasks)
+        self.io_processor = self.llm_engine.io_processor
+        self.input_processor = self.llm_engine.input_processor
+        self.chat_template = load_chat_template(None)
+        self.chat_template_config = ChatTemplateConfig(chat_template=self.chat_template)
+        self.pooling_io_processors = init_pooling_io_processors(
+            supported_tasks=self.supported_tasks,
+            model_config=self.model_config,
+            renderer=self.renderer,
+            chat_template_config=self.chat_template_config,
+        )
+        self._cached_repr: str | None = None
 
     # ------------------------------------------------------------------
     # Public API
