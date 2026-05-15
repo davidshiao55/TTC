@@ -13,6 +13,49 @@ The older milestone files are now appendices:
 
 `phase1_cleanup_triage.md` was merged into this document and removed.
 
+## Freeze Record
+
+Phase 1 freeze pass was run on 2026-05-15.
+
+Baseline commits:
+
+| Repo | Commit | Note |
+|---|---:|---|
+| `/TTC/vllm` | `da4894d6e` | final Phase 1 implementation |
+| `/TTC` | `7729c73` | Phase 1 docs restructure parent; this freeze note advances it |
+
+The freeze pass caught one teardown bug before the final baseline was recorded:
+`NativeCotsRunner.close()` could unregister the pybind infer while
+stream-ordered COTS callback/UVA work was still unwinding. The fix synchronizes
+the current CUDA stream before draining the CPU queue and unregistering the
+runner. This is in `/TTC/vllm` commit `da4894d6e`.
+
+Verification run:
+
+| Check | Result |
+|---|---:|
+| `python -m py_compile` on Phase 1 analysis benchmark scripts | pass |
+| `python -m py_compile vllm/model_executor/offloader/cots_runners.py` | pass |
+| `David/Tests/phase1_analysis/test_kv_throughput_log_parser.py` and `test_cots_vs_native_prefetch.py` | 6 passed |
+| `vllm/tests/model_executor/test_cots_prefetch_trace.py` plus COTS graph-split config tests | 4 passed |
+| `phase1b/test_three_way_scatter.py`, `phase1b/test_layer_ahead_smoke.py`, `phase1c/test_parity_with_python_runner.py`, `phase1c/test_stage2_substrate.py` | 54 passed |
+| free-regime smoke, `B=1`, `output_len=16`, `f=0.01` | completed |
+| Qwen2.5-7B COTS generation smoke, `f_cpu_store=0.09`, eager | completed |
+
+Free-regime smoke output:
+
+| Arm | Mean latency |
+|---|---:|
+| `none` | 0.2658 s |
+| `cots_cpu_only_f0p01` | 0.2831 s |
+| `cots_prefetch_only_f0p01` | 0.2782 s |
+
+Artifacts: `/TTC/results/phase1_freeze/free_regime_smoke_20260515/`.
+
+Generation smoke output was semantically sane for prompt
+`The capital of France is`, producing: `Paris. Which of the following
+statements is`.
+
 ## Executive Summary
 
 Phase 1 lands a graph-compatible collaborative tensor-split weight offloader
