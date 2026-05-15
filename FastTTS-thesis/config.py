@@ -135,6 +135,13 @@ class FastTTSConfig:
     offload_enabled: bool = False
     prefix_aware_scheduling: bool = False
 
+    # Thin launch-time TTC planner interface. When enabled, FastTTS resolves a
+    # two-engine plan before spawning vLLM workers, then writes engine-local
+    # vLLM kwargs back into generator_vllm_config / verifier_vllm_config.
+    planner_enabled: bool = False
+    planner_mode: Literal["manual"] = "manual"
+    planner_config: Optional[Dict] = None
+
     def create_search_config(self, **kwargs) -> SearchConfig:
         """Create a search configuration with optional overrides."""
         return self.search_config.copy(**kwargs)

@@ -33,7 +33,20 @@ Host_RAM_budget = total_RAM − OS_overhead
 - `|B_prefetch| = 2 × max_layer_bytes_m` per model (pipeline-depth sized; see §5)
 - `vLLM_overhead` ≈ 1–2 GB from engine process state (see `vllm_v1_migration.md`)
 
-FastTTS runs two engines (generator + verifier) sharing the GPU. The Planner inherits FastTTS's existing `gpu_memory_utilization` split between them rather than re-deciding the split — one less knob.
+FastTTS runs two engines (generator + verifier) sharing the GPU. The
+production planner is therefore a two-layer contract:
+
+- **FastTTS/global planner**: owns the shared-memory decision across both
+  engines. It chooses each engine's GPU budget, CPU KV budget, and target
+  weight CPU-store fraction from the search objective.
+- **vLLM/engine-local resolver**: consumes one engine's plan and turns it into
+  COTS runtime geometry: snapped weight slices, optional per-bucket dispatch
+  table, prefetch buffers, and validation against actual captured buckets.
+
+The older `memory_latency_analysis.py` splitter remains a baseline sweeper: it
+can test generator/verifier `gpu_memory_utilization` pairs, but it does not
+model weight or KV offload. It should feed/validate the global planner, not
+replace it.
 
 ### 1.3 Workload target
 
@@ -89,17 +102,41 @@ The two models hit different bucket distributions. Because the dispatch table is
 
 ## 4. Outputs
 
-### 4.1 Load-time scalars
+### 4.1 Global Plan Output
 
 Per model `m ∈ {generator, verifier}`:
 
+- `gpu_memory_utilization_m` or equivalent GPU-byte budget — the global GPU
+  budget assigned to this vLLM engine.
 - `f_cpu_store_m ∈ [0, 1]` — single scalar applied uniformly to **WQKV, MLP1, MLP2**. WQKV's CPU-stored bytes are ordered by the K/V-biased picker (K+V head groups first, then Q tail). WO is not offloaded in Phase 1/2 (`f_cpu_store_WO = 0`, fixed — see `weight_offload_design.md §WO Split Axis Decision`).
 - `KV_gpu_bytes_m` — GPU KV pool size
 - `KV_cpu_bytes_m` — CPU KV pool size (the "extension")
 
-Six scalars total. The verifier often degenerates to `f_cpu_store_ver = 0` and `KV_cpu_bytes_ver = 0` on a 24 GB RTX 4090 with a 1.5B PRM — the Planner discovers this rather than assuming it.
+The verifier often degenerates to `f_cpu_store_ver = 0` and
+`KV_cpu_bytes_ver = 0` on a 24 GB RTX 4090 with a 1.5B PRM — the Planner
+discovers this rather than assuming it.
 
-### 4.2 Dispatch table
+### 4.2 Engine-Local Resolved Plan
+
+The FastTTS/global planner emits one engine-local plan per vLLM instance.
+Current pre-Phase-2 implementation is deliberately manual/static:
+
+```
+FastTTS planner_config
+        -> TTCSystemPlan(generator, verifier)
+        -> per-engine vLLM kwargs:
+           gpu_memory_utilization
+           kv_offloading_size/backend
+           offload_backend="cots"
+           cots_f_cpu_store
+           cots_f_prefetch
+           cots_dispatch_table (optional; complete if set)
+```
+
+This keeps Phase 2 work plan-shaped without committing to a performance model
+before CPU suffix-attention timings exist.
+
+### 4.3 Dispatch table
 
 Per model, a table keyed by `BatchDescriptor`:
 
@@ -119,11 +156,26 @@ Every CPU-stored byte is dispatched each forward — either CPU-computed or pref
 
 **WQKV K/V positioning is the Planner's responsibility.** The runtime applies the dispatch table verbatim across all sub-modules; there is no K/V-pin override. To avoid K/V-output PCIe round-trips when the per-bucket `f_cpu_compute` lands below the K/V fraction, the Planner's cost model (§7.3) charges the round-trip and naturally biases toward `f_cpu_compute ≥ K/V fraction` when the budget allows. See `weight_offload_design.md §Implementation Note: WQKV K/V Positioning`.
 
-### 4.3 Eager-fallback entry
+The current simple interface supports this through vLLM's
+`cots_dispatch_table` config. If the table is set, it must contain every
+captured bucket used by that engine. For thesis experiments this is acceptable:
+the planner config either pins `cudagraph_capture_sizes` or uses a known bucket
+set from the controlled launch config. If unset, vLLM preserves today's uniform
+fallback:
+
+```
+f_cpu_compute = f_cpu_store - f_prefetch
+f_prefetch_compute = f_prefetch
+```
+
+Do not add a vLLM-side bucket export/partial-policy expansion layer yet. That
+is a future simplification only if complete tables become a practical blocker.
+
+### 4.4 Eager-fallback entry
 
 For `num_tokens > max_cudagraph_capture_size`, vLLM falls back to eager execution. The Planner emits one extra entry for this case (simplest: reuse the largest captured bucket's dispatch). The Scheduler looks up this entry for out-of-bucket batches.
 
-### 4.4 Fixed constants (documented outputs, not tuned)
+### 4.5 Fixed constants (documented outputs, not tuned)
 
 - `|B_prefetch_m| = layer-ahead buffer` — sized to hold `Σ_m (f_prefetch × W_m)` across WQKV/MLP1/MLP2 within one layer (see `pcie_bandwidth_allocation_design.md §Prefetch Distance`).
 - **Prefetch distance = layer-ahead** — one prefetch queue per layer, one sync per layer boundary. Committed (not an option). Empirically validated in `phase0_findings.md §0.10.1d`: under uniform spread (G=4 N=1) on Qwen2.5-7B at decode B=64, K=2 buys only 2.9% over K=1 and K=4 OOMs because the buffer pool grows linearly with K.
@@ -133,7 +185,7 @@ For `num_tokens > max_cudagraph_capture_size`, vLLM falls back to eager executio
 
 These appear in the output for completeness so the Scheduler has one place to read the plan, but the Planner does not optimize over them.
 
-### 4.5 Runtime dispatch lookup — graph-enabled vs graph-disabled
+### 4.6 Runtime dispatch lookup — graph-enabled vs graph-disabled
 
 The dispatch table is keyed on `cudagraph_capture_sizes`, independent of whether CUDA graphs are actually enabled at runtime. This keeps the Planner output identical across Phase 1a/1b (graph-disabled prototypes) and Phase 1c (graph-enabled native runner; was Phase 4). The difference is only in how `num_tokens` maps to a bucket at runtime:
 
@@ -321,7 +373,8 @@ The Planner returns a structured error identifying which constraint is tight. Th
 - **Online re-planning.** The Planner runs once at launch. Runtime adaptation to workload drift is the Scheduler's concern (and a future-work item).
 - **Beyond two models.** Generator + verifier is hard-coded. Multi-expert or MoE-style extensions are out of scope.
 - **Pareto output (latency vs throughput).** The Planner returns one plan per launch. Users sweep launches to explore Pareto curves.
-- **Automatic selection of gen/ver VRAM split.** Inherited from FastTTS's `gpu_memory_utilization` setting. Sweeping this is future work.
+- **Online automatic replanning of gen/ver VRAM split.** The launch-time
+  planner may choose the split, but runtime changes still require relaunch.
 
 ---
 

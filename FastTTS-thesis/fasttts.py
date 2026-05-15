@@ -46,13 +46,15 @@ class FastTTS:
         self.generator = None
         self.verifier = None
         self._initialized = False
+        self._ttc_plan = None
         
-    def initialize(self):
+    def initialize(self, search_config: Optional[SearchConfig] = None):
         """Initialize the generator and verifier models asynchronously."""
         if self._initialized:
             return
             
         logger.info("Initializing FastTTS models...")
+        self._resolve_planner(search_config or self.config.search_config)
         
         # Initialize generator
         self.generator = GeneratorVLLMModelWrapper(
@@ -68,6 +70,25 @@ class FastTTS:
         
         self._initialized = True
         logger.info("FastTTS models initialized successfully")
+
+    def _resolve_planner(self, search_config: SearchConfig) -> None:
+        """Run the launch-time TTC planner if enabled."""
+        if not self.config.planner_enabled:
+            return
+        if self.config.planner_mode != "manual":
+            raise ValueError(
+                f"Unsupported planner_mode={self.config.planner_mode!r}; "
+                "only 'manual' is implemented pre-Phase-2."
+            )
+        from planner import ManualTTCPlanner, apply_ttc_plan_to_config
+
+        self._ttc_plan = ManualTTCPlanner(self.config).plan(search_config)
+        apply_ttc_plan_to_config(self.config, self._ttc_plan)
+        logger.info(
+            "Resolved TTC manual planner: generator=%s verifier=%s",
+            self.config.generator_vllm_config,
+            self.config.verifier_vllm_config,
+        )
         
     def _process_batch(
         self,
@@ -87,9 +108,6 @@ class FastTTS:
         **search_kwargs,
     ) -> SearchResults:
         """Perform test-time search with batch processing."""
-        if not self._initialized:
-            self.initialize()
-
         if search_config is None:
             search_config = self.config.search_config
         if search_kwargs:
@@ -97,6 +115,8 @@ class FastTTS:
         search_config = search_config.copy(
             spec_beam_extension=self.config.spec_beam_extension,
         )
+        if not self._initialized:
+            self.initialize(search_config)
 
         batch_size = search_config.batch_size
         if batch_size <= 0:
