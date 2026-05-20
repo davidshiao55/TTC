@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import logging
+import sys
+from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 from config import FastTTSConfig, SearchConfig
@@ -80,6 +82,9 @@ class FastTTS:
                 f"Unsupported planner_mode={self.config.planner_mode!r}; "
                 "only 'manual' is implemented pre-Phase-2."
             )
+        package_root = str(Path(__file__).resolve().parent)
+        if package_root not in sys.path:
+            sys.path.insert(0, package_root)
         from planner import ManualTTCPlanner, apply_ttc_plan_to_config
 
         self._ttc_plan = ManualTTCPlanner(self.config).plan(search_config)

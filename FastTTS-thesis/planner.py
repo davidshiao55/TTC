@@ -114,13 +114,16 @@ class WeightPlacementPlan:
 
 @dataclass(frozen=True)
 class KVPlacementPlan:
-    """Per-engine KV offload budget.
+    """Per-engine KV placement budget.
 
-    `cpu_kv_bytes` is intentionally byte-based at the planner boundary. vLLM's
-    current public config uses GiB, so `EnginePlan.to_vllm_overrides` converts.
+    Phase 2 COTS hybrid KV uses `cpu_kv_bytes` + `split_blocks` directly.
+    The legacy vLLM KV-offload fields are preserved for old planner configs
+    but are not emitted for COTS hybrid KV.
     """
 
+    gpu_kv_bytes: int | None = None
     cpu_kv_bytes: int | None = None
+    split_blocks: int = 0
     backend: str = "native"
 
     @classmethod
@@ -131,17 +134,42 @@ class KVPlacementPlan:
         defaults: Mapping[str, Any],
     ) -> "KVPlacementPlan":
         raw = raw or {}
+        gpu_kv_bytes = raw.get("gpu_kv_bytes", raw.get("KV_gpu_bytes"))
+        if gpu_kv_bytes is None and "gpu_kv_gb" in raw:
+            gpu_kv_bytes = int(float(raw["gpu_kv_gb"]) * (1 << 30))
         cpu_kv_bytes = raw.get("cpu_kv_bytes")
+        if cpu_kv_bytes is None:
+            cpu_kv_bytes = raw.get("KV_cpu_bytes")
         if cpu_kv_bytes is None and "cpu_kv_gb" in raw:
             cpu_kv_bytes = int(float(raw["cpu_kv_gb"]) * (1 << 30))
-        if cpu_kv_bytes is None and "kv_offloading_size" in defaults:
+        if cpu_kv_bytes is None and "cots_kv_cpu_pool_bytes" in defaults:
+            cpu_kv_bytes = defaults.get("cots_kv_cpu_pool_bytes")
+        elif cpu_kv_bytes is None and "kv_offloading_size" in defaults:
             size_gib = defaults.get("kv_offloading_size")
             if size_gib is not None:
                 cpu_kv_bytes = int(float(size_gib) * (1 << 30))
+        split_blocks = int(
+            raw.get(
+                "split_blocks",
+                raw.get(
+                    "kv_split_blocks",
+                    raw.get(
+                        "cots_kv_split_blocks",
+                        defaults.get("cots_kv_split_blocks", 0),
+                    ),
+                ),
+            )
+        )
+        if gpu_kv_bytes is not None and int(gpu_kv_bytes) < 0:
+            raise ValueError(f"gpu_kv_bytes must be non-negative, got {gpu_kv_bytes}")
         if cpu_kv_bytes is not None and int(cpu_kv_bytes) < 0:
             raise ValueError(f"cpu_kv_bytes must be non-negative, got {cpu_kv_bytes}")
+        if split_blocks < 0:
+            raise ValueError(f"split_blocks must be non-negative, got {split_blocks}")
         return cls(
+            gpu_kv_bytes=None if gpu_kv_bytes is None else int(gpu_kv_bytes),
             cpu_kv_bytes=None if cpu_kv_bytes is None else int(cpu_kv_bytes),
+            split_blocks=split_blocks,
             backend=str(
                 raw.get("backend", defaults.get("kv_offloading_backend", "native"))
             ),
@@ -154,6 +182,7 @@ class EnginePlan:
 
     role: EngineRole
     gpu_memory_utilization: float | None = None
+    max_num_seqs: int | None = None
     weight: WeightPlacementPlan = field(default_factory=WeightPlacementPlan)
     kv: KVPlacementPlan = field(default_factory=KVPlacementPlan)
 
@@ -169,6 +198,9 @@ class EnginePlan:
         gpu_memory_utilization = raw.get(
             "gpu_memory_utilization", defaults.get("gpu_memory_utilization")
         )
+        max_num_seqs = raw.get("max_num_seqs")
+        if max_num_seqs is not None and int(max_num_seqs) <= 0:
+            raise ValueError(f"max_num_seqs must be positive, got {max_num_seqs}")
         weight_raw = raw.get("weight", {})
         kv_raw = raw.get("kv", {})
         return cls(
@@ -178,6 +210,7 @@ class EnginePlan:
                 if gpu_memory_utilization is None
                 else float(gpu_memory_utilization)
             ),
+            max_num_seqs=None if max_num_seqs is None else int(max_num_seqs),
             weight=WeightPlacementPlan.from_mapping(weight_raw, defaults=defaults),
             kv=KVPlacementPlan.from_mapping(kv_raw, defaults=defaults),
         )
@@ -186,15 +219,32 @@ class EnginePlan:
         overrides: Dict[str, Any] = {}
         if self.gpu_memory_utilization is not None:
             overrides["gpu_memory_utilization"] = self.gpu_memory_utilization
-        if self.kv.cpu_kv_bytes is not None and self.kv.cpu_kv_bytes > 0:
+        if self.max_num_seqs is not None:
+            overrides["max_num_seqs"] = self.max_num_seqs
+        if self.kv.gpu_kv_bytes is not None and self.kv.gpu_kv_bytes > 0:
+            overrides["kv_cache_memory_bytes"] = self.kv.gpu_kv_bytes
+        hybrid_kv = (
+            self.kv.split_blocks > 0
+            and self.kv.cpu_kv_bytes is not None
+            and self.kv.cpu_kv_bytes > 0
+        )
+        if (
+            not hybrid_kv
+            and self.kv.cpu_kv_bytes is not None
+            and self.kv.cpu_kv_bytes > 0
+        ):
             overrides["kv_offloading_size"] = _bytes_to_gib(self.kv.cpu_kv_bytes)
             overrides["kv_offloading_backend"] = self.kv.backend
-        if self.weight.f_cpu_store > 0 or self.weight.backend == "cots":
+        if self.weight.f_cpu_store > 0 or self.weight.backend == "cots" or hybrid_kv:
             overrides["offload_backend"] = "cots"
             overrides["cots_f_cpu_store"] = self.weight.f_cpu_store
             overrides["cots_f_prefetch"] = self.weight.f_prefetch
             if self.weight.dispatch_table is not None:
                 overrides["cots_dispatch_table"] = self.weight.dispatch_table
+            if hybrid_kv:
+                overrides["cots_kv_split_blocks"] = self.kv.split_blocks
+                overrides["cots_kv_cpu_pool_bytes"] = self.kv.cpu_kv_bytes
+                overrides["cots_kv_h2d_mode"] = "uva"
         return overrides
 
 

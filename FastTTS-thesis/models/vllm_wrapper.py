@@ -241,6 +241,70 @@ class _BatchStatsAcc:
         }
 
 
+class _CotsHybridKVStatsAcc:
+    """Running sum of Phase 2 COTS hybrid KV counters and timings."""
+
+    SUM_FIELDS = (
+        "hybrid_preemptions",
+        "hybrid_recomputed_cpu_suffix_tokens",
+        "hybrid_decode_calls",
+        "cpu_suffix_attn_ms",
+        "cpu_suffix_wait_ms",
+        "cpu_suffix_read_wait_ms",
+        "q_d2h_copy_ms",
+        "cpu_suffix_scatter_ms",
+        "hybrid_merge_ms",
+        "gpu_prefix_attn_ms",
+        "q_d2h_bytes",
+        "kv_d2h_bytes",
+        "kv_uva_h2d_bytes",
+    )
+
+    def __init__(self):
+        self.active = False
+        self.gpu_blocks_last = 0
+        self.gpu_blocks_max = 0
+        self.cpu_blocks_last = 0
+        self.cpu_blocks_max = 0
+        self.cpu_blocks_total = 0
+        self.sums = {field: 0 for field in self.SUM_FIELDS}
+
+    def add(self, stats) -> None:
+        if stats is None:
+            return
+        self.active = True
+        gpu_blocks = getattr(stats, "hybrid_gpu_kv_blocks_used", 0) or 0
+        cpu_blocks = getattr(stats, "hybrid_cpu_kv_blocks_used", 0) or 0
+        cpu_total = getattr(stats, "hybrid_cpu_kv_blocks_total", 0) or 0
+        self.gpu_blocks_last = gpu_blocks
+        self.gpu_blocks_max = max(self.gpu_blocks_max, gpu_blocks)
+        self.cpu_blocks_last = cpu_blocks
+        self.cpu_blocks_max = max(self.cpu_blocks_max, cpu_blocks)
+        self.cpu_blocks_total = max(self.cpu_blocks_total, cpu_total)
+        for field in self.SUM_FIELDS:
+            self.sums[field] += getattr(stats, field, 0) or 0
+
+    def to_dict(self) -> dict | None:
+        if not self.active:
+            return None
+        out = {
+            "hybrid_gpu_kv_blocks_used": self.gpu_blocks_last,
+            "hybrid_gpu_kv_blocks_max": self.gpu_blocks_max,
+            "hybrid_cpu_kv_blocks_used": self.cpu_blocks_last,
+            "hybrid_cpu_kv_blocks_max": self.cpu_blocks_max,
+            "hybrid_cpu_kv_blocks_total": self.cpu_blocks_total,
+            **self.sums,
+        }
+        cpu_ms = out["cpu_suffix_attn_ms"]
+        gpu_ms = out["gpu_prefix_attn_ms"]
+        out["hybrid_overlap_ratio"] = (
+            min(cpu_ms, gpu_ms) / (cpu_ms + gpu_ms)
+            if (cpu_ms + gpu_ms) > 0
+            else 0.0
+        )
+        return out
+
+
 def _install_prefix_cache_accumulator(scheduler) -> None:
     """Wrap scheduler.make_stats so per-step stats are summed for end-of-run reporting.
 
@@ -259,6 +323,7 @@ def _install_prefix_cache_accumulator(scheduler) -> None:
     scheduler._acc_cpu_prefix = _CacheStatsAcc()
     scheduler._acc_transfers = _TransferStatsAcc()
     scheduler._acc_batch = _BatchStatsAcc()
+    scheduler._acc_cots_hybrid_kv = _CotsHybridKVStatsAcc()
     original = scheduler.make_stats
 
     def wrapped(*args, **kwargs):
@@ -268,6 +333,9 @@ def _install_prefix_cache_accumulator(scheduler) -> None:
             scheduler._acc_cpu_prefix.add(getattr(stats, "connector_prefix_cache_stats", None))
             scheduler._acc_transfers.add(getattr(stats, "kv_connector_stats", None))
             scheduler._acc_batch.add(stats)
+            scheduler._acc_cots_hybrid_kv.add(
+                getattr(stats, "cots_hybrid_kv_stats", None)
+            )
         return stats
 
     scheduler.make_stats = wrapped
@@ -281,12 +349,16 @@ def _handle_get_run_stats(ctx, request):
     cpu = getattr(scheduler, "_acc_cpu_prefix", None)
     xfer = getattr(scheduler, "_acc_transfers", None)
     batch = getattr(scheduler, "_acc_batch", None)
+    cots_hybrid_kv = getattr(scheduler, "_acc_cots_hybrid_kv", None)
     return {
         "result": {
             "gpu": gpu.to_dict() if gpu else None,
             "cpu": (cpu.to_dict() if (cpu and cpu.requests > 0) else None),
             "transfers": xfer.to_dict() if xfer else None,
             "batch": batch.to_dict() if batch else None,
+            "cots_hybrid_kv": (
+                cots_hybrid_kv.to_dict() if cots_hybrid_kv else None
+            ),
         }
     }
 

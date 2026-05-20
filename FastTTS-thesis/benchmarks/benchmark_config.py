@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
-from fasttts import SearchConfig, FastTTSConfig, create_fasttts_config
+from config import SearchConfig, FastTTSConfig
 
 @dataclass
 class BenchmarkConfig:
@@ -21,12 +21,30 @@ class BenchmarkConfig:
     enable_prefix_aware_scheduling: bool = False
 
 
+def _merge_vllm_config(defaults: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(defaults)
+    merged.update(overrides)
+    return merged
+
+
+def _copy_optional_vllm_flags(
+    vllm_config: Dict[str, Any],
+    model_config: Dict[str, Any],
+) -> None:
+    for key in ("enforce_eager",):
+        if key in model_config:
+            vllm_config[key] = model_config[key]
+
+
 def build_benchmark_config_from_yaml(yaml_dict: Dict[str, Any]) -> BenchmarkConfig:
     """Build a BenchmarkConfig from a YAML dictionary."""
     # Extract optimization options
     enable_spec_diff = yaml_dict.get("enable_spec_diff", False)
     offload_enabled = yaml_dict.get("offload_enabled", False)
-    enable_prefix_aware_scheduling = yaml_dict.get("enable_prefix_aware_scheduling", False)
+    enable_prefix_aware_scheduling = yaml_dict.get(
+        "enable_prefix_aware_scheduling",
+        yaml_dict.get("prefix_aware_scheduling", False),
+    )
 
     # Dataset
     dataset = yaml_dict["dataset"]
@@ -71,6 +89,7 @@ def build_benchmark_config_from_yaml(yaml_dict: Dict[str, Any]) -> BenchmarkConf
     }
     if "max_model_len" in generator_config:
         gen_vllm_config["max_model_len"] = generator_config["max_model_len"]
+    _copy_optional_vllm_flags(gen_vllm_config, generator_config)
     if "kv_offloading_size" in generator_config:
         gen_vllm_config["kv_offloading_size"] = generator_config["kv_offloading_size"]
         gen_vllm_config["kv_offloading_backend"] = generator_config.get(
@@ -87,18 +106,27 @@ def build_benchmark_config_from_yaml(yaml_dict: Dict[str, Any]) -> BenchmarkConf
     }
     if "max_model_len" in verifier_config:
         ver_vllm_config["max_model_len"] = verifier_config["max_model_len"]
+    _copy_optional_vllm_flags(ver_vllm_config, verifier_config)
     if "kv_offloading_size" in verifier_config:
         ver_vllm_config["kv_offloading_size"] = verifier_config["kv_offloading_size"]
         ver_vllm_config["kv_offloading_backend"] = verifier_config.get(
             "kv_offloading_backend", "native"
         )
 
-    fasttts_config = create_fasttts_config(
-        generator_vllm_config=gen_vllm_config,
-        verifier_vllm_config=ver_vllm_config,
+    defaults = FastTTSConfig()
+    fasttts_config = FastTTSConfig(
+        generator_vllm_config=_merge_vllm_config(
+            defaults.generator_vllm_config, gen_vllm_config
+        ),
+        verifier_vllm_config=_merge_vllm_config(
+            defaults.verifier_vllm_config, ver_vllm_config
+        ),
         offload_enabled=offload_enabled,
         spec_beam_extension=enable_spec_diff,
         prefix_aware_scheduling=enable_prefix_aware_scheduling,
+        planner_enabled=yaml_dict.get("planner_enabled", False),
+        planner_mode=yaml_dict.get("planner_mode", "manual"),
+        planner_config=yaml_dict.get("planner_config"),
     )
 
     return BenchmarkConfig(
