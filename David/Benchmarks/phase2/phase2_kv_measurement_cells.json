@@ -361,5 +361,258 @@
       "hybrid_gpu_kv_tokens": 23152,
       "notes": "One-block active-suffix control. Exact no-suffix hybrid split1024 is rejected because COTS hybrid KV requires at least one CPU suffix block."
     }
+  ],
+  "diagnostics": [
+    {
+      "label": "llama-eager-0.80-total1024-split1008-coalesced-prefix-ab",
+      "kind": "e2e_ablation",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.8,
+      "enforce_eager": true,
+      "max_model_len": 1024,
+      "max_num_seqs": 512,
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 1024,
+      "split_blocks": 63,
+      "split_tokens": 1008,
+      "cpu_kv_gb": 12,
+      "async_scheduling": false,
+      "prompt_mode": "shared",
+      "gpu_only_out_tok_s": 2629.646,
+      "hybrid_coalesced_prefix_on_out_tok_s": 2429.151,
+      "hybrid_coalesced_prefix_off_out_tok_s": 2384.422,
+      "hybrid_coalesced_prefix_on_vs_gpu": 0.924,
+      "hybrid_coalesced_prefix_off_vs_gpu": 0.907,
+      "notes": "Matched rerun. Coalesced prefix helps relative to split row path but still loses to GPU-only; capacity gain is only 22.97/22.61 = 1.6%."
+    },
+    {
+      "label": "llama-flash-attn-lse-b512-seq1024-split1008",
+      "kind": "microbenchmark",
+      "script": "David/Benchmarks/phase2/benchmark_flash_attn_lse.py",
+      "model_shape": {
+        "num_q_heads": 32,
+        "num_kv_heads": 8,
+        "head_dim": 128
+      },
+      "batch": 512,
+      "seq_len": 1024,
+      "split_len": 1008,
+      "dtype": "bfloat16",
+      "fa_version": 2,
+      "prefix_out_only_s1_avg_ms": 2.289151,
+      "prefix_lse_out_s1_avg_ms": 2.289798,
+      "full_out_only_s0_avg_ms": 2.326461,
+      "notes": "LSE materialization is effectively free at this shape and does not explain the e2e hybrid loss."
+    },
+    {
+      "label": "llama-hybrid-wrapper-noop-b512-seq1024",
+      "kind": "microbenchmark",
+      "script": "David/Benchmarks/phase2/benchmark_hybrid_wrapper_attention.py",
+      "model_shape": {
+        "num_q_heads": 32,
+        "num_kv_heads": 8,
+        "head_dim": 128
+      },
+      "batch": 512,
+      "seq_len": 1024,
+      "dtype": "bfloat16",
+      "fa_version": 2,
+      "cases": [
+        {
+          "split_len": 1008,
+          "suffix_fraction": 0.125,
+          "suffix_rows": 64,
+          "raw_full_fa_avg_ms": 2.328331,
+          "raw_prefix_lse_fa_avg_ms": 2.291519,
+          "coalesced_noop_suffix_avg_ms": 2.436608,
+          "capacity_gain_pct": 1.6,
+          "kernel_path_tax_pct": 4.7
+        },
+        {
+          "split_len": 960,
+          "suffix_fraction": 0.125,
+          "suffix_rows": 64,
+          "raw_full_fa_avg_ms": 2.324966,
+          "raw_prefix_lse_fa_avg_ms": 2.186804,
+          "coalesced_noop_suffix_avg_ms": 2.331311,
+          "capacity_gain_pct": 6.7,
+          "kernel_path_tax_pct": 0.3
+        },
+        {
+          "split_len": 1008,
+          "suffix_fraction": 0.5,
+          "suffix_rows": 256,
+          "raw_full_fa_avg_ms": 2.324282,
+          "raw_prefix_lse_fa_avg_ms": 2.290662,
+          "coalesced_noop_suffix_avg_ms": 2.656817,
+          "capacity_gain_pct": 1.6,
+          "kernel_path_tax_pct": 14.3
+        },
+        {
+          "split_len": 960,
+          "suffix_fraction": 0.5,
+          "suffix_rows": 256,
+          "raw_full_fa_avg_ms": 2.331372,
+          "raw_prefix_lse_fa_avg_ms": 2.185186,
+          "coalesced_noop_suffix_avg_ms": 2.552298,
+          "capacity_gain_pct": 6.7,
+          "kernel_path_tax_pct": 9.5
+        }
+      ],
+      "notes": "No-op suffix shows active-suffix row fraction controls whether prefix shortening beats merge/control overhead."
+    },
+    {
+      "label": "llama-eager-0.80-total1024-split960-stats-enabled-diagnostic",
+      "kind": "diagnostic_e2e_stats",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.8,
+      "enforce_eager": true,
+      "max_model_len": 1024,
+      "max_num_seqs": 512,
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 1024,
+      "split_blocks": 60,
+      "split_tokens": 960,
+      "cpu_kv_gb": 12,
+      "async_scheduling": false,
+      "prompt_mode": "shared",
+      "instrumented_out_tok_s": 2086.899,
+      "representative_suffix_rows_per_32_layer_calls": [
+        288,
+        576,
+        608,
+        768,
+        1024
+      ],
+      "large_mixed_prefix_windows": [
+        {
+          "prefix_rows": 43040,
+          "suffix_rows": 576,
+          "mixed_prefix_wall_ms": 176.072
+        },
+        {
+          "prefix_rows": 57760,
+          "suffix_rows": 416,
+          "mixed_prefix_wall_ms": 238.585
+        }
+      ],
+      "notes": "Diagnostic only; CUDA timing and stats lower throughput. Confirms real split960 scheduling often has non-tiny active suffix row fractions."
+    },
+    {
+      "label": "llama-merge-artifact-placement-h32d128",
+      "kind": "microbenchmark",
+      "script": "David/Benchmarks/phase2/benchmark_merge_uva.py",
+      "model_shape": {
+        "num_q_heads": 32,
+        "head_dim": 128
+      },
+      "dtype": "bfloat16_output_float32_lse",
+      "cases": [
+        {
+          "suffix_rows": 256,
+          "artifact_mb": 2.13,
+          "gpu_merge_ms": 0.003424,
+          "uva_out_uva_lse_merge_ms": 0.105007,
+          "copy_out_copy_lse_ms": 0.091625,
+          "copy_out_copy_lse_gpu_merge_ms": 0.103083
+        },
+        {
+          "suffix_rows": 512,
+          "artifact_mb": 4.26,
+          "gpu_merge_ms": 0.004308,
+          "uva_out_uva_lse_merge_ms": 0.204656,
+          "copy_out_copy_lse_ms": 0.180485,
+          "copy_out_copy_lse_gpu_merge_ms": 0.193495
+        },
+        {
+          "suffix_rows": 1024,
+          "artifact_mb": 8.52,
+          "gpu_merge_ms": 0.006754,
+          "uva_out_uva_lse_merge_ms": 0.406289,
+          "copy_out_copy_lse_ms": 0.35817,
+          "copy_out_copy_lse_gpu_merge_ms": 0.373825
+        }
+      ],
+      "notes": "Explicit H2D artifact copy plus GPU merge is only marginally faster than UVA merge, so artifact-copy revival is not the next throughput lever."
+    },
+    {
+      "label": "llama-wrapper-metadata-skip-after-cleanup",
+      "kind": "microbenchmark",
+      "script": "David/Benchmarks/phase2/benchmark_hybrid_wrapper_attention.py",
+      "model_shape": {
+        "num_q_heads": 32,
+        "num_kv_heads": 8,
+        "head_dim": 128
+      },
+      "batch": 512,
+      "seq_len": 1024,
+      "dtype": "bfloat16",
+      "cases": [
+        {
+          "split_len": 960,
+          "suffix_fraction": 0.125,
+          "suffix_rows": 64,
+          "raw_full_fa_avg_ms": 2.32849,
+          "raw_prefix_lse_fa_avg_ms": 2.185616,
+          "coalesced_noop_suffix_avg_ms": 2.321708
+        },
+        {
+          "split_len": 960,
+          "suffix_fraction": 0.5,
+          "suffix_rows": 256,
+          "raw_full_fa_avg_ms": 2.326147,
+          "raw_prefix_lse_fa_avg_ms": 2.185499,
+          "coalesced_noop_suffix_avg_ms": 2.548385
+        }
+      ],
+      "notes": "After skipping unused prefix metadata allocation for precomputed-prefix calls, wrapper timings moved only slightly; cleanup is correct but not a throughput unlock."
+    },
+    {
+      "label": "llama-eager-0.80-total1024-split960-scheduler-budget-ab",
+      "kind": "e2e_ablation",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.8,
+      "enforce_eager": true,
+      "max_model_len": 1024,
+      "max_num_seqs": 512,
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 1024,
+      "split_blocks": 60,
+      "split_tokens": 960,
+      "cpu_kv_gb": 12,
+      "async_scheduling": false,
+      "prompt_mode": "shared",
+      "cases": [
+        {
+          "max_num_batched_tokens": 8192,
+          "gpu_only_out_tok_s": 2617.17,
+          "hybrid_out_tok_s": 2455.014,
+          "hybrid_vs_gpu": 0.938
+        },
+        {
+          "max_num_batched_tokens": 2048,
+          "gpu_only_out_tok_s": 2623.088,
+          "hybrid_out_tok_s": 2475.68,
+          "hybrid_vs_gpu": 0.944,
+          "gpu_only_effective_capacity": 22.98,
+          "hybrid_effective_capacity": 24.52
+        },
+        {
+          "max_num_batched_tokens": 1024,
+          "gpu_only_out_tok_s": 2600.561,
+          "hybrid_out_tok_s": 2430.475,
+          "hybrid_vs_gpu": 0.935,
+          "gpu_only_effective_capacity": 23.05,
+          "hybrid_effective_capacity": 24.58
+        }
+      ],
+      "notes": "Coarse max_num_batched_tokens tuning is too blunt: 2048 helps slightly but remains negative; 1024 hurts hybrid more."
+    }
   ]
 }

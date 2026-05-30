@@ -4398,6 +4398,110 @@ next throughput attempt should therefore target the active mixed prefix/LSE path
 or the scheduling pattern that creates large mixed prefix-row work, not another
 CPU suffix micro-optimization.
 
+## 2026-05-30 Follow-up: Coalesced Prefix and Wrapper-Tax Isolation
+
+The Llama total1024/split1008 one-block control was rerun as a matched A/B for
+the partial-hybrid prefix strategy:
+
+| Mode | Coalesced prefix | Out tok/s | vs matched GPU-only |
+|---|---:|---:|---:|
+| GPU-only | n/a | 2629.646 | 1.000x |
+| Hybrid split1008 | on | 2429.151 | 0.924x |
+| Hybrid split1008 | off | 2384.422 | 0.907x |
+
+This rules out the coalesced-prefix path as the source of the loss. It helps by
+about 1.9% relative to the older split prefix/suffix-row path, but the one-block
+hybrid case still loses about 7.6% to GPU-only while gaining only about 1.6%
+effective KV capacity.
+
+The raw FlashAttention LSE microbench also ruled out LSE materialization as the
+main tax. For the Llama shape (`B=512`, `Hq=32`, `Hkv=8`, `D=128`,
+`seq=1024`, `split=1008`), prefix out-only was `2.2892 ms`, while prefix+LSE
+was `2.2898 ms`.
+
+The no-op-suffix wrapper microbench is more explanatory. It replaces CPU suffix
+attention with a no-op and therefore measures the remaining mergeable hybrid
+prefix/control path:
+
+| Batch | Split | Active suffix rows | Raw full FA ms | Coalesced no-op hybrid ms | Capacity gain | Kernel-path tax |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 1008 | 64 | 2.328 | 2.437 | 1.6% | 4.7% |
+| 512 | 960 | 64 | 2.325 | 2.331 | 6.7% | 0.3% |
+| 512 | 1008 | 256 | 2.324 | 2.657 | 1.6% | 14.3% |
+| 512 | 960 | 256 | 2.331 | 2.552 | 6.7% | 9.5% |
+
+So the split960 no-op path can in principle beat the raw attention kernel when
+only a small fraction of rows are suffix-active, but it loses once the active
+suffix fraction rises. A stats-enabled split960 e2e run showed the real
+scheduler repeatedly enters the latter regime: representative 5-second windows
+had 288, 576, 608, 768, and 1024 suffix rows over 32 layer calls, plus occasional
+large mixed-prefix windows such as `43040` prefix rows with `576` suffix rows and
+`57760` prefix rows with `416` suffix rows. The instrumented run produced
+`2086.899 out tok/s`, so it is diagnostic rather than a throughput baseline.
+
+Updated policy implication: the planner cannot model hybrid as just
+`capacity_gain(split) - cpu_suffix_cost(split)`. It also needs an active-suffix
+mix term: the fraction and clustering of rows that have crossed the split while
+other rows remain prefix-only. Hybrid wins are plausible only when the saved GPU
+KV capacity is larger than the mergeable-prefix wrapper tax for the expected
+active-suffix mix. A useful next implementation attempt should reduce that tax
+for general mixed batches, or change scheduling so suffix-active rows are less
+interleaved with large prefix-only work.
+
+## 2026-05-30 Follow-up: Merge Artifacts and Scheduler-Budget Probe
+
+A focused merge benchmark was extended to parameterize the Llama shape and to
+compare direct UVA reads against explicit H2D artifact copy plus GPU-resident
+merge. For `Hq=32`, `D=128`, BF16 suffix output plus FP32 LSE:
+
+| Suffix rows | Artifact MB | UVA output+LSE merge ms | Copy artifacts + GPU merge ms | Delta |
+|---:|---:|---:|---:|---:|
+| 256 | 2.130 | 0.105 | 0.103 | -0.002 |
+| 512 | 4.260 | 0.205 | 0.193 | -0.011 |
+| 1024 | 8.520 | 0.406 | 0.374 | -0.032 |
+
+GPU-resident merge itself is nearly free (`0.003-0.007 ms` across these rows),
+but explicit copy still has to move the same artifact bytes over PCIe. The copy
+path is only marginally faster than UVA and does not explain or close the e2e
+gap. This supports leaving the deprecated explicit-copy runtime path deleted.
+
+A small implementation cleanup was made in `cots_hybrid_decode_attention`: when
+the coalesced-prefix path already provides precomputed prefix output/LSE, the
+suffix merge path now skips unused GPU prefix metadata (`gpu_block_table`
+`index_select`, `torch.arange` query lengths, and `torch.full` prefix lengths).
+Focused tests still pass:
+
+```text
+/opt/conda/envs/thesis/bin/python -m pytest \
+  /TTC/vllm/tests/kernels/attention/test_cots_hybrid_attention.py \
+  /TTC/vllm/tests/v1/worker/test_cots_hybrid_kv.py -q
+# 27 passed, 2 warnings
+```
+
+The cleanup is correct but not a throughput unlock. The wrapper microbench moved
+only slightly for the important split960 Llama shape:
+
+| Split | Active suffix rows | Before coalesced no-op ms | After coalesced no-op ms |
+|---:|---:|---:|---:|
+| 960 | 64 | 2.331 | 2.322 |
+| 960 | 256 | 2.552 | 2.548 |
+
+Finally, a coarse scheduler-budget probe tested whether limiting chunked-prefill
+work reduces the large mixed-prefix windows seen in the stats run. The knob helps
+only a little and is not a general win:
+
+| max_num_batched_tokens | GPU-only out tok/s | Hybrid split960 out tok/s | Hybrid/GPU |
+|---:|---:|---:|---:|
+| default 8192 | 2617.170 | 2455.014 | 0.938x |
+| 2048 | 2623.088 | 2475.680 | 0.944x |
+| 1024 | 2600.561 | 2430.475 | 0.935x |
+
+The 2048-token budget slightly improves hybrid, but 1024 slows it more than it
+helps. Coarse global prefill throttling is therefore too blunt. The policy lever
+that remains plausible is suffix-active-aware scheduling: avoid interleaving
+large prefix-only prefill chunks with suffix-active rows when the expected
+active-suffix mix makes the mergeable-prefix tax larger than the capacity gain.
+
 ## 2026-05-30 Follow-up: Planner Policy Hook Removed
 
 The profile-gated planner hook described above has been removed from
