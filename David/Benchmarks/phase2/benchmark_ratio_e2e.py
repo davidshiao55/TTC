@@ -17,14 +17,31 @@ import torch
 from vllm import LLM, SamplingParams, TokensPrompt
 
 
-def make_prompts(batch: int, prompt_len: int) -> list[TokensPrompt]:
+def make_prompts(
+    batch: int,
+    prompt_len: int,
+    *,
+    prompt_mode: str = "shared",
+) -> list[TokensPrompt]:
     if prompt_len <= 0:
         raise ValueError("prompt_len must be positive")
-    shared = [100] * max(prompt_len - 1, 0)
-    return [
-        TokensPrompt(prompt_token_ids=shared + [200 + idx])
-        for idx in range(batch)
-    ]
+    if prompt_mode == "shared":
+        shared = [100] * max(prompt_len - 1, 0)
+        return [
+            TokensPrompt(prompt_token_ids=shared + [200 + idx])
+            for idx in range(batch)
+        ]
+    if prompt_mode == "unique":
+        return [
+            TokensPrompt(
+                prompt_token_ids=[
+                    1000 + ((idx * 15485863 + pos * 32452843) % 30000)
+                    for pos in range(prompt_len)
+                ]
+            )
+            for idx in range(batch)
+        ]
+    raise ValueError(f"unknown prompt_mode: {prompt_mode}")
 
 
 def main() -> None:
@@ -33,11 +50,31 @@ def main() -> None:
     parser.add_argument("--split-tokens", type=int, required=True)
     parser.add_argument("--prompt-tokens", type=int)
     parser.add_argument("--total-tokens", type=int, default=640)
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        help="Override engine max_model_len for no-suffix split controls.",
+    )
     parser.add_argument("--batch", type=int, default=48)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.72)
     parser.add_argument("--cpu-pool-gb", type=float, default=4.0)
     parser.add_argument("--max-num-seqs", type=int)
     parser.add_argument("--max-num-batched-tokens", type=int)
+    parser.add_argument(
+        "--scheduler-reserve-full-isl",
+        choices=["auto", "true", "false"],
+        default="auto",
+    )
+    parser.add_argument(
+        "--enable-prefix-caching",
+        choices=["auto", "true", "false"],
+        default="auto",
+    )
+    parser.add_argument(
+        "--prompt-mode",
+        choices=["shared", "unique"],
+        default="shared",
+    )
     parser.add_argument("--log-iterations", action="store_true")
     parser.add_argument("--enable-log-stats", action="store_true")
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
@@ -48,6 +85,12 @@ def main() -> None:
     )
     parser.add_argument("--cots-f-cpu-store", type=float, default=0.0)
     parser.add_argument("--cots-f-prefetch", type=float, default=0.0)
+    parser.add_argument(
+        "--cots-auto-graph-split",
+        choices=["auto", "true", "false"],
+        default="auto",
+        help="Override COTS auto graph split policy for graph-mode A/B checks.",
+    )
     parser.add_argument("--cuda-profile-range", action="store_true")
     parser.add_argument(
         "--enforce-eager",
@@ -62,6 +105,8 @@ def main() -> None:
     )
     if args.total_tokens <= prompt_tokens_per_req:
         raise ValueError("total_tokens must be > prompt_tokens")
+    if args.max_model_len is not None and args.max_model_len < args.total_tokens:
+        raise ValueError("max_model_len must be >= total_tokens")
     if args.split_tokens < prompt_tokens_per_req:
         raise ValueError("split_tokens must be >= prompt_tokens")
     if args.split_tokens % 16 != 0:
@@ -71,7 +116,7 @@ def main() -> None:
     engine_kwargs = {
         "model": args.model,
         "dtype": "bfloat16",
-        "max_model_len": args.total_tokens,
+        "max_model_len": args.max_model_len or args.total_tokens,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "enforce_eager": args.enforce_eager == "true",
         "trust_remote_code": True,
@@ -84,6 +129,14 @@ def main() -> None:
         engine_kwargs["max_num_seqs"] = args.max_num_seqs
     if args.max_num_batched_tokens is not None:
         engine_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+    if args.scheduler_reserve_full_isl != "auto":
+        engine_kwargs["scheduler_reserve_full_isl"] = (
+            args.scheduler_reserve_full_isl == "true"
+        )
+    if args.enable_prefix_caching != "auto":
+        engine_kwargs["enable_prefix_caching"] = (
+            args.enable_prefix_caching == "true"
+        )
     if args.log_iterations:
         engine_kwargs["enable_logging_iteration_details"] = True
     if args.cots_f_cpu_store > 0.0 or args.cots_f_prefetch > 0.0:
@@ -91,6 +144,10 @@ def main() -> None:
             offload_backend="cots",
             cots_f_cpu_store=args.cots_f_cpu_store,
             cots_f_prefetch=args.cots_f_prefetch,
+        )
+    if args.cots_auto_graph_split != "auto":
+        engine_kwargs["cots_auto_graph_split"] = (
+            args.cots_auto_graph_split == "true"
         )
     if args.mode == "hybrid":
         engine_kwargs.update(
@@ -111,11 +168,19 @@ def main() -> None:
         ignore_eos=True,
     )
     llm.generate(
-        make_prompts(min(args.batch, 4), prompt_tokens_per_req),
+        make_prompts(
+            min(args.batch, 4),
+            prompt_tokens_per_req,
+            prompt_mode=args.prompt_mode,
+        ),
         warm_sampling,
         use_tqdm=False,
     )
-    prompts = make_prompts(args.batch, prompt_tokens_per_req)
+    prompts = make_prompts(
+        args.batch,
+        prompt_tokens_per_req,
+        prompt_mode=args.prompt_mode,
+    )
 
     if args.cuda_profile_range and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -132,13 +197,15 @@ def main() -> None:
     ratio = args.split_tokens / max_tokens
     print(
         "mode,batch,total_tokens,prompt_tokens_per_req,split_tokens,"
-        "suffix_tokens,ratio,elapsed_s,prompt_tokens,out_tokens,"
+        "suffix_tokens,ratio,prompt_mode,prefix_caching,elapsed_s,"
+        "prompt_tokens,out_tokens,"
         "out_tok_s,total_tok_s"
     )
     print(
         f"{args.mode},{args.batch},{args.total_tokens},"
         f"{prompt_tokens_per_req},{args.split_tokens},{max_tokens},"
-        f"{ratio:.3f},{elapsed:.6f},{prompt_tokens},{out_tokens},"
+        f"{ratio:.3f},{args.prompt_mode},{args.enable_prefix_caching},"
+        f"{elapsed:.6f},{prompt_tokens},{out_tokens},"
         f"{out_tokens / elapsed:.3f},"
         f"{(prompt_tokens + out_tokens) / elapsed:.3f}"
     )

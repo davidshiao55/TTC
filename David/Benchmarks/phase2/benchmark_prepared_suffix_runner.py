@@ -30,8 +30,8 @@ def _worker(args: argparse.Namespace) -> None:
     import torch
 
     from vllm._custom_ops import (
-        cots_qwen_bf16_scatter_suffix_kv,
-        cots_qwen_bf16_suffix_attention,
+        cots_gqa_bf16_scatter_suffix_kv,
+        cots_gqa_bf16_suffix_attention,
     )
     from vllm.v1.attention.backends.cots_hybrid_attention import (
         CotsPreparedNativeSuffixAttentionRunner,
@@ -48,15 +48,28 @@ def _worker(args: argparse.Namespace) -> None:
 
     torch.manual_seed(args.seed)
     block_size = args.block_size
+    if args.model_shape == "qwen2.5-7b":
+        num_q_heads, num_kv_heads, head_dim = 28, 4, 128
+        if args.layers is None:
+            args.layers = 28
+    elif args.model_shape == "llama3-8b":
+        num_q_heads, num_kv_heads, head_dim = 32, 8, 128
+        if args.layers is None:
+            args.layers = 32
+    else:
+        raise SystemExit(f"unknown model shape: {args.model_shape}")
     max_blocks = math.ceil(args.seq_len / block_size)
     num_blocks = args.batch * max_blocks
-    scale = 128**-0.5
+    scale = head_dim**-0.5
     pin = bool(args.pin_inputs)
+    total_heads = num_q_heads + 2 * num_kv_heads
 
-    qkv = torch.randn(args.batch, 36, 128, dtype=torch.bfloat16, pin_memory=pin)
-    query = qkv[:, :28, :]
-    key_src = qkv[:, 28:32, :]
-    value_src = qkv[:, 32:36, :]
+    qkv = torch.randn(
+        args.batch, total_heads, head_dim, dtype=torch.bfloat16, pin_memory=pin
+    )
+    query = qkv[:, :num_q_heads, :]
+    key_src = qkv[:, num_q_heads : num_q_heads + num_kv_heads, :]
+    value_src = qkv[:, num_q_heads + num_kv_heads :, :]
     block_table = torch.arange(
         num_blocks, dtype=torch.int32, pin_memory=pin
     ).reshape(args.batch, max_blocks)
@@ -77,20 +90,20 @@ def _worker(args: argparse.Namespace) -> None:
     output_lses = []
     for _ in range(args.layers):
         key_cache = torch.randn(
-            num_blocks, 4, block_size, 128, dtype=torch.bfloat16, pin_memory=pin
+            num_blocks, num_kv_heads, block_size, head_dim, dtype=torch.bfloat16, pin_memory=pin
         )
         value_cache = torch.randn_like(key_cache)
         key_caches.append(key_cache)
         value_caches.append(value_cache)
         outputs.append(torch.empty_like(query, pin_memory=pin))
         output_lses.append(
-            torch.empty(28, args.batch, dtype=torch.float32, pin_memory=pin)
+            torch.empty(num_q_heads, args.batch, dtype=torch.float32, pin_memory=pin)
         )
 
     def run_direct(scatter: bool) -> None:
         for layer_idx in range(args.layers):
             if scatter:
-                cots_qwen_bf16_scatter_suffix_kv(
+                cots_gqa_bf16_scatter_suffix_kv(
                     key_src,
                     value_src,
                     scatter_block_ids,
@@ -98,7 +111,7 @@ def _worker(args: argparse.Namespace) -> None:
                     key_caches[layer_idx],
                     value_caches[layer_idx],
                 )
-            cots_qwen_bf16_suffix_attention(
+            cots_gqa_bf16_suffix_attention(
                 query=query,
                 key_cache=key_caches[layer_idx],
                 value_cache=value_caches[layer_idx],
@@ -116,7 +129,7 @@ def _worker(args: argparse.Namespace) -> None:
         runner: CotsPreparedNativeSuffixAttentionRunner, scatter: bool, sync: bool = True
     ) -> None:
         for layer_idx in range(args.layers):
-            runner.run_qwen_bf16_suffix_attention(
+            runner.run_gqa_bf16_suffix_attention(
                 query=query,
                 key_cache=key_caches[layer_idx],
                 value_cache=value_caches[layer_idx],
@@ -130,6 +143,7 @@ def _worker(args: argparse.Namespace) -> None:
                 scatter_block_ids=scatter_block_ids if scatter else None,
                 scatter_block_offsets=scatter_block_offsets if scatter else None,
                 scatter_from_qkv=scatter,
+                snapshot_inputs=not args.no_snapshot_inputs,
             )
         if sync:
             torch.cuda.synchronize()
@@ -146,14 +160,17 @@ def _worker(args: argparse.Namespace) -> None:
         mean_ms = statistics.mean(times_ms)
         p90_ms = statistics.quantiles(times_ms, n=10)[8] if len(times_ms) >= 10 else max(times_ms)
         print(
-            "mode,batch,seq_len,layers,threads,pin_inputs,mean_ms,median_ms,p90_ms,"
-            "median_us_per_layer"
+            "mode,model_shape,batch,seq_len,layers,threads,pin_inputs,"
+            "num_q_heads,num_kv_heads,head_dim,mean_ms,median_ms,p90_ms,"
+            "median_us_per_layer,out_tok_s"
         ) if not getattr(measure, "_printed_header", False) else None
         measure._printed_header = True
         print(
-            f"{label},{args.batch},{args.seq_len},{args.layers},{args.threads},"
-            f"{int(pin)},{mean_ms:.3f},{median_ms:.3f},{p90_ms:.3f},"
-            f"{median_ms * 1000.0 / args.layers:.3f}"
+            f"{label},{args.model_shape},{args.batch},{args.seq_len},"
+            f"{args.layers},{args.threads},{int(pin)},{num_q_heads},"
+            f"{num_kv_heads},{head_dim},{mean_ms:.3f},{median_ms:.3f},"
+            f"{p90_ms:.3f},{median_ms * 1000.0 / args.layers:.3f},"
+            f"{args.batch * args.layers / (median_ms / 1000.0):.3f}"
         )
         return mean_ms, median_ms, p90_ms, min(times_ms)
 
@@ -195,11 +212,15 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=256)
     parser.add_argument("--seq-len", type=int, default=160)
     parser.add_argument("--block-size", type=int, default=16)
-    parser.add_argument("--layers", type=int, default=28)
+    parser.add_argument("--layers", type=int)
     parser.add_argument("--threads", type=int, default=24)
+    parser.add_argument(
+        "--model-shape", choices=["qwen2.5-7b", "llama3-8b"], default="qwen2.5-7b"
+    )
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--repeat", type=int, default=20)
     parser.add_argument("--pin-inputs", action="store_true")
+    parser.add_argument("--no-snapshot-inputs", action="store_true")
     parser.add_argument(
         "--modes",
         default="direct,direct_scatter,prepared,prepared_scatter,graph_prepared_scatter",

@@ -41,7 +41,7 @@ def _worker(args: argparse.Namespace) -> None:
 
     import torch
 
-    from vllm._custom_ops import cots_qwen_bf16_suffix_attention
+    from vllm._custom_ops import cots_gqa_bf16_suffix_attention
 
     torch.set_num_threads(args.threads)
     try:
@@ -51,10 +51,16 @@ def _worker(args: argparse.Namespace) -> None:
 
     torch.manual_seed(2031)
     block_size = args.block_size
+    if args.model_shape == "qwen2.5-7b":
+        num_q_heads, num_kv_heads, head_dim = 28, 4, 128
+    elif args.model_shape == "llama3-8b":
+        num_q_heads, num_kv_heads, head_dim = 32, 8, 128
+    else:
+        raise SystemExit(f"unknown model shape: {args.model_shape}")
     max_blocks = math.ceil(args.seq_len / block_size)
     num_blocks = args.batch * max_blocks
 
-    query = torch.randn(args.batch, 28, 128, dtype=torch.bfloat16)
+    query = torch.randn(args.batch, num_q_heads, head_dim, dtype=torch.bfloat16)
     if args.pin_inputs:
         query = query.pin_memory()
     key_caches = []
@@ -62,9 +68,9 @@ def _worker(args: argparse.Namespace) -> None:
     for _ in range(args.layers):
         key_cache = torch.empty(
             num_blocks,
-            4,
+            num_kv_heads,
             block_size,
-            128,
+            head_dim,
             dtype=torch.bfloat16,
             pin_memory=args.pin_inputs,
         )
@@ -91,14 +97,14 @@ def _worker(args: argparse.Namespace) -> None:
         for _ in range(args.layers)
     ]
     output_lses = [
-        torch.empty(28, args.batch, dtype=torch.float32, pin_memory=args.pin_inputs)
+        torch.empty(num_q_heads, args.batch, dtype=torch.float32, pin_memory=args.pin_inputs)
         for _ in range(args.layers)
     ]
-    scale = 128**-0.5
+    scale = head_dim**-0.5
 
     def run_once() -> None:
         for layer_idx in range(args.layers):
-            cots_qwen_bf16_suffix_attention(
+            cots_gqa_bf16_suffix_attention(
                 query=query,
                 key_cache=key_caches[layer_idx],
                 value_cache=value_caches[layer_idx],
@@ -124,8 +130,8 @@ def _worker(args: argparse.Namespace) -> None:
         times_ms
     )
     print(
-        f"threads={args.threads},batch={args.batch},seq={args.seq_len},"
-        f"layers={args.layers},pin_inputs={int(args.pin_inputs)},"
+        f"threads={args.threads},model_shape={args.model_shape},batch={args.batch},"
+        f"seq={args.seq_len},layers={args.layers},pin_inputs={int(args.pin_inputs)},"
         f"madvise_hugepage={int(args.madvise_hugepage)},"
         f"mean_ms={mean_ms:.3f},"
         f"median_ms={median_ms:.3f},p90_ms={p90_ms:.3f},"
@@ -142,6 +148,9 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--repeat", type=int, default=20)
     parser.add_argument("--threads-list", default="4,8,12,16,20,24,28,32")
+    parser.add_argument(
+        "--model-shape", choices=["qwen2.5-7b", "llama3-8b"], default="qwen2.5-7b"
+    )
     parser.add_argument("--threads", type=int)
     parser.add_argument("--pin-inputs", action="store_true")
     parser.add_argument("--layers", type=int, default=1)
@@ -168,6 +177,8 @@ def main() -> None:
             str(args.seq_len),
             "--block-size",
             str(args.block_size),
+            "--model-shape",
+            args.model_shape,
             "--warmup",
             str(args.warmup),
             "--repeat",

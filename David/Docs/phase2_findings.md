@@ -12,7 +12,9 @@ Supported thesis envelope for this pass:
 
 - Single GPU, decoder-only, full attention.
 - BF16 model dtype and BF16 KV dtype.
-- Qwen2.5-7B BF16 attention shape: 28 query heads, 4 KV heads, head size 128.
+- Generic GQA BF16 attention shapes with head size 128 and
+  `num_query_heads / num_kv_heads <= 8`; validated for Qwen2.5-7B
+  (`28q/4kv`) and Llama3.1-8B (`32q/8kv`).
 - Static block-aligned split:
   - GPU owns global blocks below `cots_kv_split_blocks`.
   - CPU owns global blocks at and above `cots_kv_split_blocks`, with suffix-local block tables passed to the CPU runner.
@@ -27,7 +29,7 @@ Supported thesis envelope for this pass:
 - Eager and COTS piecewise graph modes are both functional for decode. Hybrid KV forces the same split-graph policy used by COTS CPU runtime work.
 - Native vLLM `kv_offload`, KV transfer/connectors, non-single-GPU modes, encoder-decoder models, non-BF16 model/KV dtype, and async scheduling are rejected at startup with clear diagnostics.
 
-Deliberately not in Phase 2: CPU-aware admission, planner split selection, dynamic promotion/eviction, GPU tail fallback, native vLLM KV-offload integration, CPU-produced QKV direct handoff from Phase 1, model-general CPU suffix kernels, and graph-captured suffix-prefill overflow buckets.
+Deliberately not in Phase 2: CPU-aware admission, planner split selection, dynamic promotion/eviction, GPU tail fallback, native vLLM KV-offload integration, CPU-produced QKV direct handoff from Phase 1, non-BF16/non-128-head-dim CPU suffix kernels, and graph-captured suffix-prefill overflow buckets.
 
 ## Optimizations Landed In This Pass
 
@@ -35,26 +37,29 @@ Deliberately not in Phase 2: CPU-aware admission, planner split selection, dynam
 - CPU value staging was fixed to use pinned memory. The earlier `empty_like`
   allocation silently produced non-pinned memory and disabled async K/V staging.
 - Q/K/V staging now uses one shared D2H stream/event.
-- Qwen-style Q/K/V tensors are staged through one combined contiguous
-  `[B, 36, 128]` D2H copy when their storage layout allows it.
+- GQA Q/K/V tensors are staged through one combined contiguous
+  `[B, num_query_heads + 2 * num_kv_heads, 128]` D2H copy when their
+  storage layout allows it.
 - Suffix slot masking has a CPU-position fast path for all-prefix/all-suffix
   decode steps.
 - All-active CPU suffix K/V scatter now uses a thesis-owned C++ memcpy fast
   path instead of PyTorch advanced indexing.
-- CPU suffix attention now pre-converts each task's 7 BF16 query heads to FP32
-  once and reuses them across suffix tokens, avoiding repeated BF16 upcasts in
+- CPU suffix attention now pre-converts each task's query-head group to FP32
+  once and reuses it across suffix tokens, avoiding repeated BF16 upcasts in
   the dot-product loop.
 - CPU suffix attention now vectorizes the final FP32-to-BF16 output store with
   AVX2 integer operations while preserving round-to-nearest-even conversion.
 - CPU suffix attention now processes QK logits two suffix tokens at a time
-  within each cache block, reusing the 7 FP32 query-head vectors across both
-  tokens. This is a small parity-safe form of the same tiling idea used in
+  within each cache block, reusing the per-KV-group FP32 query-head vectors
+  across both tokens. This is a small parity-safe form of the same tiling idea used in
   NEO's ISPC CPU attention path, adapted to the COTS BF16/AVX2 kernel.
 - Prepared native suffix attention tasks can now scatter current-token K/V
-  directly from the staged `[B, 36, 128]` QKV artifact before running CPU suffix
+  directly from the staged generic GQA QKV artifact before running CPU suffix
   attention. This removes the Python-side `_finish_staged_kv_cache_update` from
   the native-prepared path and is the first graph-substrate step for suffix KV
   update plus CPU attention in one stream-ordered host callback.
+- The CPU suffix attention and scatter custom ops now use generic GQA naming;
+  the old Qwen-named custom-op and runner entry points were removed.
 - Added `benchmark_prepared_suffix_runner.py` to measure direct,
   direct-scatter, eager-prepared, eager-prepared-scatter, and CUDA-graph replay
   prepared-scatter variants at the suffix-runner boundary.
@@ -1750,8 +1755,9 @@ Supported now:
   or after `x` run the hybrid GPU-prefix + CPU-suffix merge.
 
 The native suffix attention kernel did not need a new multi-query kernel for
-this pass. It already accepts a batch of independent `[28, 128]` query rows, so
-prefill rows are flattened into that batch.
+this pass. At this point it accepted a batch of independent `[28, 128]` query
+rows, so prefill rows were flattened into that batch. This is now superseded by
+the generic GQA kernel noted in the current contract.
 
 Graph note: decode graph buckets remain on the existing fixed task IDs. If a
 row-expanded prefill batch exceeds the decode batch staging capacity, it uses a
@@ -1761,7 +1767,9 @@ decode stable while making CPU suffix prefill functionally correct first.
 Still unsupported by design in this pass:
 
 - CUDA graph capture/replay for row-expanded suffix prefill overflow tasks.
-- Any model shape other than the existing Qwen2.5-7B BF16 suffix kernel shape.
+- At this point in the chronology, any model shape other than the then-current
+  Qwen2.5-7B BF16 suffix kernel shape. This is now superseded by the generic
+  GQA kernel noted in the current contract.
 
 Validation after adding CPU suffix prefill:
 
@@ -2029,7 +2037,7 @@ capture keeps the old main-stream path for now.
 Implementation kept:
 
 - `CotsHybridDecodeMetadata` now carries an optional `suffix_submit_stream`.
-- `CotsPreparedNativeSuffixAttentionRunner.run_qwen_bf16_suffix_attention()` can
+- `CotsPreparedNativeSuffixAttentionRunner.run_gqa_bf16_suffix_attention()` can
   submit on that stream and sync on the caller stream.
 - The side-stream path is gated by `not torch.cuda.is_current_stream_capturing()`
   so graph behavior is unchanged.
@@ -2303,3 +2311,2025 @@ Takeaway: split672 is not intrinsically bad. It was bad for prompt608 because
 the split was beyond the shared prefix and consumed too many unique GPU KV
 blocks per request before CPU KV helped. For a prompt/shared-prefix length near
 672, the same split becomes viable and narrowly throughput-positive.
+
+
+## 2026-05-28 Follow-up: Generic GQA Naming and Llama Throughput Check
+
+The Phase 2 CPU suffix kernel is now shape-parameterized for GQA models with
+BF16 KV, head size 128, and up to eight query heads per KV head. The public
+custom-op and runner names use `gqa_bf16` / `run_gqa_bf16_suffix_attention`;
+the old `qwen_bf16` compatibility entry points were removed. Focused coverage
+validates both Qwen2.5-7B (`28q/4kv`) and Llama3.1-8B (`32q/8kv`) shapes.
+
+Isolated prepared-suffix runner benchmark, B256/suffix160/24 threads:
+
+| Model shape | Mode | Median ms/layer | Synthetic layer tok/s |
+|---|---|---:|---:|
+| Qwen2.5-7B | direct | 2.084 | 122846 |
+| Qwen2.5-7B | prepared_scatter | 2.525 | 101379 |
+| Llama3.1-8B | direct | 3.854 | 66416 |
+| Llama3.1-8B | prepared_scatter | 4.767 | 53706 |
+
+Llama E2E throughput probe, `meta-llama/Llama-3.1-8B-Instruct`, B512,
+prompt608/total768, `max_num_seqs=512`, eager, async scheduling disabled,
+`gpu_memory_utilization=0.80`, CPU pool 12 GiB:
+
+| Mode | Split | CPU suffix blocks/CPU-tier request | Effective capacity | Out tok/s |
+|---|---:|---:|---:|---:|
+| GPU-only | n/a | n/a | 30.23x | 3771.986, 3733.769 |
+| Hybrid selective | 608 | 10 | 38.18x | 3234.531 |
+| Hybrid selective | 672 | 6 | 34.55x | 3544.703 |
+| Hybrid selective | 704 | 4 | 32.98x | 3761.551 |
+| Hybrid selective | 736 | 2 | 31.54x | 3792.670 |
+| Hybrid selective | 752 | 1 | 30.87x | 3804.750, 3806.259 |
+
+At `gpu_memory_utilization=0.75`, Llama is more KV-limited than at `0.80`: GPU
+KV cache drops to 13,520 tokens and GPU-only concurrency drops to 17.60x. The
+hybrid result is worse at every tested split:
+
+| Mode | Split | CPU suffix blocks/CPU-tier request | Effective capacity | Out tok/s |
+|---|---:|---:|---:|---:|
+| GPU-only | n/a | n/a | 17.60x | 3052.701 |
+| Hybrid selective | 608 | 10 | 22.24x | 2218.756 |
+| Hybrid selective | 672 | 6 | 20.12x | 2420.745 |
+| Hybrid selective | 704 | 4 | 19.20x | 2423.891 |
+| Hybrid selective | 736 | 2 | 18.37x | 2438.079 |
+| Hybrid selective | 752 | 1 | 17.98x | 2447.293 |
+
+At `gpu_memory_utilization=0.68`, Llama GPU-only could not allocate any KV
+blocks after loading 14.99 GiB of weights, so the Qwen tight-memory setting is
+not a matched Llama comparison point.
+
+A diagnostic split752 rerun with iteration logging showed the main decode plateau
+at `73` generation requests. In other words, the current scheduler/placement did
+not turn the one-block CPU suffix into a larger active decode batch at this
+setting; the run mostly keeps the lower GPU-limited batch size and adds hybrid
+attention/suffix machinery plus a long tail. This is why the naive capacity
+intuition does not show up in throughput.
+
+Takeaway: the Llama model has higher KV-capacity pressure, but it also makes the
+CPU suffix kernel much heavier. In this harness, Llama only ties/wins at `0.80`
+when the split is almost at the tail and the run is near the GPU-only behavior.
+At `0.75`, the current scheduler does not realize enough extra active decode
+capacity to pay for even the one-block hybrid path. Treat this as a
+scheduler/placement limitation plus CPU-suffix overhead, not a general proof
+that CPU KV becomes less useful under tighter memory.
+
+
+## 2026-05-28 Follow-up: Position-Based Hybrid KV Split
+
+The selective request-tier placement described above is now superseded. The old
+policy classified whole requests as either full-GPU or CPU-suffix and tried the
+full-GPU path first when it fit. That made split752 diagnostics misleading: a
+sequence that had not physically crossed the split could be treated as a
+permanent full-GPU request, so `COTS CPU KV blocks` and hybrid decode calls could
+remain zero even in a nominal hybrid run.
+
+The current Phase 2 invariant is purely position-based:
+
+```text
+gpu_tokens(seq_len) = min(seq_len, split_x)
+cpu_tokens(seq_len) = max(seq_len - split_x, 0)
+```
+
+There is no `full_gpu_req_ids` / `cpu_suffix_req_ids` state and no full-GPU
+fallback. The scheduler still grows KV incrementally like normal vLLM decode:
+CPU KV is not allocated just because `prompt_tokens + max_tokens` could exceed
+the split. CPU suffix blocks appear only when the actual sequence length crosses
+`split_x`. The default full-input-length admission check remains split-aware for
+chunked prefill, but possible future decode length is not hard-reserved.
+
+Focused unit coverage now checks the intended behavior:
+
+- `len < split_x`: GPU prefix blocks only; CPU suffix blocks are absent.
+- `len == split_x`: still GPU-only; CPU suffix blocks are absent.
+- `len > split_x`: GPU prefix remains capped at the split and new suffix blocks
+  are allocated from the CPU pool.
+- A prompt/cache hit beyond the split is recovered as GPU prefix cache plus CPU
+  suffix cache, not as a full-GPU request.
+
+This means the Llama 0.75/0.80 throughput tables above should be read as
+measurements of the old selective policy. They are still useful for diagnosing
+why the old results were confusing, but they are not final evidence for the
+position-based hybrid KV mechanism.
+
+
+Corrected Llama B512 reruns with the position-based split, same
+`meta-llama/Llama-3.1-8B-Instruct`, prompt608/total768, `max_num_seqs=512`,
+eager, async scheduling disabled, CPU pool 12 GiB:
+
+| GPU util | Mode | Split | Effective capacity | Out tok/s |
+|---:|---|---:|---:|---:|
+| 0.75 | GPU-only | n/a | 17.54x | 3031.053 |
+| 0.75 | Position split hybrid | 608 | 22.16x | 1305.255 |
+| 0.75 | Position split hybrid | 672 | 20.05x | 1750.865 |
+| 0.75 | Position split hybrid | 704 | 19.14x | 2102.140 |
+| 0.75 | Position split hybrid | 736 | 18.30x | 2501.148 |
+| 0.75 | Position split hybrid | 752 | 17.91x | 2657.276 |
+| 0.80 | GPU-only | n/a | 30.15x | 3748.958 |
+| 0.80 | Position split hybrid | 608 | 38.08x | 1301.455 |
+| 0.80 | Position split hybrid | 672 | 34.45x | 2032.684 |
+| 0.80 | Position split hybrid | 704 | 32.89x | 2460.390 |
+| 0.80 | Position split hybrid | 736 | 31.46x | 3138.812 |
+| 0.80 | Position split hybrid | 752 | 30.79x | 3301.310 |
+
+The activation sanity check for 0.75/split752 confirmed the intended path is now
+active: the stats log reported `COTS CPU KV blocks: 53/6144` and
+`COTS hybrid decode calls: 32`. That run was stats-enabled and produced
+`2641.683 out tok/s`, close to the no-stats `2657.276` throughput point.
+
+Conclusion: correcting the placement semantics resolves the diagnostic mystery
+but removes the old apparent 0.80 near-tail tie. Llama still loses to matched
+GPU-only in this prompt608/total768 harness. The best corrected split is 752 at
+both memory points, but it remains about `12%` below GPU-only. The current
+limiting factor is no longer inactive CPU KV; it is the cost of the CPU suffix
+path and merge relative to the small one-block capacity benefit.
+
+
+## 2026-05-28 Follow-up: Llama Performance Gap Investigation
+
+The next investigation separated three possible causes of the Llama gap:
+
+- CPU suffix compute itself.
+- Per-step Python/metadata overhead before any request crosses the split.
+- Mixed-row hybrid attention overhead once only some decode rows have suffix KV.
+
+Stats-enabled Llama 0.80/split752 runs showed that CPU suffix compute is not the
+dominant cost near the tail split. During active suffix intervals, the log showed
+small accumulated CPU attention time, e.g. `COTS CPU wait/read/attn:
+0.000/0.057/1.811 ms` over a two-second stats window with 32 hybrid decode
+calls. The larger problem was overhead around the hybrid path.
+
+One concrete overhead was fixed in `GPUModelRunner._build_attention_metadata`.
+Before the fix, Phase 2 built COTS hybrid decode metadata once per layer on every
+decode step, even when all scheduled token positions were still below `split_x`.
+For Llama this meant 32 repeated Python scans through the same pre-split rows for
+most of the run. The runner now precomputes whether the current step contains
+any suffix positions and skips per-layer COTS metadata construction until at
+least one scheduled token has `position >= split_x`.
+
+Post-fix throughput:
+
+| Setting | Before | After | Matched GPU-only | Outcome |
+|---|---:|---:|---:|---|
+| 0.80, split752, B512 | 3301.310 | 3429.256 | 3748.958 | still -8.5% |
+| 0.80, split736, B512 | 3138.812 | 3250.544 | 3748.958 | still loses |
+| 0.75, split752, B512 | 2657.276 | 2726.125 | 3031.053 | still -10.1% |
+| 0.72, split752, B512 | n/a | 1933.718 | 2272.196 | still loses |
+| 0.72, split736, B512 | n/a | 1838.233 | 2272.196 | still loses |
+| 0.80, split752, B1024 | n/a | 3312.744 | 3717.366 | still loses |
+| 0.80, split752, B512, graph | n/a | 3210.254 | 3748.958 | worse than eager |
+
+The metadata short-circuit is a real improvement, especially at 0.80/split752,
+but it is not enough to produce a Llama throughput win. Lowering GPU memory to
+0.72 did not reveal a hidden cliff win; both split736 and split752 still trail
+GPU-only. CUDA graph mode also did not help in this configuration because graph
+memory reduced available KV capacity and throughput fell below the eager hybrid
+run.
+
+Current conclusion: the existing Phase 2 Llama path does not yet achieve a
+robust throughput win for prompt608/total768. Near-tail splits provide only a
+small capacity increase (`768 / 752 = 1.021x` for split752), so even modest
+hybrid overhead erases the benefit. Wider CPU suffixes increase capacity more,
+but the mixed hybrid path becomes too expensive.
+
+The next credible optimization target is the mixed-row decode path in
+`flash_attn.py`: today, a partially hybrid batch runs separate GPU prefix work
+for prefix-only rows and suffix rows, then CPU suffix attention plus online
+softmax merge for suffix rows. A better implementation would keep GPU prefix
+attention coalesced for all rows, then run CPU suffix attention and merge only
+for the suffix subset. A scheduler-level alternative is to group suffix-active
+rows away from prefix-only rows, but that is a larger policy change and should
+come after the lower-level mixed-row overhead is measured.
+
+
+## 2026-05-28 Follow-up: Active Split GPU Path Isolation
+
+A targeted mixed-row diagnostic was added after the metadata short-circuit. The
+new counters separate the partial hybrid path into:
+
+- suffix-active hybrid decode calls,
+- prefix-only rows inside mixed batches,
+- suffix rows inside mixed batches,
+- GPU time and wall time for the mixed prefix-only path.
+
+The Llama 0.80/split752 timing probe confirmed that the active split slowdown is
+mostly not CPU suffix compute. In active intervals, CPU suffix attention was
+usually around `1.7-2.6 ms` per stats window, while the mixed prefix-only GPU
+path was much larger: about `7.8-22.6 ms` GPU time and `19.7-58.8 ms` wall time
+across the same 32 layer calls. This is exactly the split-weight-style failure
+mode we suspected: once the split is active, the GPU path is no longer the same
+as GPU-only.
+
+An env-gated prototype, `VLLM_COTS_HYBRID_COALESCED_PREFIX=1`, then replaced the
+partial mixed path with one coalesced GPU prefix FlashAttention call over all
+rows and reused those prefix states for CPU-suffix merge. This removes the extra
+prefix-only FlashAttention launch and avoids recomputing GPU prefix states for
+suffix rows.
+
+Throughput result, Llama 0.80/split752, B512, eager:
+
+| Mode | Out tok/s | Notes |
+|---|---:|---|
+| GPU-only | 3748.958 | matched baseline |
+| Hybrid split752, metadata short-circuit | 3429.256 | current default hybrid |
+| Hybrid split752, coalesced prefix prototype | 3445.185 | +0.5% over default hybrid |
+
+The coalesced prototype is correct enough to run the benchmark, but it does not
+recover the missing throughput. Timed coalesced runs still showed about
+`8-10 ms` GPU prefix time per active 32-layer stats window, while CPU suffix
+attention stayed around `1.6-1.8 ms`. The remaining overhead is therefore not the
+second prefix-only launch alone. It is the active split GPU prefix semantics:
+materializing prefix output plus LSE for online-softmax merge, capping suffix rows
+at `split_x`, and the associated tensor/indexing work around that path.
+
+Current conclusion: for Llama prompt608/total768, Phase 2 is not blocked by CPU
+suffix arithmetic. It is blocked by the GPU-side cost of making the split
+mergeable. A real win likely requires a lower-level attention primitive that
+returns/merges prefix LSE with less overhead, or a design that avoids online
+softmax merge for the common near-tail case. The env-gated coalesced-prefix path
+is useful as a diagnostic upper-bound attempt, but not yet a production fix.
+
+
+## 2026-05-28 Follow-up: FlashAttention LSE Microbenchmark
+
+The active split investigation suggested that the GPU prefix path was expensive
+once it had to produce mergeable online-softmax state. To isolate that, a focused
+FlashAttention microbenchmark was added:
+
+```text
+David/Benchmarks/phase2/benchmark_flash_attn_lse.py
+```
+
+It uses the same paged-cache layout as vLLM FlashAttention and Llama-shaped
+decode tensors: `Hq=32`, `Hkv=8`, `D=128`, BF16, block size 16. The sweep compares
+normal output-only decode against output+LSE variants, with both `num_splits=0`
+(normal eager heuristic) and `num_splits=1` (the original Phase 2 suffix-prefix
+path).
+
+Representative B512 results:
+
+| Case | KV len | return LSE | out buffer | num_splits | Avg ms |
+|---|---:|---:|---:|---:|---:|
+| full_out_only_s0 | 768 | no | yes | 0 | 1.7606 |
+| full_lse_out_s0 | 768 | yes | yes | 0 | 1.7601 |
+| prefix_out_only_s0 | 752 | no | yes | 0 | 1.7254 |
+| prefix_lse_out_s0 | 752 | yes | yes | 0 | 1.7250 |
+| prefix_lse_alloc_s0 | 752 | yes | no | 0 | 1.7253 |
+| prefix_out_only_s1 | 752 | no | yes | 1 | 1.7248 |
+| prefix_lse_out_s1 | 752 | yes | yes | 1 | 1.7248 |
+| prefix_lse_alloc_s1 | 752 | yes | no | 1 | 1.7253 |
+
+The same pattern held across B64/B128/B192/B256/B512: returning LSE did not
+measurably slow the raw FlashAttention kernel for these decode shapes, and
+`num_splits=1` was not meaningfully worse than the normal `num_splits=0` path.
+
+Updated conclusion: the remaining Llama gap is not explained by raw FA
+`return_softmax_lse=True` overhead. The slowdown is in the composed active-split
+path around the kernel: suffix Q/K/V staging, CPU/GPU handoff, UVA artifact reads,
+merge, extra tensor/indexing work, and scheduler wave effects from tiny near-tail
+capacity gains. The next diagnostic should therefore be a no-CPU/dummy-suffix
+hybrid path that keeps the same GPU prefix+merge orchestration but replaces CPU
+suffix attention/artifact movement with synthetic GPU-resident suffix states. If
+that still loses, the orchestration/merge path is the issue; if it recovers, the
+CPU artifact handoff is the issue.
+
+## 2026-05-28 Follow-up: Dummy-Suffix Dry Run
+
+A diagnostic dummy-suffix mode was added for the active split path:
+
+```text
+VLLM_COTS_HYBRID_DUMMY_SUFFIX=gpu|cpu|prefix_only
+```
+
+This is deliberately not a correctness mode. It keeps the hybrid scheduler,
+position-based split metadata, and GPU prefix attention. The `gpu` variant
+supplies neutral GPU-resident suffix state (`lse=-inf`) and still runs
+`merge_attn_states`; the `cpu` variant fills the existing pinned CPU suffix
+artifact buffers with neutral state and exposes them back through UVA; the
+`prefix_only` variant writes prefix FlashAttention output directly and returns
+before suffix state construction or online-softmax merge. This separates CPU
+suffix arithmetic, UVA artifact consumption, mixed-row prefix work, and merge
+cost.
+
+Same-session Llama3.1-8B B512 reruns used `prompt608/total768/split752`,
+`gpu_memory_utilization=0.80`, `max_num_seqs=512`, eager mode, async scheduling
+disabled, and a 12 GiB CPU KV pool:
+
+| Mode | Out tok/s | Interpretation |
+|---|---:|---|
+| GPU-only | 3742.012 | matched baseline for this session |
+| Default hybrid split752 | 3513.954 | real CPU suffix path |
+| Hybrid split752 + dummy GPU suffix | 3557.424 | no CPU suffix compute, no UVA artifact read, still merges |
+| Hybrid split752 + dummy CPU/UVA suffix | 3579.364 | no CPU suffix compute, keeps pinned CPU artifact read and merge |
+| Hybrid split752 + prefix-only skip-merge | 3503.148 | removes merge for suffix rows, but keeps separate mixed-row prefix path |
+| Coalesced-prefix + dummy CPU/UVA suffix | 3510.162 | coalescing alone did not provide an upper-bound win |
+| Coalesced-prefix + dummy GPU suffix | 3538.466 | merge remains expensive even without CPU/UVA artifact state |
+| Coalesced-prefix + prefix-only skip-merge | 3662.878 | removes both mixed-row extra prefix work and merge |
+
+The first dummy suffixes recovered only about `+1.2-1.9%` over default hybrid,
+while the remaining gap to GPU-only stayed around `4.3-4.9%`. The CPU/UVA dummy
+being slightly faster than the GPU dummy is within noise and argues against UVA
+artifact reads as the primary bottleneck. The stronger signal is the coalesced
+prefix-only run: once the mixed-row prefix path and merge are both removed, the
+active split path rises to `3662.878 out tok/s`, only about `2.1%` below the
+matched GPU-only run.
+
+Updated diagnosis: the Llama split752 gap is a composition problem, not a CPU
+suffix arithmetic problem. The default partial path pays for separate mixed-row
+prefix work, and the merge/suffix-state path costs enough that the tiny near-tail
+capacity gain (`30.15x -> 30.79x`, about `+2.1%`) cannot win. A real fix should
+therefore either avoid the online-softmax merge for near-tail splits, make the
+coalesced-prefix path production-quality and reduce merge/suffix-state overhead,
+or have the planner choose only split points/workloads where CPU KV increases
+active batch by much more than this overhead.
+
+Coalesced-prefix plus prefix-only split sweep, same Llama3.1-8B B512 setup:
+
+| Split | Effective capacity | Out tok/s | Relative to GPU-only |
+|---:|---:|---:|---:|
+| 752 | 30.79x | 3662.878 | 0.979x |
+| 736 | 31.46x | 3428.306 | 0.916x |
+| 704 | 32.89x | 2993.206 | 0.800x |
+| 672 | 34.45x | 2781.259 | 0.743x |
+| 608 | 38.08x | 2100.071 | 0.561x |
+
+This upper-bound sweep is pessimistic for wider suffixes. Even after removing
+real CPU suffix compute, CPU/UVA artifact reads, and online-softmax merge, moving
+the split earlier does not uncover a throughput win. The best upper bound is
+still the near-tail split752 point, and it remains slightly below GPU-only. This
+means the extra nominal capacity is not converting into useful throughput in the
+current Llama synthetic workload. For Llama, Phase 2 should be planner-gated
+unless a workload sits at a sharper admission cliff than this harness, or unless
+a future implementation removes enough active split overhead to make the near-tail
+case exceed GPU-only.
+
+## 2026-05-28 Follow-up: Wrapper Microbench and EngineCore Timing
+
+A focused attention-wrapper microbenchmark was added:
+
+```text
+David/Benchmarks/phase2/benchmark_hybrid_wrapper_attention.py
+```
+
+It compares raw paged FlashAttention against the exact COTS hybrid wrapper in
+`VLLM_COTS_HYBRID_DUMMY_SUFFIX=prefix_only` mode. It reports both CUDA-event time
+and synchronized wall time so Python/tensor launch overhead is visible.
+
+Representative B32/B64 Llama-shaped results show the attention wrapper itself is
+not the reason wider splits collapse in E2E. At B64:
+
+| Split | raw full FA wall ms | raw prefix+LSE wall ms | hybrid direct prefix-only wall ms | coalesced prefix-only wall ms |
+|---:|---:|---:|---:|---:|
+| 752 | 0.249 | 0.247 | 0.267 | 0.268 |
+| 736 | 0.249 | 0.242 | 0.263 | 0.263 |
+| 704 | 0.250 | 0.235 | 0.254 | 0.254 |
+| 672 | 0.249 | 0.225 | 0.246 | 0.247 |
+| 608 | 0.249 | 0.206 | 0.227 | 0.227 |
+
+This curve moves in the expected direction: earlier splits make attention cheaper
+in isolation. That is the opposite of the E2E split sweep, where earlier splits
+get much slower. The residual Llama gap is therefore not inside the attention
+wrapper alone.
+
+An env-gated EngineCore timing probe was then added under
+`VLLM_COTS_HYBRID_ENGINE_TIMING=1`, splitting each step into scheduler,
+`execute_model` submission, model future/sample, and scheduler update. Matched
+Llama B512 split752 traces:
+
+| Mode | Out tok/s | schedule sum ms | execute_submit sum ms | sample sum ms | update sum ms | total timed step ms |
+|---|---:|---:|---:|---:|---:|---:|
+| GPU-only | 3733.336 | 449.110 | 2445.241 | 18835.272 | 164.652 | 21897.448 |
+| Coalesced + prefix-only hybrid | 3629.283 | 804.403 | 4302.504 | 17188.939 | 166.799 | 22465.909 |
+
+The upper-bound hybrid actually spent about `1.65 s` less in the model/sample
+section, but lost that back through about `+1.86 s` in `execute_model` submission
+and about `+0.36 s` in scheduler time. Binning by decode width shows this is not
+only a final tiny-tail effect: in the 100-399 scheduled-token bin,
+`execute_submit_ms` averaged `5.35 ms` for GPU-only and `10.23 ms` for the
+upper-bound hybrid.
+
+Updated pin-down: for this Llama harness, the reason Phase 2 does not beat
+GPU-only is CPU-side active-hybrid overhead before the model future, primarily
+worker submission/input-prep and secondarily scheduler bookkeeping. The attention
+kernel path is already fast enough in isolation, and the unrealistic prefix-only
+upper bound proves that removing CPU suffix compute/UVA/merge is insufficient
+while this submit/scheduler tax remains. The next code target is therefore the
+`execute_model` preparation path for active COTS hybrid KV metadata, not the CPU
+suffix kernel.
+
+## 2026-05-28 Follow-up: Active Metadata Reuse and Remaining Llama Gap
+
+The submit-path probe was expanded with `VLLM_COTS_HYBRID_SUBMIT_TIMING=1`,
+which logs per-step GPUModelRunner buckets and an attention-metadata breakdown.
+For the same Llama3.1-8B B512 `prompt608/total768/split752` upper-bound run,
+active suffix steps spent most of the extra submit time rebuilding identical
+per-request hybrid metadata once per layer:
+
+| Mode | Out tok/s | execute_submit sum ms | sample sum ms | active suffix attention metadata avg ms |
+|---|---:|---:|---:|---:|
+| GPU-only + submit timing | 3720.615 | 2677.834 | 18904.949 | n/a |
+| Coalesced + prefix-only before reuse | 3596.193 | 4600.195 | 17402.939 | 5.47 |
+| Coalesced + prefix-only after reuse | 3735.678 | 3595.862 | 17557.130 | 1.22 |
+
+The fix was to build the request-level `CotsHybridDecodeMetadata` once per
+attention group and reuse its common CPU block table, suffix lengths, scatter
+rows, active row indices, and mixed-prefix selectors for the remaining layer
+metadata objects. Only layer-local cache pointers, staging slots, output buffers,
+and task ids are rebuilt per layer. The diagnostic counters confirm the intended
+shape: active metadata construction now calls the heavy request path once instead
+of 32 times (`kv_calls=1`), and the repeated row-filter/cache-key work disappears.
+
+No-timing Llama controls after metadata reuse:
+
+| Mode | Out tok/s | Relative to GPU-only timing baseline (`3733.336`) | Interpretation |
+|---|---:|---:|---|
+| Coalesced + prefix-only | 3817.099 | 1.022x | upper bound now clears GPU-only |
+| Coalesced + dummy GPU suffix | 3740.889 | 1.002x | merge with GPU-resident neutral suffix is near tie |
+| Coalesced + dummy CPU/UVA suffix | 3707.361 | 0.993x | pinned CPU artifact/UVA path costs roughly 1% |
+| Coalesced + real CPU suffix | 3661.273 | 0.981x | real CPU suffix work still loses about 2% |
+
+This changes the diagnosis: the original ``we can never win`` gap was largely a
+Python/metadata issue and is fixable. After that fix, the remaining Llama loss is
+inside the active suffix execution path. Timed real-suffix runs show active
+`forward_launch_ms` rising from about `7.9 ms` in prefix-only to about `17.7 ms`
+with the real suffix path, while metadata stays near `1.4 ms`. A one-off
+`H2D-copy-before-merge` probe improved the dummy CPU/UVA control (`3775.889` out
+tok/s) but slightly hurt the real CPU suffix path (`3647.390` out tok/s), so it
+is not a production fix.
+
+COTS suffix counters on the real path show the native runner is active only once
+suffix rows exist. The runner uses a single queue worker, and the CPU attention
+kernel uses ATen `parallel_for` over `batch * num_kv_heads`. Per reporting window,
+CPU suffix attention submit time was about `1.7-1.8 ms` for 32 layer calls, while
+native worker busy time ranged from about `4-10 ms` depending on live suffix rows;
+queue wait was usually sub-ms, with a few small-row windows around `2-3 ms`.
+
+An env-gated async artifact-copy probe then tested direction (2) directly:
+`VLLM_COTS_HYBRID_SUFFIX_ARTIFACT_COPY=1` submits the native suffix task without
+immediate stream sync, waits for the CPU suffix completion on a side stream,
+copies suffix output/LSE from pinned CPU memory into GPU buffers, then makes the
+merge consume the GPU buffers.
+
+No-timing Llama B512 `prompt608/total768/split752` results:
+
+| Mode | Out tok/s | Interpretation |
+|---|---:|---|
+| Coalesced + dummy CPU suffix + async artifact copy | 3735.583 | explicit GPU artifact copy removes most of the dummy CPU/UVA penalty |
+| Coalesced + real CPU suffix + async artifact copy | 3590.214 | worse than real CPU suffix through UVA (`3661.273`) |
+
+The control is useful: explicit GPU-resident artifacts help when the suffix
+state is already ready. The real path regresses because the CPU suffix output is
+ready late enough that the explicit H2D copy lands on the critical path. The
+current wait mechanism is the wait-kernel path, not a legacy blocking sync
+callback, so the remaining issue is scheduling/overlap: the suffix task and its
+artifact movement are not far enough ahead of the merge.
+
+The earlier suffix-submit diagnostic was then added under
+`VLLM_COTS_HYBRID_EARLY_SUFFIX_SUBMIT=1`. It prepares and enqueues the native
+CPU suffix task before the GPU prefix attention launch, then waits only at merge
+time.
+
+No-timing Llama B512 `prompt608/total768/split752` results:
+
+| Mode | Out tok/s | Interpretation |
+|---|---:|---|
+| Coalesced + real CPU suffix + early submit | 3609.587 | earlier submit alone is worse than the existing UVA path |
+| Coalesced + real CPU suffix + early submit + async artifact copy | 3685.634 | best real-suffix result so far, but still below GPU-only/dummy-GPU |
+
+Lower-memory sweep, same Llama B512 `prompt608/total768` workload,
+`gpu_memory_utilization=0.75`, coalesced prefix + early submit + async artifact
+copy for hybrid:
+
+| Mode / split | GPU prefix blocks | Reported effective capacity | Out tok/s | vs GPU-only |
+|---|---:|---:|---:|---:|
+| GPU-only | 48 | 17.54x | 3005.794 | 1.000x |
+| Hybrid split752 | 47 | 17.91x | 2883.133 | 0.959x |
+| Hybrid split736 | 46 | 18.30x | 2700.400 | 0.898x |
+| Hybrid split704 | 44 | 19.14x | 2261.581 | 0.752x |
+| Hybrid split672 | 42 | 20.05x | 1860.999 | 0.619x |
+| Hybrid split640 | 40 | 21.05x | 1585.802 | 0.528x |
+| Hybrid split608 | 38 | 22.16x | 1365.424 | 0.454x |
+
+This sweep confirms the lower-memory intuition only helps if the capacity gain is
+large enough relative to the active suffix overhead. For this Llama workload, the
+near-tail split752 saves only one GPU KV block per request (`48 -> 47`), while
+earlier splits increase capacity modestly but make the CPU suffix path much
+heavier. Throughput falls monotonically as the split moves earlier.
+
+This clarifies the tradeoff. Moving suffix submission earlier gives the CPU task
+a larger overlap window, but it also moves suffix task preparation/host-callback
+launch work before the GPU prefix launch. Without explicit GPU artifact buffers,
+that tradeoff loses. With artifact copy, the extra overlap is useful enough to
+beat the original real-suffix path (`3661.273`) and the artifact-copy-only path
+(`3590.214`), but it still does not reach the GPU-only timing baseline
+(`3733.336`) or dummy-GPU merge control (`3740.889`).
+
+Next target: reduce the real suffix critical path itself. The remaining loss is
+not explained by request metadata, not by GPU prefix attention, and not by UVA
+artifact reads alone. The best current real path still pays native suffix compute
+plus output/LSE materialization/copy. Planner-gating Llama near-tail splits should
+remain the default unless a profile predicts enough capacity gain to cover that
+measured suffix execution overhead.
+
+## 2026-05-29 Follow-up: Qwen Current-Code Check
+
+The same current-code path used for the Llama investigation was tested on
+`Qwen/Qwen2.5-7B-Instruct`: coalesced prefix, early native suffix submit, and
+async suffix artifact copy. Workload: B512 `prompt608/total768`, eager,
+`max_num_seqs=512`.
+
+At `gpu_memory_utilization=0.80`:
+
+| Mode / split | Reported effective capacity | Out tok/s | vs GPU-only |
+|---|---:|---:|---:|
+| GPU-only | 82.96x | 5794.626 | 1.000x |
+| Hybrid split752 | 84.72x | 5686.217 | 0.981x |
+
+At `gpu_memory_utilization=0.75`:
+
+| Mode / split | Reported effective capacity | Out tok/s | vs GPU-only |
+|---|---:|---:|---:|
+| GPU-only | 54.15x | 5491.545 | 1.000x |
+| Hybrid split752 | 55.30x | 5295.210 | 0.964x |
+| Hybrid split736 | 56.50x | 4812.990 | 0.876x |
+| Hybrid split704 | 59.07x | 3927.592 | 0.715x |
+
+Qwen has much more KV capacity than Llama in this setup because it has fewer KV
+heads, so the same near-tail split only raises effective capacity by about 2.1%.
+That is not enough to pay the active hybrid suffix path. Moving the split earlier
+increases capacity, but throughput drops quickly as the CPU suffix grows. The
+current code therefore does not produce a Qwen throughput win on this synthetic
+B512 `prompt608/total768` workload.
+
+## 2026-05-29 Follow-up: Model-Specific Tight-Memory Check
+
+A tighter memory check used model-specific feasible settings rather than assuming
+Llama and Qwen have the same GPU footprint. In these runs, Llama loaded about
+`14.99 GiB` of weights, while Qwen loaded about `14.25 GiB`, leaving Qwen with
+roughly `0.74 GiB` more KV headroom at the same `gpu_memory_utilization`.
+
+Workload: B512 `prompt608/total768`, eager, `max_num_seqs=512`, current best
+hybrid path (coalesced prefix + early suffix submit + async artifact copy).
+
+Llama at `gpu_memory_utilization=0.70`:
+
+| Mode / split | Available KV | Reported effective capacity | Out tok/s | vs GPU-only |
+|---|---:|---:|---:|---:|
+| GPU-only | 0.46 GiB | 4.94x | 1304.707 | 1.000x |
+| Hybrid split752 | 0.46 GiB | 5.04x | 1167.173 | 0.895x |
+| Hybrid split736 | 0.46 GiB | 5.15x | 1130.189 | 0.866x |
+
+Qwen at `gpu_memory_utilization=0.70`:
+
+| Mode / split | Available KV | Reported effective capacity | Out tok/s | vs GPU-only |
+|---|---:|---:|---:|---:|
+| GPU-only | 1.04 GiB | 25.33x | 4092.449 | 1.000x |
+| Hybrid split752 | 1.04 GiB | 25.87x | 3874.464 | 0.947x |
+
+Qwen at `gpu_memory_utilization=0.67`:
+
+| Mode / split | Available KV | Reported effective capacity | Out tok/s | vs GPU-only |
+|---|---:|---:|---:|---:|
+| GPU-only | 0.33 GiB | 8.04x | 2159.427 | 1.000x |
+| Hybrid split752 | 0.33 GiB | 8.21x | 2010.113 | 0.931x |
+| Hybrid split736 | 0.33 GiB | 8.39x | 1927.641 | 0.893x |
+
+Even in the tightest feasible settings tested, the near-tail hybrid split still
+loses. The reason is the same ratio math as before: split752 saves one GPU KV
+block per request, so capacity rises by only about `48/47 = 1.021x`, while the
+active CPU suffix path costs more than that. Moving to split736 raises capacity
+slightly more, but the second CPU suffix block already hurts throughput enough to
+make it worse than split752.
+
+## 2026-05-29 Follow-up: Heads-Per-KV Specialization Probe
+
+This round targeted the real one-block suffix path for the Llama/Qwen split752
+case. The prepared native runner already disables eager input snapshots for the
+static pinned staging path, so the remaining runner overhead is mostly real
+scatter + suffix attention + artifact/merge orchestration.
+
+A small diagnostic flag was added to `benchmark_prepared_suffix_runner.py`:
+`--no-snapshot-inputs`. This lets the microbenchmark match the production static
+staging path instead of the pessimistic eager snapshot path.
+
+First attempted fix: route prepared runner calls through an internal unchecked
+suffix-attention entry point after `populate_task()` shape validation. This built
+and passed focused tests, but did not materially change the one-block runner
+microbenchmark. The public custom op still keeps full validation.
+
+Second attempted fix: specialize the CPU suffix attention hot loop by compile-time
+`heads_per_kv` and dispatch for values 1-8. This keeps the generic GQA contract
+while allowing the compiler to shrink/unroll the inner per-KV-head query group.
+It helped both target shapes in the exact B512/suffix16 runner probe:
+
+| Model shape | Mode | Before median | After median | Change |
+|---|---|---:|---:|---:|
+| Llama3.1-8B | direct | 27.554 ms / 32 layers | 26.106 ms / 32 layers | +5.3% |
+| Llama3.1-8B | prepared_scatter | 35.099 ms / 32 layers | 33.660 ms / 32 layers | +4.1% |
+| Qwen2.5-7B | direct_scatter | 16.604 ms / 28 layers | 16.085 ms / 28 layers | +3.1% |
+| Qwen2.5-7B | prepared_scatter | 17.897 ms / 28 layers | 16.995 ms / 28 layers | +5.0% |
+
+Validation run after the C++ change:
+
+```text
+/opt/conda/envs/thesis/bin/python -m pytest \
+  tests/kernels/attention/test_cots_suffix_attention.py \
+  tests/kernels/attention/test_cots_suffix_attention_runner.py -q
+# 22 passed
+```
+
+Llama E2E reruns, B512 `prompt608/total768/split752`, `gpu_memory_utilization=0.80`,
+eager, async scheduling disabled, `max_num_seqs=512`:
+
+| Mode | Extra knobs | Out tok/s |
+|---|---|---:|
+| GPU-only | none | 3707.061, 3739.187 |
+| Hybrid | coalesced + early submit + artifact copy | 3670.804, 3680.926 |
+| Hybrid | coalesced only | 3720.178, 3719.584 |
+
+The important change is that the best post-specialization hybrid setting is now
+the simpler coalesced path without early suffix submit or explicit artifact copy.
+The early/copy path was useful when CPU suffix work was longer, but after the
+kernel specialization it moves extra work onto the critical path.
+
+Conclusion: this is progress, but not a robust throughput win yet. Hybrid
+`split752` is now in the GPU-only noise band and sometimes slightly above one
+matched GPU-only run, but the second GPU-only repeat reached `3739 out tok/s`.
+The remaining planner rule should still be conservative: choose hybrid only when
+profiling predicts a capacity/admission benefit larger than this measured
+near-tail overhead. The next useful target is reducing the artifact/merge or
+submission envelope enough to turn the current near-tie into a repeatable win.
+
+## 2026-05-29 Follow-up: Early-Submit-Only Decomposition
+
+This round decomposed the remaining split752 gap after the heads-per-KV CPU
+kernel specialization. Workload: B512 `prompt608/total768`, eager,
+`max_num_seqs=512`, async scheduling disabled, coalesced prefix enabled for all
+hybrid runs.
+
+Llama at `gpu_memory_utilization=0.80`, split752:
+
+| Mode / knob | Out tok/s | Notes |
+|---|---:|---|
+| GPU-only | 3712.193, 3739.608 | same-session baseline range |
+| Hybrid prefix-only dummy | 3722.876 | split GPU-prefix path is not slower |
+| Hybrid dummy GPU suffix | 3728.912 | merge with GPU fake suffix is not the gap |
+| Hybrid dummy CPU/UVA suffix | 3775.513 | noisy, but no real suffix runner cost |
+| Hybrid real, coalesced only | 3700.659 | real suffix runner sits on critical path |
+| Hybrid real, early-submit only | 3728.937, 3731.294 | recovers most real suffix cost |
+| Hybrid real, artifact-copy only | 3694.624 | explicit artifact copy is harmful here |
+
+The important correction versus the previous early/copy result is that the bad
+part was the explicit artifact-copy path, not early submission itself. Without
+`VLLM_COTS_HYBRID_EARLY_SUFFIX_SUBMIT`, the real suffix is submitted after the
+GPU prefix returns, so even a one-block suffix remains on the critical path.
+Early-submit-only overlaps that work and moves Llama split752 back into the
+GPU-only noise band. It is still not a robust win: the best GPU-only repeat in
+this session was `3739.608 out tok/s`, above the early-submit repeats.
+
+Earlier splits with early-submit did not close the gap:
+
+| Model / memory | Split | Effective capacity | Out tok/s | vs matched GPU-only |
+|---|---:|---:|---:|---:|
+| Llama 0.80 | 736 | 31.46x | 3495.324 | 0.935x vs 3739.608 |
+| Llama 0.75 | 752 | 17.91x | 2935.956 | 0.970x vs 3028.281 |
+| Llama 0.75 | 736 | 18.30x | 2768.038 | 0.914x vs 3028.281 |
+
+This reinforces the one-block cliff: split752 only improves capacity by about
+`48/47 = 1.021x`, which is too small to robustly beat GPU-only; split736 improves
+capacity more, but the second CPU suffix block costs much more than it saves.
+
+Qwen checks with early-submit-only:
+
+| Memory | Mode / split | Effective capacity | Out tok/s | vs GPU-only |
+|---|---|---:|---:|---:|
+| 0.80 | GPU-only | 82.96x | 5848.190 | 1.000x |
+| 0.80 | Hybrid split752 | 84.72x | 5716.989 | 0.978x |
+| 0.75 | GPU-only | 54.15x | 5505.983 | 1.000x |
+| 0.75 | Hybrid split752 | 55.30x | 5332.827 | 0.969x |
+
+Qwen still loses because the available GPU KV capacity is high enough that a
+near-tail one-block split only gives about a 2.1% admission gain, while the real
+suffix/merge path costs more than that.
+
+Code decision from this round: make early suffix submit the default hybrid
+behavior and keep explicit artifact copy opt-in/off. The default can be disabled
+with `VLLM_COTS_HYBRID_EARLY_SUFFIX_SUBMIT=0`, `false`, or `off`. This does not
+create a robust throughput win by itself, but it is the cleaner production
+behavior for the real suffix path because it overlaps the CPU suffix instead of
+submitting it after the GPU prefix.
+
+Validation after the Python change:
+
+```text
+/opt/conda/envs/thesis/bin/python -m py_compile \
+  /TTC/vllm/vllm/envs.py \
+  /TTC/vllm/vllm/v1/attention/backends/cots_hybrid_attention.py
+# passed
+
+/opt/conda/envs/thesis/bin/python -m pytest \
+  tests/kernels/attention/test_cots_hybrid_attention.py \
+  tests/kernels/attention/test_cots_suffix_attention_runner.py \
+  tests/v1/worker/test_cots_hybrid_kv.py -q
+# 37 passed
+```
+
+Current conclusion: the remaining blocker is not the split GPU-prefix kernel and
+not raw CPU suffix math alone. The one-block hybrid tax is now mostly the real
+suffix runner plus merge/UVA artifact envelope. To make the planner choose hybrid
+for this synthetic workload, the next attempt must reduce the one-block fixed tax
+below roughly the 2.1% capacity gain of split752, or find a workload/admission
+point where the capacity gain is materially larger without crossing into the
+second CPU suffix block.
+
+## 2026-05-29 Follow-up: Integer Cliff and Short-Suffix Probe
+
+This probe tested the most favorable planner scenario for a one-block split:
+keep `split752`, search near GPU KV integer-admission cliffs, and shorten the
+post-split region so hybrid saves one GPU KV block while doing as little real CPU
+suffix work as possible. Workload stayed B512, prompt608, eager,
+`max_num_seqs=512`, async scheduling disabled, coalesced prefix enabled, early
+suffix submit enabled, artifact copy off.
+
+Llama split752 integer-cliff checks:
+
+| GPU mem | Total | Mode | Reported capacity | Out tok/s |
+|---:|---:|---|---:|---:|
+| 0.801 | 768 | GPU-only | 30.40x | 3792.403 |
+| 0.801 | 768 | Hybrid | 31.04x | 3720.721 |
+| 0.805 | 768 | GPU-only | 31.42x | 4042.524 |
+| 0.805 | 768 | Hybrid | 32.09x | 3786.643 |
+
+The integer cliff alone did not produce a win. Even when hybrid crossed the
+next reported capacity boundary, the real one-block hybrid envelope cost more
+than the extra admission slot repaid.
+
+Short post-split checks at `gpu_memory_utilization=0.801`:
+
+| Total | Mode | Reported capacity | Out tok/s | Notes |
+|---:|---|---:|---:|---|
+| 754 | GPU-only | 30.40x | 4093.241 | 48 GPU blocks/request |
+| 754 | Hybrid | 31.04x | 4039.036 | 2 post-split decode steps |
+| 753 | GPU-only | 30.40x | 4073.738 | 48 GPU blocks/request |
+| 753 | Hybrid | 31.04x | 4006.775 | 1 post-split decode step |
+| 753 | Hybrid prefix-only dummy | 31.04x | 4023.782 | no real suffix/merge |
+
+Even the minimum one-token post-split case did not win. The prefix-only dummy
+also stayed below GPU-only, which means some fixed hybrid path cost is present
+outside raw CPU suffix math.
+
+Strongest low-memory admission case tested:
+
+| GPU mem | Total | Mode | Reported capacity | Out tok/s |
+|---:|---:|---|---:|---:|
+| 0.70 | 753 | GPU-only | 4.94x | 1399.437 |
+| 0.70 | 753 | Hybrid | 5.04x | 1383.529 |
+
+This was the best theoretical setup for a planner-visible win: one-token CPU
+suffix and a reported capacity boundary around 5 concurrent requests. It still
+lost by about 1.1%.
+
+Conclusion: no throughput win has been found yet, including the integer-cliff
+and shortest-suffix regimes. The remaining work should move from split search to
+removing fixed hybrid overhead: metadata build/row filtering, suffix submit/sync,
+UVA artifact exposure, and the merge/return path. A planner can still model
+hybrid as feasible capacity, but the current implementation should not select it
+for throughput on these synthetic Llama/Qwen B512 cases.
+
+
+## 2026-05-29 Follow-up: Fixed-Overhead Fast Path
+
+This round investigated why hybrid still lost in the most favorable `split752`
+capacity-cliff case. A key correction: for `prompt608,total753,split752`, the
+main decode never actually runs CPU suffix attention. Decode attends to the
+previous length, so the last forward position is still below 752. The timing log
+confirmed `suffix_scan_false` on every steady B512 decode step. This makes
+`total753` a pure fixed-overhead test: hybrid gets the 47-block GPU-prefix
+capacity accounting, but no real CPU suffix/merge work should be active.
+
+Isolation runs:
+
+| Case | Out tok/s | Observation |
+|---|---:|---|
+| GPU-only total753 timing | 4050.475 | baseline timing run |
+| `offload_backend=cots`, no hybrid KV | 4062.798 | COTS backend selection alone is effectively no-op |
+| Hybrid split752 total753 timing, before fast path | 3975.704 | no suffix active, but hybrid runtime overhead visible |
+| Hybrid split768/max769 total753 timing | 4003.327 | valid no-suffix hybrid with 48-block prefix; still no win |
+
+The COTS-backend/no-hybrid result ruled out the weight-offload backend as the
+source of the fixed tax. The overhead came from hybrid-KV worker/runtime hooks
+that were still active before suffix rows existed.
+
+Implemented cleanup:
+
+- Cache `cots_hybrid_has_suffix_positions` once during input prep and reuse it
+  in slot masking and attention metadata attachment.
+- Thread that cached predicate through `CotsRuntime.on_dispatch` so repeated
+  no-suffix forwards skip hybrid live-count publication without rescanning
+  positions.
+- Carry a cached `scatter_source_indices_gpu` through common hybrid metadata so
+  suffix-active layers reuse the row-index tensor instead of rebuilding it per
+  layer.
+
+Validation:
+
+```text
+/opt/conda/envs/thesis/bin/python -m py_compile \
+  /TTC/vllm/vllm/v1/attention/backends/cots_hybrid_attention.py \
+  /TTC/vllm/vllm/v1/worker/cots_hybrid_kv.py \
+  /TTC/vllm/vllm/v1/worker/cots_runtime.py \
+  /TTC/vllm/vllm/v1/worker/gpu_model_runner.py \
+  /TTC/vllm/tests/v1/worker/test_cots_hybrid_kv.py
+# passed
+
+/opt/conda/envs/thesis/bin/python -m pytest \
+  tests/kernels/attention/test_cots_hybrid_attention.py \
+  tests/kernels/attention/test_cots_suffix_attention_runner.py \
+  tests/v1/worker/test_cots_hybrid_kv.py -q
+# 37 passed
+```
+
+No-suffix timing improved but did not turn into a win:
+
+| Case | Out tok/s | steady prepare med | attn metadata med | publish med |
+|---|---:|---:|---:|---:|
+| GPU-only total753 timing | 4050.475 | 0.390 ms | 0.085 ms | 0.004 ms |
+| Hybrid total753 timing before | 3975.704 | 0.609 ms | 0.151 ms | 0.054 ms |
+| Hybrid total753 after cached predicate | 3995.984 | 0.438 ms | 0.090 ms | 0.052 ms |
+| Hybrid total753 after dispatch fast path | 4015.084 | 0.419 ms | 0.090 ms | 0.004 ms |
+
+The fast path removed most of the visible Python/runtime fixed overhead. The
+remaining no-suffix gap is now smaller, but still present. The fair non-timing
+capacity-cliff pair after the cleanup still lost:
+
+| Total | Mode | Out tok/s |
+|---:|---|---:|
+| 753 | GPU-only | 4092.799 |
+| 753 | Hybrid split752 | 3998.876 |
+
+The suffix-active Llama pair also still lost after the cleanup:
+
+| Total | Mode | Reported capacity | Out tok/s |
+|---:|---|---:|---:|
+| 768 | GPU-only | 30.40x | 3843.848 |
+| 768 | Hybrid split752 | 31.04x | 3775.715 |
+
+Conclusion: this cleanup is correct and reduces fixed overhead, but it does not
+create a throughput win. The next plausible implementation attempt is not more
+split sweeping. It is the real suffix artifact/merge return path: avoid the
+per-layer suffix-row `index_select`/`index_copy_` envelope by adding an indexed
+merge/writeback path that consumes full prefix output plus suffix row indices
+and writes merged rows directly into the full output. That targets the remaining
+fixed cost that capacity gains have not yet overcome.
+
+
+## 2026-05-29 Follow-up: Indexed Merge/Writeback Attempt
+
+This attempt targeted the remaining real-suffix return envelope for partial
+hybrid rows. The old partial/coalesced path gathered full prefix outputs into
+compact suffix-row tensors, ran `merge_attn_states`, then scattered the merged
+rows back into the full output with `index_copy_`. The new diagnostic path adds
+a CUDA op, `merge_attn_states_indexed`, that reads full prefix rows by
+`source_indices`, merges compact suffix output/LSE, and writes directly into the
+full output row.
+
+Implementation details:
+
+- Added a CUDA indexed merge kernel in `csrc/attention/merge_attn_states.cu` and
+  registered it as `torch.ops._C.merge_attn_states_indexed`.
+- Added Python wrappers in `_custom_ops.py` and
+  `vllm/v1/attention/ops/merge_attn_states.py`; the high-level wrapper falls
+  back to the old gather/merge/scatter sequence off the supported CUDA path.
+- Wired COTS hybrid decode to use it only when a precomputed full prefix output
+  is present and `scatter_source_indices` is non-null.
+- Kept the COTS path opt-in via `VLLM_COTS_HYBRID_INDEXED_MERGE=1` after the
+  first benchmark did not show a win.
+
+Validation:
+
+```text
+/opt/conda/envs/thesis/bin/cmake --build --preset release --target install
+# rebuilt _C.abi3.so successfully
+
+/opt/conda/envs/thesis/bin/python -m pytest \
+  tests/kernels/attention/test_merge_attn_states.py::test_merge_attn_states_indexed_matches_compact \
+  tests/kernels/attention/test_cots_hybrid_attention.py \
+  tests/kernels/attention/test_cots_suffix_attention_runner.py \
+  tests/v1/worker/test_cots_hybrid_kv.py -q
+# 39 passed
+```
+
+Llama B512, prompt608, total768, split752, 0.801 GPU memory:
+
+| Mode | Indexed merge | Out tok/s |
+|---|---|---:|
+| Hybrid | off / previous fast path | 3775.715 |
+| Hybrid | on | 3715.162 |
+| Hybrid | off, same rebuilt code | 3734.811 |
+
+The indexed path did not close the gap. For the synchronized synthetic workload
+it is also mostly not the steady-state path: after all requests cross the split
+together, `scatter_source_indices` is null and COTS uses the all-suffix compact
+path, not partial indexed writeback. This explains why the attempt does not
+address the main Llama/Qwen B512 loss. It may still be useful for future mixed
+request-length diagnostics, but it should stay opt-in until a mixed workload
+shows a benefit.
+
+Updated conclusion: the remaining throughput gap for the current synthetic cases
+is in the all-suffix envelope: CPU suffix artifact exposure, UVA/merge cost, and
+possibly stream synchronization around the suffix runner. The next attempt should
+measure and reduce the all-suffix merge/artifact path directly, not the partial
+row scatter path.
+
+
+## 2026-05-29 Follow-up: All-Suffix Real-CPU Ablation
+
+This round added a diagnostic-only real-suffix ablation knob:
+
+```text
+VLLM_COTS_HYBRID_REAL_SUFFIX_ABLATION=prefix_only|gpu|cpu
+```
+
+Unlike `VLLM_COTS_HYBRID_DUMMY_SUFFIX`, this still submits and waits for the
+real native CPU suffix task. The mode then deliberately ignores or neutralizes
+its result so the active all-suffix path can separate CPU submit/sync cost from
+artifact/merge cost. The default remains `none`; the new env is registered along
+with `VLLM_COTS_HYBRID_INDEXED_MERGE` to avoid diagnostic warning noise.
+
+Same-session Llama3.1-8B B512, prompt608, total768, split752,
+`gpu_memory_utilization=0.801`, eager, async scheduling disabled:
+
+| Mode | Out tok/s | Interpretation |
+|---|---:|---|
+| GPU-only | 3793.655 | Same-session baseline. |
+| Hybrid full real suffix | 3734.966 | Still loses by about 1.5%. |
+| Hybrid dummy prefix-only, no CPU suffix | 3824.485 | Split GPU-prefix path itself can clear GPU-only. |
+| Hybrid dummy GPU suffix, no CPU suffix | 3843.823 | Merge with GPU-resident neutral suffix also clears GPU-only. |
+| Hybrid real CPU suffix, skip artifact/merge | 3733.811 | Real suffix submit/sync alone erases the win. |
+| Hybrid real CPU suffix + GPU dummy merge | 3778.339 | Artifacts are not the main loss; real CPU suffix path is still too expensive. |
+| Hybrid real CPU suffix + CPU dummy artifact | 3432.974 | Stress mode only: it overwrites pinned CPU buffers after compute, so it overstates artifact cost. |
+
+The important comparison is not the CPU-dummy stress case. It is the pair
+`dummy GPU suffix` versus `real CPU suffix + GPU dummy merge`: adding the real
+CPU suffix runner drops throughput from `3843.823` to `3778.339` output tok/s,
+roughly a `1.7%` tax. The near-tail split752 capacity gain over GPU-only is only
+about `31.04 / 30.40 = 1.021x` nominal and was about `1.3%` in this same-session
+throughput run, so this CPU submit/sync envelope is enough to keep hybrid below
+GPU-only.
+
+Updated diagnosis: the immediate gap is no longer the split GPU kernel, not the
+online-softmax merge by itself, and not the UVA artifact read by itself. The
+throughput win is available in no-real-CPU controls, but the native suffix task
+submission/synchronization path consumes more than the capacity gain for a
+one-block near-tail Llama split. The next attempt should therefore target the
+real suffix runner envelope: reduce per-layer submit/sync overhead, increase the
+overlap window without moving more work onto the critical path, or special-case
+one-block suffix attention so the CPU task has less fixed overhead.
+
+## 2026-05-29 Follow-up: Native Suffix Runner Attribution and General Kernel Attempts
+
+This round instrumented the native suffix runner enough to split the real CPU
+suffix tax into submit, dispatch callback, queue wait, scatter, and attention
+work. The production path keeps counters off unless `VLLM_COTS_DIAG=1` or
+`VLLM_COTS_SUFFIX_COUNTERS=1` is set.
+
+Kept implementation changes:
+
+- Added native suffix runner counters for submit prepare/snapshot/hostfunc,
+  dispatch callback/snapshot/enqueue, worker queue wait, scatter, and attention.
+- Moved `TaskQueue::Node` construction to move the queued `std::function`
+  instead of copying it.
+- Removed the extra CPU suffix probability-normalization pass; probabilities are
+  normalized when accumulating V.
+- Tuned CPU suffix attention `at::parallel_for` grain size from 1 to 8. This is
+  a general scheduling-overhead reduction for all GQA shapes, not a one-block
+  fast path.
+
+Attempts that were tested and backed out:
+
+- Row-parallel CPU KV scatter: improved the isolated scatter microbenchmark, but
+  regressed Llama E2E throughput, likely from extra threadpool contention in the
+  full runner.
+- Online-softmax one-pass CPU suffix accumulation: correct, but slower than the
+  existing two-phase logits/probs then V accumulation. It adds output-accumulator
+  traffic on every token, which outweighed removing the probability buffer.
+- Grain size 16: the benchmark harness wedged with the child process defunct, so
+  the final code was restored to grain size 8.
+
+Validation after the kept changes:
+
+```text
+/opt/conda/envs/thesis/bin/cmake --build --preset release --target install
+# rebuilt _cots_C successfully
+
+/opt/conda/envs/thesis/bin/python -m pytest \
+  tests/kernels/attention/test_cots_suffix_attention.py \
+  tests/kernels/attention/test_cots_suffix_attention_runner.py \
+  tests/kernels/attention/test_cots_hybrid_attention.py \
+  tests/v1/worker/test_cots_hybrid_kv.py -q
+# 52 passed, 2 warnings
+```
+
+Isolated Llama3.1-8B shape, B512, suffix16, 32 layers, 24 CPU threads:
+
+| Kernel state | direct ms | prepared ms | direct+scatter ms | prepared+scatter ms |
+|---|---:|---:|---:|---:|
+| Restored two-phase, grain 1 | 27.009 | 29.090 | 32.854 | 34.514 |
+| Kept two-phase, grain 8 | 26.835 | 28.472 | 32.824 | 34.337 |
+| Online softmax attempt | 27.483 | 28.482 | 33.407 | 34.835 |
+
+Same-session Llama3.1-8B E2E, B512, prompt608, total768, split752,
+`gpu_memory_utilization=0.801`, eager, async scheduling disabled:
+
+| Mode / code state | Out tok/s |
+|---|---:|
+| GPU-only baseline | 3817.934 |
+| Hybrid, kept grain 8 suffix kernel | 3742.514 |
+
+CUDA timing plus suffix counters confirm the remaining bottleneck. In active
+hybrid intervals, GPU prefix attention was only a few milliseconds across the 32
+layers, while native suffix worker busy time was often comparable or larger.
+Representative intervals showed GPU prefix/merge around `1.6-4.7/0.2-0.9 ms`
+while suffix worker busy/scatter/attention was around
+`3.4-8.0/0.1-1.7/2.3-5.9 ms`. The diagnostic run itself is slower because CUDA
+timing synchronizes events, but the attribution is clear: real CPU suffix work is
+on the critical path for this near-tail one-block Llama split.
+
+Updated conclusion: the general changes narrowed the suffix runner a little, but
+not enough to create a throughput win. The no-real-CPU controls still show that
+the split GPU path can beat GPU-only; the real CPU suffix worker remains the tax
+that exceeds the small one-block capacity gain. The next promising direction is
+a more structural CPU suffix attention optimization or a planner policy that
+uses hybrid only where the capacity gain is larger than this measured real-CPU
+suffix tax. A one-block-only fast path may help the current synthetic case, but
+it would be a narrow optimization rather than evidence that the general hybrid
+mechanism wins.
+
+
+## 2026-05-29 Follow-up: Same-Block K/V Prefetch in CPU Suffix Kernel
+
+This round tested a minimal general CPU suffix-kernel change: while processing a
+suffix token, prefetch the next same-block K and V BF16 head vectors. This keeps
+the current GQA online-softmax structure and does not add a one-block special
+case or request tiling.
+
+Code decision: keep the prefetch. It improved both Llama and Qwen isolated
+suffix timings and passed the focused Phase 2 regression suite.
+
+Validation:
+
+```text
+cmake --build --preset release --target install
+# rebuilt _cots_C successfully
+
+/opt/conda/envs/thesis/bin/python -m pytest \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention_runner.py \
+  /TTC/vllm/tests/v1/worker/test_cots_hybrid_kv.py -q
+# 38 passed, 2 warnings
+```
+
+Isolated suffix runner, B256, suffix256, 24 CPU threads:
+
+| Model shape | Mode | Before median ms | Prefetch median ms | Change |
+|---|---|---:|---:|---:|
+| Llama3-8B | direct | 166.509 | 158.462 | 0.952x |
+| Llama3-8B | direct+scatter | 171.295 | 162.536 | 0.949x |
+| Llama3-8B | prepared | 193.958 | 184.436 | 0.951x |
+| Llama3-8B | prepared+scatter | 201.209 | 192.010 | 0.954x |
+| Qwen2.5-7B | direct | 82.540 | 76.061 | 0.922x |
+| Qwen2.5-7B | direct+scatter | 86.481 | 78.209 | 0.904x |
+| Qwen2.5-7B | prepared | 91.882 | 88.221 | 0.960x |
+| Qwen2.5-7B | prepared+scatter | 94.639 | 90.285 | 0.954x |
+
+E2E Llama, B512, prompt608, total768, split752, eager, async scheduling
+disabled, CPU pool 12 GiB:
+
+| GPU memory | Mode | Effective capacity | Out tok/s |
+|---:|---|---:|---:|
+| 0.80 | GPU-only | 30.15x | 3714.555, 3730.229 |
+| 0.80 | Hybrid | 30.79x | 3724.744, 3716.241 |
+| 0.75 | GPU-only | 17.54x | 3037.171 |
+| 0.75 | Hybrid | 17.91x | 2883.314 |
+
+Interpretation: the prefetch is a real local kernel improvement, but it still
+does not create a robust throughput win. At `gpu_memory_utilization=0.80`, the
+best split752 case is now essentially tied with GPU-only: one hybrid repeat is
+slightly above one GPU repeat, but the two-run means are `3720.5` hybrid versus
+`3722.4` GPU-only. At `0.75`, hybrid still loses decisively because the one-block
+capacity gain is too small relative to the fixed real-suffix/merge envelope.
+Planner policy should still treat this as a measured near-tie, not a repeatable
+throughput win.
+
+
+## 2026-05-29 Follow-up: Persistent Sharding Attempt and Snapshot Attribution
+
+This round tested a general runner-side optimization idea: replace the prepared
+suffix runner's per-layer `at::parallel_for` entry with a COTS-owned persistent
+static shard executor over the same `(sequence, KV-head)` task space. This was
+not a one-block special case and still used the generic GQA suffix kernel.
+
+Code decision: do **not** keep the persistent sharding change. It passed the
+focused correctness suite when forced with `VLLM_COTS_SUFFIX_NUM_THREADS=4`, but
+it did not improve the isolated prepared path and regressed Qwen. The attempted
+executor was reverted; the installed extension was rebuilt after the revert.
+
+Validation after revert:
+
+```text
+cmake --build --preset release --target install
+# rebuilt _cots_C successfully
+
+/opt/conda/envs/thesis/bin/python -m pytest \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention_runner.py \
+  /TTC/vllm/tests/v1/worker/test_cots_hybrid_kv.py -q
+# 38 passed, 2 warnings
+```
+
+Isolated suffix runner, B256, suffix256, 24 CPU threads, with the persistent
+sharding attempt active:
+
+| Model shape | Mode | Median ms | Interpretation |
+|---|---|---:|---|
+| Llama3-8B | direct | 158.836 | unchanged vs kept prefetch path |
+| Llama3-8B | direct+scatter | 167.271 | unchanged |
+| Llama3-8B | prepared | 185.616 | no meaningful win vs prior `184.436` |
+| Llama3-8B | prepared+scatter | 192.533 | no meaningful win vs prior `192.010` |
+| Qwen2.5-7B | direct | 76.348 | unchanged |
+| Qwen2.5-7B | direct+scatter | 78.585 | unchanged |
+| Qwen2.5-7B | prepared | 94.796 | worse than prior `88.221` |
+| Qwen2.5-7B | prepared+scatter | 99.684 | worse than prior `90.285` |
+
+Conclusion from the failed attempt: the remaining prepared-path gap is not
+mainly PyTorch's per-call parallel runtime entry. Replacing it with our own
+persistent static sharding adds enough wakeup/function-call overhead to cancel
+or reverse any benefit.
+
+The useful attribution came from the suffix runner counters. With default eager
+input snapshots enabled, Llama prepared+scatter spent about `11.7 ms/run` in the
+CUDA host callback snapshot copy at B256/suffix256/32 layers:
+
+| Counter group | ms/run |
+|---|---:|
+| wall median | 177.469 |
+| dispatch callback snapshot | 11.703 |
+| worker busy | 168.430 |
+| worker scatter | 3.949 |
+| worker attention | 163.782 |
+
+With snapshots disabled, the isolated prepared runner nearly collapses to the
+direct CPU work:
+
+| Model shape | Direct+scatter median ms | Prepared+scatter no-snapshot median ms | Gap |
+|---|---:|---:|---:|
+| Llama3-8B | 162.544 | 165.025 | +2.481 ms / 32 layers |
+| Qwen2.5-7B | 78.412 | 79.819 | +1.407 ms / 28 layers |
+
+A no-snapshot Llama counter run reported wall median `165.392 ms/run`, worker
+busy `163.714 ms/run`, worker attention `158.273 ms/run`, worker scatter
+`4.756 ms/run`, dispatch callback total only `0.086 ms/run`, and dispatch
+snapshot only `0.003 ms/run`.
+
+Important interpretation: eager snapshots explain the large isolated prepared
+benchmark gap, but the production static-staging decode path already disables
+snapshots when pinned staging slots are protected by reuse events. Therefore this
+finding is diagnostic rather than a new throughput fix. It says the prepared
+runner envelope is already down to roughly `0.05-0.08 ms/layer` after protected
+staging, and the remaining E2E near-tail loss is the real CPU suffix work plus
+merge/submit timing being slightly larger than the one-block capacity gain. The
+next general attempt should not be another thread-launch substrate; it should
+either reduce the actual suffix attention/scatter work, improve overlap in the
+E2E layer schedule, or move the planner toward cases with a larger measured
+capacity/admission gain.
+
+
+
+## 2026-05-29 Follow-up: Fused One-Block Scatter + Suffix Attention
+
+This round targeted the remaining short-suffix runner cost by folding the CPU KV
+scatter into the suffix attention worker for the common near-tail case. The
+generic all-suffix version was tested first, but it regressed long-suffix
+prepared runs. The retained implementation therefore gates fusion to
+`max_suffix_blocks <= 1`; longer suffixes keep the existing standalone scatter
+followed by the generic GQA suffix attention kernel.
+
+Code decision: keep the gated fused scatter path. It is not a separate
+one-block attention kernel: it uses the same generic GQA suffix attention loop,
+but copies the newly generated K/V row into the CPU cache inside the worker
+before the attention group reads from the cache. This removes the standalone
+scatter call for the hot one-block throughput path without adding per-token
+staged-K/V reads in the long-suffix loop.
+
+Validation:
+
+```text
+cmake --build --preset release --target install
+# rebuilt _cots_C successfully
+
+/opt/conda/envs/thesis/bin/python -m pytest \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention_runner.py \
+  /TTC/vllm/tests/v1/worker/test_cots_hybrid_kv.py -q
+# 38 passed, 2 warnings
+```
+
+Isolated near-tail suffix runner, B512, suffix16, 24 CPU threads, snapshots
+disabled:
+
+| Model shape | Mode | Median ms |
+|---|---|---:|
+| Llama3.1-8B | direct | 24.540 |
+| Llama3.1-8B | direct+scatter | 30.466 |
+| Llama3.1-8B | prepared | 25.837 |
+| Llama3.1-8B | prepared+scatter | 26.911 |
+| Qwen2.5-7B | direct | 12.816 |
+| Qwen2.5-7B | direct+scatter | 15.182 |
+| Qwen2.5-7B | prepared | 14.178 |
+| Qwen2.5-7B | prepared+scatter | 14.300 |
+
+The important local result is that `prepared+scatter` is now close to
+`prepared` for the one-block shape, especially on Qwen. For the long-suffix
+Llama B256/suffix256 shape, the fused path was not kept; the standalone
+prepared+scatter rerun after the gate was `165.847 ms`, back in the previous
+no-snapshot envelope.
+
+E2E Llama, B512, prompt608, total768, split752, `gpu_memory_utilization=0.80`,
+eager, async scheduling disabled, CPU pool 12 GiB:
+
+| Mode | Effective capacity | Out tok/s |
+|---|---:|---:|
+| GPU-only | 30.15x | 3697.721, 3737.507 |
+| Hybrid | 30.79x | 3713.310, 3699.936 |
+
+Interpretation: the fused one-block scatter path improves the isolated runner,
+but it still does not produce a robust E2E throughput win. One same-session
+hybrid run beat one GPU-only run by about 0.4%, but the repeat flipped the
+ordering. The two-run means are `3717.6` GPU-only versus `3706.6` hybrid. The
+current evidence is therefore near-tie/no-repeatable-win, not a planner-worthy
+hybrid advantage.
+
+
+
+## 2026-05-29 Follow-up: Coalesced Prefix Default and First Llama Win
+
+This round revisited the E2E gap after the fused scatter change. The key finding
+was that the current throughput runs were not using the coalesced-prefix hybrid
+path by default. In mixed decode steps, that meant prefix-only rows and suffix
+rows were handled through separate prefix attention paths. Enabling coalesced
+prefix lets one GPU prefix attention cover all rows, then merges CPU suffix only
+for the suffix-active rows.
+
+Code decision: make `VLLM_COTS_HYBRID_COALESCED_PREFIX` default-on in
+`vllm/envs.py`, while preserving `VLLM_COTS_HYBRID_COALESCED_PREFIX=0` as the
+diagnostic kill switch. Artifact-copy and indexed-merge remained off; both
+regressed this workload.
+
+Validation:
+
+```text
+/opt/conda/envs/thesis/bin/python -m pytest \
+  /TTC/vllm/tests/kernels/attention/test_cots_hybrid_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention_runner.py \
+  /TTC/vllm/tests/v1/worker/test_cots_hybrid_kv.py -q
+# 52 passed, 2 warnings
+```
+
+Llama3.1-8B E2E, B512, prompt608, total768, `gpu_memory_utilization=0.80`,
+eager, async scheduling disabled, CPU pool 12 GiB:
+
+| Mode | Split | Effective capacity | Out tok/s |
+|---|---:|---:|---:|
+| GPU-only | n/a | 30.15x | 3740.354 |
+| Hybrid, coalesced prefix | 736 | 31.46x | 3756.531, 3750.388 |
+| Hybrid, coalesced default sanity | 736 | 31.46x | 3764.667 |
+
+This is the first current-code Llama E2E throughput win against the same
+GPU-memory setting. The best default-on hybrid run is `1.0065x` the fresh
+GPU-only repeat; the two explicit coalesced-prefix runs are `1.0043x` and
+`1.0027x`. The win is small, but it is no longer just the split752 near-tie.
+The planner-relevant condition is that one block of GPU KV savings was still too
+small; the two-block split736 capacity increase was large enough to offset the
+remaining split-attention overhead after coalescing.
+
+Negative controls from the same round:
+
+| Hybrid variant | Split | Out tok/s | Interpretation |
+|---|---:|---:|---|
+| Coalesced prefix | 752 | 3729.749 | one-block capacity gain still too small |
+| Coalesced + artifact copy | 752 | 3672.895 | explicit artifact copy hurts |
+| Coalesced + indexed merge | 752 | 3710.828 | indexed merge hurts this all/mixed-row case |
+| Coalesced + dummy GPU suffix | 752 | 3722.355 | no-real-CPU headroom is not enough at one block |
+| Coalesced prefix | 801 mem, split752 | 3740.070 | still below GPU-only 3793.228 at that cliff |
+
+Updated conclusion: the throughput win is achievable, but only after both
+conditions hold: the split GPU path must use coalesced prefix by default, and the
+planner must choose a split with enough integer/admission gain to pay the
+remaining LSE/merge/native-suffix overhead. For this Llama synthetic case that
+means split736 at 0.80, not the earlier split752 near-tail setting.
+
+
+
+## 2026-05-29 Follow-up: Robustness Checks After Coalesced Default
+
+After the first Llama split736 win, this round checked whether the same current
+code/defaults generalize across model geometry and lower-memory settings. All
+throughput runs below kept `VLLM_COTS_SUFFIX_NUM_THREADS=24`, eager execution,
+async scheduling disabled, B512, prompt608, total768, and CPU pool 12 GiB.
+
+Qwen2.5-7B at `gpu_memory_utilization=0.80`:
+
+| Mode | Split | Effective capacity | Out tok/s |
+|---|---:|---:|---:|
+| GPU-only | n/a | 82.96x | 5837.726 |
+| Hybrid | 736 | 86.57x | 5728.208 |
+| Hybrid | 752 | 84.72x | 5722.396 |
+
+Qwen still loses at 0.80. The reason is not CPU kernel raw speed; it is that
+Qwen already has very high GPU KV capacity because of its smaller KV footprint,
+so the extra capacity from moving one or two suffix blocks to CPU does not repay
+the split-attention overhead.
+
+Qwen2.5-7B at `gpu_memory_utilization=0.67`:
+
+| Mode | Split | Effective capacity | Out tok/s |
+|---|---:|---:|---:|
+| GPU-only | n/a | 8.04x | 2167.625 |
+| Hybrid | 752 | 8.21x | 2065.000 |
+
+Even under tight Qwen KV memory, the one-block capacity increase is only about
+`1.02x`, while the hybrid path costs more than that.
+
+Llama3.1-8B at `gpu_memory_utilization=0.75`:
+
+| Mode | Split | Effective capacity | Out tok/s |
+|---|---:|---:|---:|
+| GPU-only | n/a | 17.54x | 3041.334 |
+| Hybrid | 736 | 18.30x | 2975.872 |
+| Hybrid | 752 | 17.91x | 2929.964 |
+
+The Llama win at 0.80 does not extend to 0.75. At this lower memory point,
+capacity improves, but the scheduler/throughput dynamics do not repay the extra
+hybrid work. Split736 is still better than split752 here, but both lose.
+
+One stability caveat: a diagnostic rerun of Llama split736 at 0.80 without
+`VLLM_COTS_SUFFIX_NUM_THREADS=24` failed during engine initialization inside
+`cudaHostAlloc` from `install_wait_kernel_sync_for_task`. This happened after
+many rapid benchmark launches, so it should not be overinterpreted as a thread
+policy result. The verified win condition remains explicit about the 24-thread
+suffix setting.
+
+Updated planner conclusion: hybrid should not be globally enabled. The current
+measured win region is narrow but real: Llama3.1-8B, 0.80 GPU memory,
+split736/two CPU suffix blocks, coalesced-prefix default, 24 suffix threads. For
+Qwen and for lower-memory Llama 0.75, GPU-only remains faster under the same
+synthetic workload.
+
+
+## 2026-05-29 Follow-up: Default Suffix Thread Policy
+
+The previous Llama split736 win was still fragile because the verified runs set
+`VLLM_COTS_SUFFIX_NUM_THREADS=24`. With the env var absent, the native suffix
+runner previously returned `0` from the thread-policy helper and therefore did
+not force the CPU attention worker thread count.
+
+Code decision: make the native suffix runner default to
+`min(std::thread::hardware_concurrency(), 24)` threads when
+`VLLM_COTS_SUFFIX_NUM_THREADS` is unset or empty. Explicit invalid values or
+`0` still mean "do not override PyTorch threads" for diagnostics.
+
+Validation:
+
+```text
+cmake --build --preset release --target install
+# rebuilt _cots_C successfully
+
+/opt/conda/envs/thesis/bin/python -m pytest \
+  /TTC/vllm/tests/kernels/attention/test_cots_hybrid_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention_runner.py \
+  /TTC/vllm/tests/v1/worker/test_cots_hybrid_kv.py -q
+# 52 passed, 2 warnings
+```
+
+A small no-env counter probe with `VLLM_COTS_SUFFIX_COUNTERS=1` reported
+`COTS suffix worker threads req/obs: 24/24` once CPU suffix rows became active,
+confirming that the default policy is actually used by the native worker.
+
+Same-session no-env Llama3.1-8B E2E, B512, prompt608, total768,
+`gpu_memory_utilization=0.80`, eager, async scheduling disabled:
+
+| Mode | Split | Effective capacity | Out tok/s |
+|---|---:|---:|---:|
+| GPU-only | n/a | 30.15x | 3732.583 |
+| Hybrid | 736 | 31.46x | 3732.934 |
+
+Interpretation: the explicit `VLLM_COTS_SUFFIX_NUM_THREADS=24` launch condition
+is no longer required. The current no-env pair is effectively a tie with a tiny
+hybrid edge (`1.00009x`), smaller than the earlier split736 repeats, so the
+planner conclusion stays conservative: hybrid is measurable only in a narrow
+Llama 0.80/split736 region and should remain profile-gated. The earlier Qwen
+and lower-memory Llama checks still lose under this synthetic workload.
+
+
+## 2026-05-29 Follow-up: Longer Context and Two-Block Fusion
+
+This round tested two possible ways to turn the narrow Llama near-tie into a
+clearer throughput win. First, we tried longer total context with later splits;
+second, we expanded the fused scatter path from one suffix block to two suffix
+blocks, matching the current Llama split736 win candidate.
+
+Longer-context Llama3.1-8B checks, B512, eager, async scheduling disabled,
+`gpu_memory_utilization=0.80`, no explicit suffix-thread env:
+
+| Prompt / total | Mode | Split | Effective capacity | Out tok/s |
+|---|---|---:|---:|---:|
+| 896 / 1024 | GPU-only | n/a | 22.61x | 3629.406 |
+| 896 / 1024 | Hybrid | 896 | 25.84x | 2589.174 |
+| 896 / 1024 | Hybrid | 960 | 24.12x | 3467.995 |
+| 896 / 1024 | Hybrid | 992 | 23.34x | 3417.246 |
+| 960 / 1024 | GPU-only | n/a | 22.61x | 3887.210 |
+| 960 / 1024 | Hybrid | 960 | 24.12x | 3139.507 |
+
+The longer-context result is negative. Split896 has enough capacity gain, but
+128-token CPU suffix attention is too expensive. Split960 reduces CPU suffix to
+64 tokens and gets much closer, but still loses. Split992 is the two-block
+analogue of split736, but at total1024 the capacity gain is too small to repay
+hybrid overhead. Aligning the prompt to split960 also loses because the short
+decode length exposes hybrid overhead more than resident-capacity gain.
+
+Implementation change kept: set `kFusedScatterMaxSuffixBlocks = 2`. This keeps
+the same generic GQA suffix loop, but skips the standalone scatter call for
+small suffixes up to two blocks. It directly targets split736 and similar
+planner candidates without adding a separate one-block-only kernel.
+
+Validation after the two-block gate and pooled wait-slot change:
+
+```text
+cmake --build --preset release --target install
+# rebuilt _cots_C successfully
+
+/opt/conda/envs/thesis/bin/python -m pytest \
+  /TTC/vllm/tests/kernels/attention/test_cots_hybrid_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention_runner.py \
+  /TTC/vllm/tests/v1/worker/test_cots_hybrid_kv.py -q
+# 52 passed, 2 warnings
+```
+
+Llama3.1-8B split736 current-code result, B512, prompt608, total768,
+`gpu_memory_utilization=0.80`:
+
+| Mode | Split | Effective capacity | Out tok/s |
+|---|---:|---:|---:|
+| GPU-only | n/a | 30.15x | 3721.399 |
+| Hybrid, two-block fused scatter | 736 | 31.46x | 3787.940, 3781.640 |
+
+This is now a clearer repeatable win than the earlier near-tie: the two hybrid
+repeats are about `1.016x` to `1.018x` over the same-session GPU-only run.
+
+Robustness checks remain conservative:
+
+| Model / memory | Mode | Split | Effective capacity | Out tok/s | Interpretation |
+|---|---|---:|---:|---:|---|
+| Qwen2.5-7B / 0.80 | Hybrid | 736 | 86.57x | 5745.603 | Slightly better than prior split736, still below GPU-only 5837.726. |
+| Llama3.1-8B / 0.75 | Hybrid | 736 | 18.30x | 3000.362 | Better than prior split736, still below GPU-only 3041.334. |
+| Llama3.1-8B / 0.80, total1024 | Hybrid | 992 | 23.34x | 3417.246 | Two-block fusion is not enough for the longer-context split992 case. |
+
+A reliability fix landed in the same round: suffix wait-kernel sync now uses one
+mapped host slot pool instead of two `cudaHostAllocMapped` calls per prepared
+task. At B512, the previous path could perform tens of thousands of tiny mapped
+host allocations during engine initialization and repeatedly hit a segfault in
+`cudaHostAlloc` after many benchmark launches. After pooling, the same
+total1024/split992 launch that had just crashed initialized and completed.
+
+Updated planner conclusion: hybrid is now convincingly positive for the
+Llama3.1-8B 0.80/split736 synthetic point, but it is still not globally
+profitable. The planner should treat the two-block fused path as the preferred
+small-suffix candidate, then rely on measured profile/admission tables rather
+than enabling hybrid for all models, memory budgets, or longer contexts.
+
+
+## 2026-05-29 Follow-up: Qwen Tight-Memory Split Sweep
+
+After the two-block fused scatter change made Llama split736 clearly positive,
+this round revisited Qwen2.5-7B under the tighter `gpu_memory_utilization=0.67`
+setting. The hypothesis was that Qwen might need a slightly earlier split than
+Llama because its GPU-only KV capacity is small at this memory budget, while its
+CPU suffix attention is cheaper than Llama's.
+
+Workload: Qwen2.5-7B, B512, prompt608, total768, eager, async scheduling
+disabled, no explicit suffix-thread env.
+
+| Mode | Split | Effective capacity | Out tok/s |
+|---|---:|---:|---:|
+| GPU-only | n/a | 8.04x | 2156.910, 2161.736 |
+| Hybrid | 736 | 8.39x | 2102.544 |
+| Hybrid | 720 | 8.58x | 2122.198 |
+| Hybrid | 704 | 8.77x | 2154.900, 2160.484 |
+
+Split704 is the best current Qwen point, but it is still a noise-level tie, not
+a planner-worthy win. Its two-run mean is `2157.692` versus GPU-only mean
+`2159.323`. Split736 has too little capacity gain, while split720 and split704
+show that adding capacity helps until the larger CPU suffix cost eats it.
+
+A four-block fused scatter gate was tested specifically for split704, because
+that split has four CPU suffix blocks and was almost tied. It passed the suffix
+runner tests, but the target throughput regressed to `2142.811 out tok/s`. The
+experiment was reverted; the retained gate remains
+`kFusedScatterMaxSuffixBlocks = 2`. This is consistent with the earlier
+all-suffix fusion attempt: folding scatter into the attention loop helps very
+short suffixes, but starts hurting once the suffix is longer.
+
+Test coverage was strengthened with a prepared native runner case that scatters
+QKV into a true two-block suffix (`max_suffix_blocks=2`) for both Qwen and Llama
+GQA shapes. Targeted validation after reverting the four-block experiment:
+
+```text
+/opt/conda/envs/thesis/bin/python -m pytest \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention_runner.py -q
+# 9 passed, 2 warnings
+```
+
+Full focused Phase 2 validation with the added coverage:
+
+```text
+/opt/conda/envs/thesis/bin/python -m pytest \
+  /TTC/vllm/tests/kernels/attention/test_cots_hybrid_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention_runner.py \
+  /TTC/vllm/tests/v1/worker/test_cots_hybrid_kv.py -q
+# 54 passed, 2 warnings
+```
+
+Updated conclusion: the current implementation has a real Llama win, but Qwen
+still does not have a robust positive point in this synthetic B512/prompt608/
+total768 sweep. The Qwen 0.67 result is useful for the planner because it marks
+the boundary: extra CPU KV capacity can bring hybrid to parity, but the current
+CPU suffix/merge envelope is still a little too expensive for a reliable Qwen
+throughput win.
+
+## 2026-05-29 Follow-up: Unchecked Native Scatter Fallback
+
+The next Qwen throughput attempt targeted the remaining split704 gap rather than
+changing the split policy. Counter runs showed that split704 uses four CPU suffix
+blocks, so it does not take the retained two-block fused scatter path. In this
+fallback path the prepared native runner was still calling the public checked
+scatter wrapper on every layer. That wrapper revalidated tensor shapes, dtypes,
+block IDs, and block offsets before the actual K/V copy, even though the runner
+had already built the metadata.
+
+Change: add an internal `gqa_bf16_scatter_suffix_kv_unchecked_at` helper and use
+it only from the prepared native worker's standalone scatter fallback. The
+public Python-visible `gqa_bf16_scatter_suffix_kv` entry point remains checked.
+
+Target workload: Qwen2.5-7B, B512, prompt608, total768,
+`gpu_memory_utilization=0.67`, split704, eager, async scheduling disabled, no
+explicit suffix-thread env.
+
+| Mode | Effective capacity | Out tok/s |
+|---|---:|---:|
+| GPU-only | 8.04x | 2159.264, 2156.436 |
+| Hybrid split704 | 8.77x | 2166.316, 2163.732 |
+
+The paired means are `2157.850` GPU-only versus `2165.024` hybrid, or about
+`1.0033x` for hybrid. This is still a very small win, but it is the first
+same-session Qwen tight-memory result that is consistently above GPU-only rather
+than a tie/slight loss.
+
+Diagnostic caveat: the counter run itself perturbs throughput (`2142.667 out
+tok/s` with counters enabled before this optimization), but it usefully showed
+that the residual Qwen cost was on the native suffix worker path rather than
+submit/callback overhead. The standalone scatter slice was smaller than CPU
+suffix attention, so this optimization was expected to be incremental, not a
+large step-function improvement.
+
+Updated conclusion: we now have two narrow positive points: Llama3.1-8B at
+0.80/split736 and Qwen2.5-7B at 0.67/split704. Both are small synthetic wins,
+not enough to enable hybrid unconditionally. The planner should still require
+per-model/per-memory profiling, but hybrid is no longer universally losing in
+our measured throughput path.
+
+## 2026-05-29 Follow-up: Small-Suffix Two-Pass CPU Attention
+
+After unchecked standalone scatter, the residual Qwen split704 cost was still
+inside the native suffix worker, with CPU suffix attention dominating submit,
+callback, queue, and scatter time. A quick thread-policy probe did not improve
+things: Qwen split704 at `gpu_memory_utilization=0.67` produced `2161.656 out
+tok/s` with `VLLM_COTS_SUFFIX_NUM_THREADS=16` and `2101.280 out tok/s` with
+`VLLM_COTS_SUFFIX_NUM_THREADS=32`, so the retained default cap of 24 threads
+remains the best observed policy among these checks.
+
+The next general kernel attempt was a small-suffix two-pass attention path for
+`seq_len <= 128`. The existing online-softmax loop is robust, but for short CPU
+suffixes it does two exponentials per token per query head and rescales the
+partial output vector every token. The new path computes logits/max first, then
+runs a softmax/value pass with one exponential per token and no per-token output
+rescale. Longer suffixes keep the existing online path.
+
+Implementation notes:
+
+- The threshold is `kTwoPassMaxSeqLen = 128` in the GQA CPU suffix kernel.
+- Scratch logits use a fixed thread-local buffer sized for `kMaxHeadsPerKV` so
+  the hot path avoids per-task heap allocation. A first version with a large
+  template-dependent stack array triggered a GCC 11 internal compiler error at
+  `-O3`; the thread-local fixed buffer rebuilt cleanly.
+- Exact-threshold correctness coverage was added with `seq_lens=[128, 128]` for
+  both Qwen and Llama GQA shapes.
+
+Qwen2.5-7B, B512, prompt608, total768, `gpu_memory_utilization=0.67`, split704,
+eager, async scheduling disabled, no explicit suffix-thread env:
+
+| Mode | Effective capacity | Out tok/s |
+|---|---:|---:|
+| GPU-only | 8.04x | 2162.435 |
+| Hybrid split704, two-pass | 8.77x | 2180.878, 2168.010 |
+
+The two hybrid runs average `2174.444 out tok/s`, about `1.0055x` over the fresh
+GPU-only run. This is still modest, but it is a clearer margin than the
+unchecked-scatter-only result.
+
+Llama3.1-8B, B512, prompt608, total768, `gpu_memory_utilization=0.80`, split736:
+
+| Mode | Effective capacity | Out tok/s |
+|---|---:|---:|
+| GPU-only | 30.15x | 3742.022 |
+| Hybrid split736, two-pass | 31.46x | 3777.188 |
+
+Llama remains positive at about `1.0094x` over the fresh GPU-only baseline,
+though this single hybrid run is slightly below the earlier best two-block
+fusion pair (`3787.940`, `3781.640`). The important point is that the general
+small-suffix two-pass path improves Qwen without destroying the Llama win.
+
+Focused validation after the change:
+
+```text
+/opt/conda/envs/thesis/bin/python -m pytest \
+  /TTC/vllm/tests/kernels/attention/test_cots_hybrid_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention_runner.py \
+  /TTC/vllm/tests/v1/worker/test_cots_hybrid_kv.py -q
+# 58 passed, 2 warnings
+```
+
+Updated conclusion: hybrid now has small but repeatable positive synthetic
+points for both Qwen tight-memory and Llama mid-memory settings. The win is not
+large enough to justify unconditional hybrid admission, but the planner now has
+credible positive profile points rather than only parity/near-losses.
+
+## 2026-05-29 Follow-up: Two-Pass Boundary Checks
+
+The small-suffix two-pass CPU attention path improves the native suffix cost, but
+it does not make every previously losing split profitable. Two paired boundary
+checks are important for planner policy.
+
+Llama3.1-8B, B512, prompt608, total768, split736,
+`gpu_memory_utilization=0.75`:
+
+| Mode | Effective capacity | Out tok/s |
+|---|---:|---:|
+| GPU-only | 17.54x | 3043.805 |
+| Hybrid split736, two-pass | 18.30x | 2985.842 |
+
+This point remains negative. Even though hybrid increases effective capacity by
+about 4.3%, the lower-memory Llama run still does not gain enough batching
+benefit to cover the hybrid suffix path overhead.
+
+Qwen2.5-7B, B512, prompt608, total768, split736,
+`gpu_memory_utilization=0.80`:
+
+| Mode | Effective capacity | Out tok/s |
+|---|---:|---:|
+| GPU-only | 82.96x | 5829.575 |
+| Hybrid split736, two-pass | 86.57x | 5758.882 |
+
+This point also remains negative. The two-pass path narrows the earlier Qwen
+0.80 gap, but the capacity gain at split736 is still too small for a throughput
+win.
+
+Planner implication: hybrid should be selected only from measured positive
+profile cells, not from a monotonic "less GPU memory always helps hybrid" rule.
+The current positive cells are Qwen 0.67/split704 and Llama 0.80/split736; Qwen
+0.80/split736 and Llama 0.75/split736 should remain GPU-only unless a later
+optimization changes the measured balance.
+
+## 2026-05-29 Follow-up: Graph-Mode and Rejected Return-Path Attempts
+
+After the small-suffix two-pass kernel produced narrow eager-mode wins, this
+round checked whether the remaining gap could be reduced by restoring older
+kernel tiling, changing the suffix artifact return path, or moving the same
+cells to CUDA graph mode.
+
+First, the old two-token QK tile was restored inside the current generic
+small-suffix two-pass path as an experiment. It rebuilt and passed focused
+suffix correctness (`28 passed, 2 warnings`), but the focused prepared runner
+regressed in both model shapes, so the edit was reverted:
+
+| Shape | Case | Before | With QK pair tile | Decision |
+|---|---|---:|---:|---|
+| Qwen2.5-7B | B512, suffix64, prepared+scatter | 57.396 ms | 60.842 ms | Revert |
+| Llama3.1-8B | B512, suffix32, prepared+scatter | 64.650 ms | 66.395 ms | Revert |
+
+This is different from the earlier pre-two-pass QK tile result. In the current
+two-pass structure, token pairing increases register pressure and does not help
+the hot short-suffix path.
+
+Second, explicit suffix artifact H2D copy was tested with
+`VLLM_COTS_HYBRID_SUFFIX_ARTIFACT_COPY=1`. This avoids UVA reads of the CPU
+suffix output/LSE during merge, but the extra copy and synchronization cost more
+than they save:
+
+| Model / setting | Hybrid default | Hybrid with artifact copy | Decision |
+|---|---:|---:|---|
+| Qwen2.5-7B, 0.67, split704, eager | 2180.878, 2168.010 | 2126.835 | Keep UVA merge path |
+| Llama3.1-8B, 0.80, split736, eager | 3777.188 | 3728.901 | Keep UVA merge path |
+
+Third, graph mode was evaluated on the two positive eager cells. Llama remains
+slightly positive, but Qwen does not:
+
+| Model / setting | Mode | Effective capacity | Out tok/s |
+|---|---|---:|---:|
+| Llama3.1-8B, 0.80, split736, graph | GPU-only | 29.96x | 3753.398 |
+| Llama3.1-8B, 0.80, split736, graph | Hybrid | 30.98x | 3766.721 |
+| Qwen2.5-7B, 0.67, split704, graph | GPU-only | 7.62x | 2192.026 |
+| Qwen2.5-7B, 0.67, split704, graph | Hybrid | 7.75x | 2005.585 |
+
+Graph memory changes the capacity math: both modes lose some KV capacity to CUDA
+graph pools, and the COTS graph path defaults to PIECEWISE capture. For Llama,
+the hybrid capacity increase still beats the suffix overhead by a small margin.
+For Qwen, graph-mode hybrid overhead is too large and the eager Qwen win should
+not be treated as graph-robust.
+
+A benchmark-only flag, `--cots-auto-graph-split {auto,true,false}`, was added to
+`benchmark_ratio_e2e.py` so graph policy can be A/B tested without changing
+runtime defaults. Disabling the automatic COTS graph split for the Qwen hybrid
+cell failed during engine initialization in legacy FULL+PIECEWISE capture with
+`cudaErrorInvalidValue` from `_synchronize_static_metadata_reuse()` while
+profiling CUDA graph memory. For now, the automatic PIECEWISE policy is the only
+validated COTS hybrid graph policy in this workload.
+
+Updated conclusion: the measured throughput win is real but narrower in graph
+mode. Current validated positive cells are Llama3.1-8B 0.80/split736 in eager and
+graph mode, and Qwen2.5-7B 0.67/split704 in eager mode only. Artifact-copy and
+current two-pass QK pairing should not be kept. The planner/profiler must record
+execution mode as part of the profile key; eager Qwen data cannot be reused for
+graph-mode admission.
+
+## 2026-05-29 Follow-up: Qwen Graph Split Recovery
+
+The first Qwen graph-mode check used the eager-optimal split704 and lost badly:
+GPU-only was `2192.026 out tok/s`, while hybrid split704 was only
+`2005.585 out tok/s`. The graph logs showed why this was not directly comparable
+to the eager split704 result: CUDA graph memory reduced hybrid GPU KV capacity to
+`5456` tokens, so split704 gave only `7.75x` effective capacity versus GPU-only
+`7.62x`. The eager split704 point had `8.77x` effective capacity, so graph mode
+had erased most of the planner benefit.
+
+A small graph-mode split sweep recovered the Qwen win by moving the split earlier:
+
+| Mode | Split | Effective capacity | Out tok/s |
+|---|---:|---:|---:|
+| GPU-only graph | n/a | 7.62x | 2192.026, 2193.239 |
+| Hybrid graph | 704 | 7.75x | 2005.585 |
+| Hybrid graph | 688 | 7.93x | 2087.088 |
+| Hybrid graph | 672 | 8.12x | 2242.814, 2251.883 |
+
+This is an important correction to the previous graph-mode conclusion. Qwen graph
+mode is not inherently unable to win; the eager-optimal split was wrong once CUDA
+graph memory reduced available GPU KV. With split672, the hybrid graph runs beat
+the fresh GPU-only graph baseline by about `2.3-2.7%`.
+
+Updated planner implication: split selection must be keyed by execution mode and
+actual graph-memory-adjusted GPU KV capacity. For Qwen2.5-7B at
+`gpu_memory_utilization=0.67`, the current positive graph cell is split672, not
+split704. The broader rule is not "graph mode disables Qwen hybrid"; it is
+"graph mode changes the effective capacity curve, so the profiler must resweep
+splits under the graph policy it will actually run." The automatic PIECEWISE COTS
+graph policy remains required; disabling it still fails in legacy full capture.
+
+## 2026-05-29 Follow-up: Llama 0.75 Split Resweep
+
+After Qwen graph split recovery, the lower-memory Llama loss was rechecked to see
+whether the earlier negative result was simply a bad split. Same-session eager
+runs used Llama3.1-8B, B512, prompt608, total768,
+`gpu_memory_utilization=0.75`, async scheduling disabled, no explicit suffix
+artifact copy, default 24 suffix threads:
+
+| Mode | Split | Effective capacity | Out tok/s | vs fresh GPU-only |
+|---|---:|---:|---:|---:|
+| GPU-only eager | n/a | 17.54x | 3019.741 | 1.000x |
+| Hybrid eager | 752 | 17.91x | 2938.010 | 0.973x |
+| Hybrid eager | 736 | 18.30x | 3006.745 | 0.996x |
+| Hybrid eager | 720 | 18.71x | 2946.139 | 0.976x |
+
+Split736 is still the best lower-memory Llama point, but it remains just below
+the fresh GPU-only baseline. Moving the split later gives too little capacity
+gain; moving it earlier gives slightly more capacity but raises suffix overhead
+faster than admission capacity improves.
+
+The same lower-memory point was then checked under graph mode:
+
+| Mode | Split | Effective capacity | Out tok/s | vs GPU-only graph |
+|---|---:|---:|---:|---:|
+| GPU-only graph | n/a | 17.35x | 3102.410 | 1.000x |
+| Hybrid graph | 736 | 17.83x | 2885.644 | 0.930x |
+
+Graph mode does not rescue this Llama 0.75 case. The hybrid graph run has only a
+small capacity gain after graph-memory accounting, while it still pays the
+PIECEWISE split path and real CPU suffix return path. This reinforces the planner
+rule: lower GPU memory is not monotonic evidence for hybrid. The selected split
+must produce enough measured effective-capacity gain, under the exact execution
+mode, to exceed the suffix path tax. For current code, Llama 0.75 should remain
+GPU-only, while the validated positive Llama cell remains the mid-memory 0.80
+split736 case.
+
+## 2026-05-29 Follow-up: Qwen Graph Win Repeat Validation
+
+A same-session current-code repeat was run for the strongest positive cell found
+so far: Qwen2.5-7B, B512, prompt608, total768,
+`gpu_memory_utilization=0.67`, graph mode, async scheduling disabled. The split
+is the graph-reswept split672, not the eager-optimal split704.
+
+| Mode | Split | Effective capacity | Out tok/s |
+|---|---:|---:|---:|
+| GPU-only graph | n/a | 7.62x | 2179.022 |
+| GPU-only graph | n/a | 7.62x | 2177.591 |
+| Hybrid graph | 672 | 8.12x | 2249.883 |
+| Hybrid graph | 672 | 8.12x | 2243.443 |
+
+Same-session means: GPU-only `2178.306 out tok/s`, hybrid `2246.663 out tok/s`,
+or `1.031x` hybrid/GPU-only. Combining these two fresh repeats with the previous
+Qwen graph split672 evidence gives GPU-only mean `2185.469` and hybrid mean
+`2247.006`, or `1.028x` hybrid/GPU-only across four runs per side.
+
+This is the cleanest current Phase 2 throughput-win cell. It is larger and more
+repeatable than the narrow Llama 0.80/split736 edge. The mechanism is also clear:
+CUDA graph memory changes the effective capacity curve, and split672 raises Qwen
+hybrid from `7.62x` GPU-only capacity to `8.12x` while the Qwen CPU suffix path is
+cheap enough for that extra admission capacity to dominate. Planner/profiler
+selection should therefore include this cell as a hybrid-positive graph-mode
+profile entry, while still rejecting Qwen graph split704 and Llama 0.75.
+
+## 2026-05-29 Follow-up: Profile-Gated Planner Hook
+
+Historical note: this planner hook was removed on 2026-05-30 and is retained here only as investigation history.
+
+The repeatable Qwen graph win had been turned into an executable planner
+selection rule rather than only a prose result. `FastTTS-thesis/planner.py` keeps
+manual planner behavior unchanged, but adds an optional `phase2_kv_profile` block
+that can hold inline measured cells or load them from a JSON artifact. The
+selector only enables COTS hybrid KV when all of these are true:
+
+- the measured cell matches role, model, dtype, GPU-memory utilization,
+  `enforce_eager`/graph mode, `max_model_len`, and any configured
+  `max_num_seqs`;
+- the measured hybrid output-token throughput is at least `1 + win_margin` times
+  the matched GPU-only baseline;
+- the engine plan did not already provide an explicit manual KV plan.
+
+The measured-cell artifact lives at
+`David/Benchmarks/phase2/phase2_kv_measurement_cells.json`. It includes the current
+positive and negative synthetic cells, including Qwen graph 0.67/split672,
+Qwen eager 0.67/split704, Llama 0.80/split736, and the rejected Llama 0.75 and
+Qwen graph split704 cells. With the default `win_margin=0.01`, the robust Qwen
+graph split672 cell is selected. After the current-code Llama eager repeat below,
+Llama 0.80/split736 also clears the default margin; narrower sub-1% cells still
+require an explicitly lower margin and remain less planner-worthy.
+
+Focused validation for this planner hook:
+
+```text
+/opt/conda/envs/thesis/bin/python -m py_compile \
+  /TTC/FastTTS-thesis/planner.py \
+  /TTC/David/Benchmarks/phase2/test_phase2_manual_planner.py
+# passed
+
+/opt/conda/envs/thesis/bin/python -m pytest \
+  /TTC/David/Benchmarks/phase2/test_phase2_manual_planner.py -q
+# 6 passed
+
+/opt/conda/envs/thesis/bin/python -m json.tool \
+  /TTC/David/Benchmarks/phase2/phase2_kv_measurement_cells.json
+# valid JSON
+```
+
+This closes the immediate planner concern raised during the investigation: the
+planner will not blindly choose hybrid just because CPU KV exists. It now has a
+profile-gated path that selects hybrid for the measured positive graph-mode Qwen
+cell and leaves measured negative cells GPU-only.
+
+## 2026-05-29 Follow-up: Planner Dry-Run Tightening
+
+Historical note: this tightening applied to the removed profile-gated hook.
+
+The profile-gated planner hook was tightened after dry-running it against the
+validated Qwen graph cell. Three benchmark details are now part of the
+measured profile contract:
+
+- `async_scheduling=false` is a matched profile field. A config that explicitly
+  enables async scheduling will not consume the cell.
+- `disable_hybrid_kv_cache_manager=true` is carried as a measured
+  `engine_overrides` entry. The selector applies it when absent, and rejects the
+  cell if the launch config explicitly conflicts.
+- Workload shape is now part of the profile key. The Qwen-positive artifact cell
+  records `batch=512`, `prompt_tokens=608`, `total_tokens=768`,
+  `suffix_tokens=160`, and `prompt_mode=shared`; the selector only consumes that
+  cell when the planner config provides the same workload descriptor.
+
+Dry-run resolved generator vLLM kwargs for the validated Qwen graph cell now
+match the benchmark-critical launch shape:
+
+```json
+{
+  "async_scheduling": false,
+  "cots_f_cpu_store": 0.0,
+  "cots_f_prefetch": 0.0,
+  "cots_kv_cpu_pool_bytes": 12884901888,
+  "cots_kv_h2d_mode": "uva",
+  "cots_kv_split_blocks": 42,
+  "disable_hybrid_kv_cache_manager": true,
+  "disable_log_stats": true,
+  "dtype": "bfloat16",
+  "enforce_eager": false,
+  "gpu_memory_utilization": 0.67,
+  "max_model_len": 768,
+  "max_num_seqs": 512,
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "offload_backend": "cots",
+  "trust_remote_code": true
+}
+```
+
+Additional focused validation:
+
+```text
+/opt/conda/envs/thesis/bin/python -m pytest \
+  /TTC/David/Benchmarks/phase2/test_phase2_manual_planner.py -q
+# 10 passed
+```
+
+This makes the current positive cell planner-ready in the practical sense: the
+profile selector emits the same COTS KV geometry and execution-mode knobs used by
+the repeat-validated benchmark, and measured negative or runtime-mismatched cells
+remain GPU-only.
+
+
+## 2026-05-29 Follow-up: Llama Eager Profile Promotion
+
+Historical note: this promotion applied to the removed profile-gated hook; the cell remains useful measurement data.
+
+The Llama3.1-8B eager split736 cell was rerun because the existing profile
+artifact recorded it as a narrow `1.009x` win, just below the default planner
+margin. Same-session current-code repeats used B512, prompt608, total768,
+`gpu_memory_utilization=0.80`, eager mode, async scheduling disabled,
+`max_num_seqs=512`, CPU pool 12 GiB, no explicit suffix-thread env:
+
+| Mode | Split | Effective capacity | Out tok/s |
+|---|---:|---:|---:|
+| GPU-only eager | n/a | 30.15x | 3711.019, 3702.521 |
+| Hybrid eager | 736 | 31.46x | 3776.895, 3762.405 |
+
+The fresh means are `3706.770 out tok/s` for GPU-only and `3769.650 out tok/s`
+for hybrid, or `1.017x` hybrid/GPU-only. The profile artifact now stores this
+current-code repeat under `llama-eager-0.80-split736-current-repeat`, so the
+default `win_margin=0.01` selector can choose both the robust Qwen graph cell and
+this Llama eager cell when the exact workload/runtime key matches. Llama 0.75 and
+Qwen graph split704 remain negative control cells.
+
+Focused planner coverage was extended with a default-margin Llama eager selection
+test; a workload mismatch test remains in place so this profile still cannot leak
+to a different prompt/batch shape.
+
+Focused implementation validation after this profile promotion still passes the
+Phase 2 hybrid attention/suffix/KV suite:
+
+```text
+/opt/conda/envs/thesis/bin/python -m pytest \
+  /TTC/vllm/tests/kernels/attention/test_cots_hybrid_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention.py \
+  /TTC/vllm/tests/kernels/attention/test_cots_suffix_attention_runner.py \
+  /TTC/vllm/tests/v1/worker/test_cots_hybrid_kv.py -q
+# 58 passed, 2 warnings
+```
+
+## 2026-05-30 Follow-up: Planner Policy Hook Removed
+
+The profile-gated planner hook described above has been removed from
+`FastTTS-thesis/planner.py`. The current evidence shows real positive cells, but
+it does not yet define a general planner policy: Qwen and Llama react differently
+to memory pressure, graph mode changes the effective capacity curve, and Phase 3
+will also need to account for interactions with weight offload.
+
+Current planner behavior is intentionally manual again:
+
+- `planner_config.generator.kv` / `planner_config.verifier.kv` can still force a
+  diagnostic hybrid KV split and CPU pool.
+- `phase2_kv_profile` / `kv_profile` blocks are ignored for now.
+- The JSON cell artifact is retained as measurement data, not as launch-time
+  policy input.
+
+This keeps the codebase honest before the next round of policy work: throughput
+measurements can guide experiments, but the planner will not automatically choose
+hybrid until the combined KV/weight-offload policy is modeled and validated.

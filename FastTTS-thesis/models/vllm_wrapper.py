@@ -258,6 +258,14 @@ class _CotsHybridKVStatsAcc:
         "q_d2h_bytes",
         "kv_d2h_bytes",
         "kv_uva_h2d_bytes",
+        "suffix_submit_prepare_ms",
+        "suffix_submit_metadata_snapshot_ms",
+        "suffix_submit_launch_hostfunc_ms",
+        "suffix_dispatch_cb_ms",
+        "suffix_dispatch_snapshot_ms",
+        "suffix_dispatch_enqueue_ms",
+        "suffix_worker_scatter_ms",
+        "suffix_worker_attention_ms",
     )
 
     def __init__(self):

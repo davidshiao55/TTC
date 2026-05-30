@@ -1,0 +1,184 @@
+{
+  "schema": "phase2_kv_measurements.v1",
+  "hardware": "RTX4090+i9-14900KF",
+  "dtype": "bfloat16",
+  "notes": "Measured Phase 2 synthetic B512 prompt608 total768 cells for measurement analysis only. The FastTTS manual planner no longer consumes this artifact; automatic hybrid policy selection is deferred until the general hybrid/weight-offload policy is pinned down.",
+  "cells": [
+    {
+      "label": "qwen-graph-0.67-split672-repeat-mean",
+      "roles": [
+        "generator"
+      ],
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.67,
+      "enforce_eager": false,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "split_blocks": 42,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 2178.306,
+      "hybrid_out_tok_s": 2246.663,
+      "repeats": {
+        "gpu_only_out_tok_s": [
+          2179.022,
+          2177.591
+        ],
+        "hybrid_out_tok_s": [
+          2249.883,
+          2243.443
+        ]
+      },
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "suffix_tokens": 160,
+      "prompt_mode": "shared"
+    },
+    {
+      "label": "qwen-eager-0.67-split704-two-pass",
+      "roles": [
+        "generator"
+      ],
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.67,
+      "enforce_eager": true,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "split_blocks": 44,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 2162.435,
+      "hybrid_out_tok_s": 2174.444,
+      "repeats": {
+        "hybrid_out_tok_s": [
+          2180.878,
+          2168.01
+        ]
+      },
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "suffix_tokens": 160,
+      "prompt_mode": "shared"
+    },
+    {
+      "label": "llama-eager-0.80-split736-current-repeat",
+      "roles": [
+        "generator"
+      ],
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.8,
+      "enforce_eager": true,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "split_blocks": 46,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 3706.77,
+      "hybrid_out_tok_s": 3769.65,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "suffix_tokens": 160,
+      "prompt_mode": "shared",
+      "repeats": {
+        "gpu_only_out_tok_s": [
+          3711.019,
+          3702.521
+        ],
+        "hybrid_out_tok_s": [
+          3776.895,
+          3762.405
+        ]
+      }
+    },
+    {
+      "label": "llama-graph-0.80-split736",
+      "roles": [
+        "generator"
+      ],
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.8,
+      "enforce_eager": false,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "split_blocks": 46,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 3753.398,
+      "hybrid_out_tok_s": 3766.721,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "suffix_tokens": 160,
+      "prompt_mode": "shared"
+    },
+    {
+      "label": "llama-eager-0.75-split736-negative",
+      "roles": [
+        "generator"
+      ],
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.75,
+      "enforce_eager": true,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "split_blocks": 46,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 3019.741,
+      "hybrid_out_tok_s": 3006.745,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "suffix_tokens": 160,
+      "prompt_mode": "shared"
+    },
+    {
+      "label": "qwen-graph-0.67-split704-negative",
+      "roles": [
+        "generator"
+      ],
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.67,
+      "enforce_eager": false,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "split_blocks": 44,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 2192.026,
+      "hybrid_out_tok_s": 2005.585,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "suffix_tokens": 160,
+      "prompt_mode": "shared"
+    }
+  ]
+}
