@@ -4314,6 +4314,90 @@ Phase 2 hybrid attention/suffix/KV suite:
 # 58 passed, 2 warnings
 ```
 
+
+## 2026-05-30 Follow-up: Longer-Sequence Policy Probe
+
+A first post-cleanup policy probe tested whether increasing the generation
+length makes the existing hybrid wins more general. The hypothesis was that a
+longer total sequence should increase the value of each GPU KV token saved by
+the split, especially when the split stays near the tail. The result was
+negative for both model families in the tested cells.
+
+Llama3.1-8B, B512, prompt608, total1024, `gpu_memory_utilization=0.80`, eager,
+async scheduling disabled, CPU pool 12 GiB:
+
+| Mode | Split | Effective capacity | CPU suffix tokens at end | Out tok/s | vs GPU-only |
+|---|---:|---:|---:|---:|---:|
+| GPU-only | n/a | 22.61x | n/a | 2617.170 | 1.000x |
+| Hybrid | 864 | 26.80x | 160 | 2310.760 | 0.883x |
+| Hybrid | 928 | 24.95x | 96 | 2415.867 | 0.923x |
+| Hybrid | 960 | 24.12x | 64 | 2455.014 | 0.938x |
+| Hybrid | 1008 | 22.97x | 16 | 2437.183 | 0.931x |
+
+The total768 Llama split736 cell was narrowly positive, but the total1024 sweep
+did not generalize it. Even split960 has a larger capacity gain than the
+total768 split736 case, but doubling the suffix length from 32 to 64 tokens and
+running a longer active hybrid interval erases the benefit. The split1008
+one-block control is also negative: exact split1024/no-suffix hybrid is rejected
+at initialization because COTS hybrid KV requires at least one CPU suffix block,
+but activating only the final 16 tokens still loses about 7% to GPU-only.
+
+Qwen2.5-7B, B512, prompt608, total1024, `gpu_memory_utilization=0.67`, graph
+mode, async scheduling disabled, CPU pool 12 GiB:
+
+| Mode | Split | Effective capacity | CPU suffix tokens at end | Out tok/s | vs GPU-only |
+|---|---:|---:|---:|---:|---:|
+| GPU-only graph | n/a | 5.72x | n/a | 1154.997 | 1.000x |
+| Hybrid graph | 928 | 5.88x | 96 | 964.014 | 0.835x |
+| Hybrid graph | 864 | 6.31x | 160 | 963.753 | 0.835x |
+
+For Qwen graph mode, increasing `max_model_len` to 1024 moves the run into a
+very memory-limited regime, but COTS graph mode also has fewer GPU KV tokens
+than the GPU-only graph baseline (`5456` vs `5856`). Split928 therefore gives
+only a tiny effective-capacity increase, and split864 gives about a 10% capacity
+increase but pays too much active suffix/merge overhead.
+
+Policy implication: longer total length is not a sufficient monotonic predictor
+for hybrid. The useful predictor has to include at least execution mode,
+graph-memory-adjusted GPU KV tokens, split-derived effective capacity gain, and
+end-of-run CPU suffix length. Current positive cells stay narrow: Qwen graph
+total768/split672 and Llama eager total768/split736. The split1008 Llama control
+suggests a fixed active-hybrid tax remains even when CPU suffix work is only one
+block, so the next attempt should measure and reduce the active transition path
+rather than assume a later split is cheap enough.
+
+
+## 2026-05-30 Follow-up: One-Block Active-Suffix Tax Breakdown
+
+The Llama total1024/split1008 one-block control was rerun with
+`VLLM_COTS_HYBRID_CUDA_TIMING=1`, `VLLM_COTS_SUFFIX_COUNTERS=1`,
+`VLLM_LOG_STATS_INTERVAL=5`, and vLLM stats enabled. This run is diagnostic, not
+a throughput baseline, because CUDA timing instrumentation lowered end-to-end
+throughput to `2151.767 out tok/s`.
+
+The active windows showed the minimum suffix case is not primarily CPU suffix
+compute bound. Representative 5-second stats windows over 32 layer calls:
+
+| Window shape | Mixed prefix gpu/wall ms | CPU suffix attn ms | Native busy ms | UVA artifacts MB |
+|---|---:|---:|---:|---:|
+| 96 suffix rows | 5.858 / 17.530 | 1.779 | 2.037 | 0.799 |
+| 192 suffix rows | 5.710 / 18.508 | 1.819 | 3.226 | 1.597 |
+| 192 suffix rows, large prefix rows | 35.688 / 95.073 | 3.968 | 7.518 | 1.597 |
+| 64 suffix rows, large prefix rows | 19.333 / 52.852 | 3.972 | 4.925 | 0.532 |
+| 32 suffix rows | 5.941 / 16.988 | 1.705 | 0.382 | 0.266 |
+
+Submit/dispatch overhead was small in comparison: suffix submit
+prep/snapshot/launch was typically about `0.13-0.16 ms` total per stats window,
+and dispatch callback/snapshot/enqueue was usually below `0.15 ms`. Q/K/V D2H
+and UVA artifacts were also tiny in bandwidth terms.
+
+This strengthens the current bottleneck diagnosis: even the one-block suffix
+case pays a mixed active-prefix path whose wall time is tens of milliseconds per
+stats window, while CPU suffix attention is usually only a few milliseconds. The
+next throughput attempt should therefore target the active mixed prefix/LSE path
+or the scheduling pattern that creates large mixed prefix-row work, not another
+CPU suffix micro-optimization.
+
 ## 2026-05-30 Follow-up: Planner Policy Hook Removed
 
 The profile-gated planner hook described above has been removed from

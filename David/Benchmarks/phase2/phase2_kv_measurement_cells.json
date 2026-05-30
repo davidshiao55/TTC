@@ -179,6 +179,187 @@
       "total_tokens": 768,
       "suffix_tokens": 160,
       "prompt_mode": "shared"
+    },
+    {
+      "label": "llama-eager-0.80-total1024-split864-negative",
+      "roles": [
+        "generator"
+      ],
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.8,
+      "enforce_eager": true,
+      "max_model_len": 1024,
+      "max_num_seqs": 512,
+      "split_blocks": 54,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 2617.17,
+      "hybrid_out_tok_s": 2310.76,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 1024,
+      "suffix_tokens": 416,
+      "cpu_suffix_tokens_at_end": 160,
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 22.61,
+      "hybrid_effective_capacity": 26.8,
+      "gpu_only_gpu_kv_tokens": 23152,
+      "hybrid_gpu_kv_tokens": 23152
+    },
+    {
+      "label": "llama-eager-0.80-total1024-split928-negative",
+      "roles": [
+        "generator"
+      ],
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.8,
+      "enforce_eager": true,
+      "max_model_len": 1024,
+      "max_num_seqs": 512,
+      "split_blocks": 58,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 2617.17,
+      "hybrid_out_tok_s": 2415.867,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 1024,
+      "suffix_tokens": 416,
+      "cpu_suffix_tokens_at_end": 96,
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 22.61,
+      "hybrid_effective_capacity": 24.95,
+      "gpu_only_gpu_kv_tokens": 23152,
+      "hybrid_gpu_kv_tokens": 23152
+    },
+    {
+      "label": "llama-eager-0.80-total1024-split960-negative",
+      "roles": [
+        "generator"
+      ],
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.8,
+      "enforce_eager": true,
+      "max_model_len": 1024,
+      "max_num_seqs": 512,
+      "split_blocks": 60,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 2617.17,
+      "hybrid_out_tok_s": 2455.014,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 1024,
+      "suffix_tokens": 416,
+      "cpu_suffix_tokens_at_end": 64,
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 22.61,
+      "hybrid_effective_capacity": 24.12,
+      "gpu_only_gpu_kv_tokens": 23152,
+      "hybrid_gpu_kv_tokens": 23152
+    },
+    {
+      "label": "qwen-graph-0.67-total1024-split928-negative",
+      "roles": [
+        "generator"
+      ],
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.67,
+      "enforce_eager": false,
+      "max_model_len": 1024,
+      "max_num_seqs": 512,
+      "split_blocks": 58,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 1154.997,
+      "hybrid_out_tok_s": 964.014,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 1024,
+      "suffix_tokens": 416,
+      "cpu_suffix_tokens_at_end": 96,
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 5.72,
+      "hybrid_effective_capacity": 5.88,
+      "gpu_only_gpu_kv_tokens": 5856,
+      "hybrid_gpu_kv_tokens": 5456
+    },
+    {
+      "label": "qwen-graph-0.67-total1024-split864-negative",
+      "roles": [
+        "generator"
+      ],
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.67,
+      "enforce_eager": false,
+      "max_model_len": 1024,
+      "max_num_seqs": 512,
+      "split_blocks": 54,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 1154.997,
+      "hybrid_out_tok_s": 963.753,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 1024,
+      "suffix_tokens": 416,
+      "cpu_suffix_tokens_at_end": 160,
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 5.72,
+      "hybrid_effective_capacity": 6.31,
+      "gpu_only_gpu_kv_tokens": 5856,
+      "hybrid_gpu_kv_tokens": 5456
+    },
+    {
+      "label": "llama-eager-0.80-total1024-split1008-one-block-negative",
+      "roles": [
+        "generator"
+      ],
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.8,
+      "enforce_eager": true,
+      "max_model_len": 1024,
+      "max_num_seqs": 512,
+      "split_blocks": 63,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 2617.17,
+      "hybrid_out_tok_s": 2437.183,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 1024,
+      "suffix_tokens": 416,
+      "cpu_suffix_tokens_at_end": 16,
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 22.61,
+      "hybrid_effective_capacity": 22.97,
+      "gpu_only_gpu_kv_tokens": 23152,
+      "hybrid_gpu_kv_tokens": 23152,
+      "notes": "One-block active-suffix control. Exact no-suffix hybrid split1024 is rejected because COTS hybrid KV requires at least one CPU suffix block."
     }
   ]
 }
