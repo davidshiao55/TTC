@@ -204,7 +204,7 @@ def _dispatch(offloader: CotsOffloader, n: int = MAX_NUM_TOKENS) -> None:
 def test_qkv_native_matches_python(f_cpu_store: float) -> None:
     """QKV operator forward, f_prefetch=0 (no streamer path). The native
     runner's strided/contiguous slab dispatch must produce the same
-    values as PythonCotsRunner's F.linear closure."""
+    values as PythonCotsWeightRunner's F.linear closure."""
     torch.manual_seed(123)
     x = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
 

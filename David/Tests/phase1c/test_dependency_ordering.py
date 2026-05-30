@@ -45,7 +45,7 @@ import torch._dynamo
 
 # Import cots_ops directly so torch.ops.vllm.cots_* are registered at
 # module load (the registration runs at cots_ops import time). cots.py
-# imports cots_ops lazily from inside NativeCotsRunner.__init__, but
+# imports cots_ops lazily from inside NativeCotsWeightRunner.__init__, but
 # the schema-level tests in this file probe the ops BEFORE any runner
 # is constructed.
 from vllm.model_executor.offloader import cots, cots_ops  # noqa: F401
@@ -149,7 +149,7 @@ def test_cots_sync_then_uva_does_not_take_y_pinned() -> None:
     CPU buffer (worst case via a GPU intermediate + blocking
     GPU→CPU copy that CUDA Graph capture rejects). The sync impl
     reaches the pinned output via the slab pointer through
-    `CotsCpuInfer.y_pinned_view(task_id, bucket)`. The op's
+    `CotsWeightTaskRunner.y_pinned_view(task_id, bucket)`. The op's
     Python-visible args are CUDA tensors + scalar ids only."""
     schema = str(torch.ops.vllm.cots_sync_then_uva.default._schema)
     assert "y_pinned" not in schema, (
@@ -205,14 +205,14 @@ def test_native_dispatch_state_is_required_and_per_runner() -> None:
     rid_b = 1_000_002
     qkv = cots_ops.op_kind_code("qkv")
     try:
-        cots_ops._COTS_TASK_ID_FOR[rid_a] = {(0, 1, "qkv"): 11}
-        cots_ops._COTS_TASK_ID_FOR[rid_b] = {(0, 4, "qkv"): 44}
+        cots_ops._COTS_WEIGHT_TASK_ID_FOR[rid_a] = {(0, 1, "qkv"): 11}
+        cots_ops._COTS_WEIGHT_TASK_ID_FOR[rid_b] = {(0, 4, "qkv"): 44}
 
         with pytest.raises(RuntimeError, match="no active COTS dispatch state"):
             cots_ops._resolve_task_for_dispatch(rid_a, 0, qkv, "test")
 
-        cots_ops.set_active_dispatch_state(rid_a, bucket=1, live_num_tokens=1)
-        cots_ops.set_active_dispatch_state(rid_b, bucket=4, live_num_tokens=2)
+        cots_ops.set_active_weight_dispatch_state(rid_a, bucket=1, live_num_tokens=1)
+        cots_ops.set_active_weight_dispatch_state(rid_b, bucket=4, live_num_tokens=2)
 
         assert cots_ops._resolve_task_for_dispatch(rid_a, 0, qkv, "test") == (
             11,
@@ -225,10 +225,10 @@ def test_native_dispatch_state_is_required_and_per_runner() -> None:
             2,
         )
     finally:
-        cots_ops._COTS_TASK_ID_FOR.pop(rid_a, None)
-        cots_ops._COTS_TASK_ID_FOR.pop(rid_b, None)
-        cots_ops._COTS_ACTIVE_DISPATCH.pop(rid_a, None)
-        cots_ops._COTS_ACTIVE_DISPATCH.pop(rid_b, None)
+        cots_ops._COTS_WEIGHT_TASK_ID_FOR.pop(rid_a, None)
+        cots_ops._COTS_WEIGHT_TASK_ID_FOR.pop(rid_b, None)
+        cots_ops._COTS_WEIGHT_ACTIVE_DISPATCH.pop(rid_a, None)
+        cots_ops._COTS_WEIGHT_ACTIVE_DISPATCH.pop(rid_b, None)
 
 
 def test_native_transfer_rows_are_bounded_by_bucket_and_tensor_rows() -> None:
@@ -245,7 +245,7 @@ def test_gpu_model_runner_publishes_dispatch_for_dummy_forwards() -> None:
     from vllm.v1.worker import gpu_model_runner as gmr
 
     source = inspect.getsource(gmr.GPUModelRunner._dummy_run)
-    publish = "self._publish_offloader_dispatch(batch_desc, num_tokens_unpadded)"
+    publish = "self._publish_forward_dispatch(batch_desc, num_tokens_unpadded)"
     assert publish in source, (
         "_dummy_run must publish the active BatchDescriptor before model "
         "execution. Native COTS custom ops intentionally refuse to infer a "
@@ -253,43 +253,44 @@ def test_gpu_model_runner_publishes_dispatch_for_dummy_forwards() -> None:
         "execute_model."
     )
     assert source.index(publish) < source.index("set_forward_context("), (
-        "_dummy_run must publish offloader dispatch state before entering "
+        "_dummy_run must publish COTS dispatch state before entering "
         "the forward context and invoking the model."
     )
 
 
-def test_gpu_model_runner_dispatch_helper_calls_offloader(monkeypatch) -> None:
-    """The shared helper should pass a ForwardDispatchInfo object through."""
+def test_gpu_model_runner_dispatch_helper_calls_cots_runtime() -> None:
+    """The shared helper should pass dispatch state through CotsRuntime."""
     from vllm.forward_context import BatchDescriptor
     from vllm.v1.worker import gpu_model_runner as gmr
 
     seen = []
 
     class Recorder:
-        def on_dispatch(self, info):
-            seen.append(info)
+        def on_dispatch(self, **kwargs):
+            seen.append(kwargs)
 
-    monkeypatch.setattr(gmr, "get_offloader", lambda: Recorder())
     runner = gmr.GPUModelRunner.__new__(gmr.GPUModelRunner)
+    runner.cots_runtime = Recorder()
     desc = BatchDescriptor(num_tokens=8, uniform=True)
 
-    runner._publish_offloader_dispatch(desc, 3)
+    runner._publish_forward_dispatch(desc, 3)
 
     assert len(seen) == 1
-    assert isinstance(seen[0], gmr.ForwardDispatchInfo)
-    assert seen[0].batch_descriptor is desc
-    assert seen[0].num_tokens_unpadded == 3
+    assert seen[0]["batch_descriptor"] is desc
+    assert seen[0]["num_tokens_unpadded"] == 3
+    assert seen[0]["positions_cpu"] is None
+    assert seen[0]["positions_have_suffix"] is None
 
 
 # --- FX-level: positional ordering inside the captured graph -------------
 
 
-def _make_dryrun_runner() -> cots.NativeCotsRunner:
+def _make_dryrun_runner() -> cots.NativeCotsWeightRunner:
     """A native runner with one dryrun_noop slab. Stage 5's ordering
     test only cares about the FX graph structure, not the slab's
     actual GEMM behavior — dry_run avoids any worker-thread state."""
-    r = cots.NativeCotsRunner(dry_run=True)
-    slab = cots._NativeSlabSpecQkv(
+    r = cots.NativeCotsWeightRunner(dry_run=True)
+    slab = cots._NativeWeightSlabSpecQkv(
         op_descriptor=(0, 0, "qkv"),
         n_threads=1,
         x_pinned_ptr=0,

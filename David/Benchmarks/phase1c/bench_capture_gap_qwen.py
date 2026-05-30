@@ -112,18 +112,18 @@ def arms(*, f_cpu_store: float, cpu_threads: int) -> dict[str, list[str]]:
         "capture_host_callback_dryrun": legacy_cots_base + ["--cots-dry-run"],
         "capture_host_callback_real": legacy_cots_base,
         "capture_wait_kernel_dryrun": legacy_cots_base
-        + ["--cots-dry-run", "--cots-capture-sync-mode", "wait_kernel"],
+        + ["--cots-dry-run", "--cots-weight-capture-sync-mode", "wait_kernel"],
         "capture_wait_kernel_real": legacy_cots_base
-        + ["--cots-capture-sync-mode", "wait_kernel"],
+        + ["--cots-weight-capture-sync-mode", "wait_kernel"],
         "piecewise_host_callback_dryrun": legacy_cots_base
         + ["--cots-dry-run"]
         + piecewise_graph,
         "piecewise_host_callback_real": legacy_cots_base + piecewise_graph,
         "piecewise_wait_kernel_dryrun": legacy_cots_base
-        + ["--cots-dry-run", "--cots-capture-sync-mode", "wait_kernel"]
+        + ["--cots-dry-run", "--cots-weight-capture-sync-mode", "wait_kernel"]
         + piecewise_graph,
         "piecewise_wait_kernel_real": legacy_cots_base
-        + ["--cots-capture-sync-mode", "wait_kernel"]
+        + ["--cots-weight-capture-sync-mode", "wait_kernel"]
         + piecewise_graph,
         "piecewise_cots_split_host_callback_dryrun": legacy_cots_base
         + ["--cots-dry-run"]
@@ -131,10 +131,10 @@ def arms(*, f_cpu_store: float, cpu_threads: int) -> dict[str, list[str]]:
         "piecewise_cots_split_host_callback_real": legacy_cots_base
         + piecewise_cots_split_graph,
         "piecewise_cots_split_wait_kernel_dryrun": legacy_cots_base
-        + ["--cots-dry-run", "--cots-capture-sync-mode", "wait_kernel"]
+        + ["--cots-dry-run", "--cots-weight-capture-sync-mode", "wait_kernel"]
         + piecewise_cots_split_graph,
         "piecewise_cots_split_wait_kernel_real": legacy_cots_base
-        + ["--cots-capture-sync-mode", "wait_kernel"]
+        + ["--cots-weight-capture-sync-mode", "wait_kernel"]
         + piecewise_cots_split_graph,
         "piecewise_cots_split_inductor_host_callback_dryrun": legacy_cots_base
         + ["--cots-dry-run"]
@@ -142,10 +142,10 @@ def arms(*, f_cpu_store: float, cpu_threads: int) -> dict[str, list[str]]:
         "piecewise_cots_split_inductor_host_callback_real": legacy_cots_base
         + piecewise_cots_split_inductor_graph,
         "piecewise_cots_split_inductor_wait_kernel_dryrun": legacy_cots_base
-        + ["--cots-dry-run", "--cots-capture-sync-mode", "wait_kernel"]
+        + ["--cots-dry-run", "--cots-weight-capture-sync-mode", "wait_kernel"]
         + piecewise_cots_split_inductor_graph,
         "piecewise_cots_split_inductor_wait_kernel_real": legacy_cots_base
-        + ["--cots-capture-sync-mode", "wait_kernel"]
+        + ["--cots-weight-capture-sync-mode", "wait_kernel"]
         + piecewise_cots_split_inductor_graph,
     }
 

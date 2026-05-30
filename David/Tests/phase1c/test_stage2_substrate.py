@@ -2,7 +2,7 @@
 """Stage 2 substrate tests.
 
 Originally landed alongside Stage 2's substrate-only deliverable:
-NativeCotsRunner / PythonCotsRunner split, `cots_ops.py` custom-op
+NativeCotsWeightRunner / PythonCotsWeightRunner split, `cots_ops.py` custom-op
 registration + runner registry, `cpu_runner` config flag, and the
 installer refactor that constructs ONE runner per offloader.
 
@@ -15,7 +15,7 @@ was DROPPED in Stage 3, so:
   * `cpu_runner='python'` is the default through Stage 2/3/4 — Phase
     1a/1b workflows are unchanged.
   * `cpu_runner='native'` constructs a real, end-to-end runnable
-    NativeCotsRunner post-Stage-3 (was a NotImplementedError under
+    NativeCotsWeightRunner post-Stage-3 (was a NotImplementedError under
     Stage 2). Stage 5 will flip the default to `"native"` once graph
     capture is verified.
 
@@ -43,54 +43,54 @@ def test_cots_ops_imports_and_registers_ops():
 
 
 def test_infer_registry_round_trip():
-    """A registered infer can be looked up by id; unregister drops it.
+    """A registered runner handle can be looked up by id; unregister drops it.
 
-    §1c.19 split: the registry holds `CotsCpuInfer` instances (the
-    pybind handles), NOT `NativeCotsRunner` facades. The runner only
+    §1c.19 split: the registry holds `CotsWeightTaskRunner` instances (the
+    pybind handles), NOT `NativeCotsWeightRunner` facades. The runner only
     knows its `runner_id`."""
     from vllm.model_executor.offloader import cots_ops
 
-    class _StubInfer:
+    class _StubRunner:
         pass
 
-    infer = _StubInfer()
-    rid = cots_ops._register_infer(infer)
+    runner = _StubRunner()
+    rid = cots_ops.register_weight_runner(runner)
     assert isinstance(rid, int)
-    assert cots_ops._COTS_INFER.get(rid) is infer
+    assert cots_ops._COTS_WEIGHT_RUNNERS.get(rid) is runner
 
-    cots_ops._unregister_infer(rid)
-    assert cots_ops._COTS_INFER.get(rid) is None
+    cots_ops.unregister_weight_runner(rid)
+    assert cots_ops._COTS_WEIGHT_RUNNERS.get(rid) is None
     # Idempotent:
-    cots_ops._unregister_infer(rid)
+    cots_ops.unregister_weight_runner(rid)
 
 
-def test_infer_registry_is_strong_ref():
-    """§1c.19: the registry holds STRONG refs to `CotsCpuInfer` (was a
+def test_runner_registry_is_strong_ref():
+    """§1c.19: the registry holds STRONG refs to `CotsWeightTaskRunner` (was a
     WeakValueDictionary in the original Stage 2 design). The runner
     facade no longer holds the pybind handle, so the registry entry is
-    the sole owner — explicit `_unregister_infer` (or the runner's
+    the sole owner — explicit `unregister_weight_runner` (or the runner's
     `close()` / `__del__`) is what drops it."""
     from vllm.model_executor.offloader import cots_ops
 
-    class _StubInfer:
+    class _StubRunner:
         pass
 
-    rid = cots_ops._register_infer(_StubInfer())  # no local strong ref
+    rid = cots_ops.register_weight_runner(_StubRunner())  # no local strong ref
     import gc
 
     gc.collect()
     # Strong ref → still present after GC.
-    assert cots_ops._COTS_INFER.get(rid) is not None
-    cots_ops._unregister_infer(rid)
+    assert cots_ops._COTS_WEIGHT_RUNNERS.get(rid) is not None
+    cots_ops.unregister_weight_runner(rid)
 
 
-def test_lookup_infer_raises_clear_error_when_missing():
+def testlookup_weight_runner_raises_clear_error_when_missing():
     """Calling the op impl with a stale runner_id surfaces a clear
     RuntimeError with the registry contents — not a silent NoneType."""
     from vllm.model_executor.offloader import cots_ops
 
     with pytest.raises(RuntimeError, match="not in registry"):
-        cots_ops._lookup_infer(99999, "test_op")
+        cots_ops.lookup_weight_runner(99999, "test_op")
 
 
 # --- cots.py — runner classes + factory + backwards-compat alias ----------
@@ -99,20 +99,20 @@ def test_lookup_infer_raises_clear_error_when_missing():
 def test_python_cots_runner_construct_and_close():
     from vllm.model_executor.offloader import cots
 
-    r = cots.PythonCotsRunner(dry_run=False)
+    r = cots.PythonCotsWeightRunner(dry_run=False)
     assert r.kind == "python"
     # close() on a freshly-constructed runner is a no-op.
     r.close()
 
 
 def test_native_cots_runner_construct_install_close():
-    """Stage 3 install signature: takes a list of NativeSlabSpec records
+    """Stage 3 install signature: takes a list of NativeWeightSlabSpec records
     (ordering = task_id) plus scratch sizes. The empty-list /
     zero-scratch case is the degenerate-but-valid path covering an
     offloader with no fused MLP blocks (or just a smoke test)."""
     from vllm.model_executor.offloader import cots
 
-    r = cots.NativeCotsRunner(dry_run=True)
+    r = cots.NativeCotsWeightRunner(dry_run=True)
     assert r.kind == "native"
     assert isinstance(r._runner_id, int)
     r.install(
@@ -131,23 +131,22 @@ def test_native_cots_runner_construct_install_close():
 def test_native_runner_unregisters_on_close():
     """close() drops the registry entry so subsequent op calls with the
     same runner_id raise cleanly. §1c.19: the registry now holds the
-    `CotsCpuInfer` instance, not the runner — but the lifetime story
+    `CotsWeightTaskRunner` instance, not the runner — but the lifetime story
     from the runner facade's perspective is unchanged."""
     from vllm.model_executor.offloader import cots, cots_ops
 
-    r = cots.NativeCotsRunner(dry_run=False)
+    r = cots.NativeCotsWeightRunner(dry_run=False)
     rid = r._runner_id
-    assert cots_ops._COTS_INFER.get(rid) is not None
+    assert cots_ops._COTS_WEIGHT_RUNNERS.get(rid) is not None
     r.close()
-    assert cots_ops._COTS_INFER.get(rid) is None
+    assert cots_ops._COTS_WEIGHT_RUNNERS.get(rid) is None
 
 
-def test_cputaskrunner_alias_for_backwards_compat():
-    """Phase 1a/1b's `CpuTaskRunner` symbol must still resolve to the
-    renamed PythonCotsRunner, so any external import doesn't break."""
+def test_deprecated_cputaskrunner_alias_removed():
+    """The old Phase 1a/1b alias should not remain on the public facade."""
     from vllm.model_executor.offloader import cots
 
-    assert cots.CpuTaskRunner is cots.PythonCotsRunner
+    assert not hasattr(cots, "CpuTaskRunner")
 
 
 def test_make_runner_factory_picks_python():
@@ -158,7 +157,7 @@ def test_make_runner_factory_picks_python():
         dry_run = False
 
     r = cots._make_runner(_Cfg())
-    assert isinstance(r, cots.PythonCotsRunner)
+    assert isinstance(r, cots.PythonCotsWeightRunner)
 
 
 def test_make_runner_factory_picks_native():
@@ -169,7 +168,7 @@ def test_make_runner_factory_picks_native():
         dry_run = False
 
     r = cots._make_runner(_Cfg())
-    assert isinstance(r, cots.NativeCotsRunner)
+    assert isinstance(r, cots.NativeCotsWeightRunner)
     r.close()
 
 
@@ -230,16 +229,16 @@ def test_offloader_no_offload_does_not_construct_runner():
 
 
 def test_offloader_default_runner_is_native():
-    """Stage 5 default: `cpu_runner='native'` → NativeCotsRunner. The
+    """Stage 5 default: `cpu_runner='native'` → NativeCotsWeightRunner. The
     installer-refactor invariant from Stage 2 still holds: ONE runner
     per offloader, shared across all operator installs."""
     from vllm.config.offload import CotsOffloadConfig
-    from vllm.model_executor.offloader.cots import CotsOffloader, NativeCotsRunner
+    from vllm.model_executor.offloader.cots import CotsOffloader, NativeCotsWeightRunner
 
     cfg = CotsOffloadConfig(f_cpu_store=0.10)
     off = CotsOffloader(config=cfg)
     try:
-        assert isinstance(off._runner, NativeCotsRunner)
+        assert isinstance(off._runner, NativeCotsWeightRunner)
     finally:
         if off._runner is not None:
             off._runner.close()
@@ -247,27 +246,27 @@ def test_offloader_default_runner_is_native():
 
 def test_offloader_python_runner_explicit_path():
     """Explicit `cpu_runner='python'` continues to construct a
-    PythonCotsRunner — the kill-switch path remains valid."""
+    PythonCotsWeightRunner — the kill-switch path remains valid."""
     from vllm.config.offload import CotsOffloadConfig
-    from vllm.model_executor.offloader.cots import CotsOffloader, PythonCotsRunner
+    from vllm.model_executor.offloader.cots import CotsOffloader, PythonCotsWeightRunner
 
     cfg = CotsOffloadConfig(f_cpu_store=0.10, cpu_runner="python")
     off = CotsOffloader(config=cfg)
-    assert isinstance(off._runner, PythonCotsRunner)
+    assert isinstance(off._runner, PythonCotsWeightRunner)
 
 
 def test_offloader_native_runner_constructs_post_stage_3():
     """Stage 3 dropped the Stage-2 NotImplementedError barrier:
     `cpu_runner='native'` + `f_cpu_store > 0` now constructs a real
-    NativeCotsRunner. The runner is shared across operator install (no
+    NativeCotsWeightRunner. The runner is shared across operator install (no
     fresh runner per op). Slab population happens later in `post_init`
     so this just exercises construction, not a forward pass."""
     from vllm.config.offload import CotsOffloadConfig
-    from vllm.model_executor.offloader.cots import CotsOffloader, NativeCotsRunner
+    from vllm.model_executor.offloader.cots import CotsOffloader, NativeCotsWeightRunner
 
     cfg = CotsOffloadConfig(f_cpu_store=0.10, cpu_runner="native")
     off = CotsOffloader(config=cfg)
-    assert isinstance(off._runner, NativeCotsRunner)
+    assert isinstance(off._runner, NativeCotsWeightRunner)
     off._runner.close()
 
 
@@ -285,7 +284,7 @@ def test_make_runner_default_fallback_is_python():
         dry_run = False
 
     r = cots._make_runner(_LegacyCfg())
-    assert isinstance(r, cots.PythonCotsRunner)
+    assert isinstance(r, cots.PythonCotsWeightRunner)
 
 
 def test_offloader_native_runner_allowed_at_zero_offload():

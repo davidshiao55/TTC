@@ -23,13 +23,13 @@ import torch
 def _new_runner_with_qkv_slab(
     num_tokens: int, in_dim: int, n_cpu: int
 ) -> tuple[object, torch.Tensor, torch.Tensor]:
-    """Construct a NativeCotsRunner with one QKV slab pointed at a real
+    """Construct a NativeCotsWeightRunner with one QKV slab pointed at a real
     pinned input + output buffer. Returns (runner, x_pin, y_pin)."""
     pytest.importorskip("vllm._cots_C")
     from vllm.model_executor.offloader import cots, cots_ops
 
-    r = cots.NativeCotsRunner(dry_run=False)
-    cots_ops.install_infer(
+    r = cots.NativeCotsWeightRunner(dry_run=False)
+    cots_ops.install_weight_runner(
         r._runner_id,
         n_slabs=1,
         max_num_tokens=num_tokens,
@@ -37,7 +37,7 @@ def _new_runner_with_qkv_slab(
     x_pin = torch.empty(num_tokens, in_dim, dtype=torch.bfloat16, pin_memory=True)
     y_pin = torch.empty(num_tokens, n_cpu, dtype=torch.bfloat16, pin_memory=True)
     w_cpu = torch.empty(n_cpu, in_dim, dtype=torch.bfloat16)
-    infer = cots_ops._lookup_infer(r._runner_id, "test")
+    infer = cots_ops.lookup_weight_runner(r._runner_id, "test")
     infer.populate_slab_qkv(
         task_id=0,
         n_threads=1,
@@ -50,7 +50,7 @@ def _new_runner_with_qkv_slab(
         w_cpu_rows=n_cpu,
     )
     r._task_id_for[(0, num_tokens, "qkv")] = 0
-    cots_ops.register_task_id_map(r._runner_id, r._task_id_for)
+    cots_ops.register_weight_task_id_map(r._runner_id, r._task_id_for)
     r.set_active_dispatch(num_tokens, num_tokens)
     return r, x_pin, y_pin
 

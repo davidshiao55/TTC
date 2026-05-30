@@ -27,7 +27,7 @@ import struct
 import pytest
 import torch
 
-from vllm._cots_C import CotsCpuInfer
+from vllm._cots_C import CotsWeightTaskRunner
 
 
 # --------------------------------------------------------------------- #
@@ -54,7 +54,7 @@ def _ref_bf16_gemm_natural(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 # --------------------------------------------------------------------- #
 
 
-def _drive_kernel_to_emit(infer: CotsCpuInfer, value_fp32: float) -> float:
+def _drive_kernel_to_emit(infer: CotsWeightTaskRunner, value_fp32: float) -> float:
     M, K, N = 4, 16, 16
     x = torch.zeros(M, K, dtype=torch.bfloat16)
     w_NK = torch.zeros(N, K, dtype=torch.bfloat16)
@@ -77,7 +77,7 @@ def _drive_kernel_to_emit(infer: CotsCpuInfer, value_fp32: float) -> float:
     ],
 )
 def test_rne_conversion_matches_pytorch_bf16(value):
-    infer = CotsCpuInfer()
+    infer = CotsWeightTaskRunner()
     got = _drive_kernel_to_emit(infer, value)
     expected = float(torch.tensor(value, dtype=torch.bfloat16))
     assert got == expected, (
@@ -91,7 +91,7 @@ def test_rne_tie_to_even_boundary():
     midway_bits = 0x3F808000
     midway_fp32 = struct.unpack("<f", struct.pack("<I", midway_bits))[0]
     expected = float(torch.tensor(midway_fp32, dtype=torch.bfloat16))
-    infer = CotsCpuInfer()
+    infer = CotsWeightTaskRunner()
     got = _drive_kernel_to_emit(infer, midway_fp32)
     assert got == expected
     above_bits = 0x3F808001
@@ -142,7 +142,7 @@ def test_kernel_parity_per_M_path(M, K, N):
 
     y_ref = _ref_bf16_gemm_natural(x, w_NK)
 
-    infer = CotsCpuInfer()
+    infer = CotsWeightTaskRunner()
     y_got = torch.empty(M, N, dtype=torch.bfloat16)
     infer.run_bf16_gemm_natural_inline(x, w_NK, y_got)
 
@@ -184,7 +184,7 @@ def test_kernel_k_tail_correctness(M, K, N):
     x = torch.randn(M, K, dtype=torch.bfloat16)
     w_NK = torch.randn(N, K, dtype=torch.bfloat16)
     y_ref = _ref_bf16_gemm_natural(x, w_NK)
-    infer = CotsCpuInfer()
+    infer = CotsWeightTaskRunner()
     y_got = torch.empty(M, N, dtype=torch.bfloat16)
     infer.run_bf16_gemm_natural_inline(x, w_NK, y_got)
     assert torch.equal(y_got, y_ref), (
@@ -219,7 +219,7 @@ def test_kernel_relaxed_parity_at_production_shapes(M, K, N):
     w_NK = torch.randn(N, K, dtype=torch.bfloat16)
 
     y_ref = torch.nn.functional.linear(x, w_NK)
-    infer = CotsCpuInfer()
+    infer = CotsWeightTaskRunner()
     y_got = torch.empty(M, N, dtype=torch.bfloat16)
     infer.run_bf16_gemm_natural_inline(x, w_NK, y_got)
 
@@ -244,7 +244,7 @@ def test_kernel_threaded_output_matches_serial():
     torch.manual_seed(0xC07A4)
     x = torch.randn(M, K, dtype=torch.bfloat16)
     w_NK = torch.randn(N, K, dtype=torch.bfloat16)
-    infer = CotsCpuInfer()
+    infer = CotsWeightTaskRunner()
 
     saved = torch.get_num_threads()
     try:

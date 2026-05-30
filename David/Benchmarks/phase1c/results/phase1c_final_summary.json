@@ -8,7 +8,7 @@
   "production_default": {
     "cpu_runner": "native",
     "auto_graph_split": true,
-    "cots_capture_sync_mode": "wait_kernel",
+    "weight_capture_sync_mode": "wait_kernel",
     "split_ops": [
       "vllm::cots_submit_gemm",
       "vllm::cots_sync_then_uva"

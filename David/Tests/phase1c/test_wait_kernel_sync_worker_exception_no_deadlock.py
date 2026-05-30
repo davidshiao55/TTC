@@ -37,9 +37,9 @@ def _force_mlp_worker_error():
     Pinned-host backing buffers must outlive the slab pointers, so
     we return them as a keepalive.
     """
-    from vllm._cots_C import CotsCpuInfer
+    from vllm._cots_C import CotsWeightTaskRunner
 
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     ci.install(n_slabs=1, max_num_tokens=0)
 
     in_dim = 4
@@ -91,7 +91,7 @@ def _bounded_stream_sync(stream: torch.cuda.Stream, timeout_s: float) -> bool:
     return done.wait(timeout_s)
 
 
-def test_worker_throw_with_m3_does_not_hang_wait_kernel():
+def test_worker_throw_with_wait_kernel_does_not_hang_wait_kernel():
     """Force a worker exception while wait-kernel sync is installed for the slab.
     Without the finally-publish in RunSlabOnWorker, the captured
     cots_wait_done_kernel would spin on `done < req` forever and stream
@@ -160,11 +160,11 @@ def test_sync_or_wait_launches_kernel_when_has_error_already_set():
          worker's done publish releases it; stream #2 sync
          returns within the watchdog.
     """
-    from vllm._cots_C import CotsCpuInfer
+    from vllm._cots_C import CotsWeightTaskRunner
 
     # Two slabs: 0 = MLP-fail (scratch=0), 1 = dryrun-noop (always
-    # succeeds). install_m3 for both.
-    ci = CotsCpuInfer()
+    # succeeds). install_wait-kernel for both.
+    ci = CotsWeightTaskRunner()
     ci.install(n_slabs=2, max_num_tokens=0)
 
     in_dim = 4

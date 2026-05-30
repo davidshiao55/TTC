@@ -4,7 +4,7 @@ microbatching/ubatching, until per-ubatch live counts are plumbed
 (§1c.23 follow-up).
 
 The live-token cap
-(`GPUModelRunner._publish_offloader_dispatch →
+(`GPUModelRunner._publish_forward_dispatch →
 BaseOffloader.set_live_num_tokens`) currently sets ONE global
 `live_num_tokens` value per scheduler batch. Under ubatching, COTS
 operators run on per-ubatch slices but would see the cap as the FULL
@@ -65,6 +65,7 @@ def test_native_runner_with_ubatching_hard_fails(monkeypatch) -> None:
     o._handles = [object()]  # type: ignore[list-item]
     o._dispatch_table = {1: (0.05, 0.0)}
     o._capture_buckets = (1,)
+    o._has_cpu_compute_work = True
 
     with pytest.raises(RuntimeError, match="ubatching|§1c.23"):
         o.post_init()
@@ -87,6 +88,7 @@ def test_native_runner_without_ubatching_passes_guard(monkeypatch) -> None:
     o._handles = [object()]  # type: ignore[list-item]
     o._dispatch_table = {1: (0.05, 0.0)}
     o._capture_buckets = (1,)
+    o._has_cpu_compute_work = True
 
     # post_init may fail at the install step (the stub handles aren't
     # real CotsLinearHandles) — what matters here is that the failure

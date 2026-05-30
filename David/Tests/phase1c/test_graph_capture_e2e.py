@@ -328,11 +328,11 @@ def test_default_config_supports_graph_capture() -> None:
         offloader = CotsOffloader(
             config=CotsOffloadConfig(f_cpu_store=0.20, kv_biased=True)
         )
-        from vllm.model_executor.offloader.cots import NativeCotsRunner
+        from vllm.model_executor.offloader.cots import NativeCotsWeightRunner
 
-        assert isinstance(offloader._runner, NativeCotsRunner), (
+        assert isinstance(offloader._runner, NativeCotsWeightRunner), (
             "Default CotsOffloadConfig should now construct a "
-            "NativeCotsRunner (Stage 5 default flip)."
+            "NativeCotsWeightRunner (Stage 5 default flip)."
         )
         set_offloader(offloader)
         offloader.wrap_modules(iter([layer]))

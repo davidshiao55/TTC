@@ -21,13 +21,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm._cots_C import CotsCpuInfer
+from vllm._cots_C import CotsWeightTaskRunner
 
 pytestmark = pytest.mark.needs_cuda
 
 
 def _populate_one_qkv_slab(
-    ci: CotsCpuInfer,
+    ci: CotsWeightTaskRunner,
     *,
     n_threads: int,
     in_dim: int = 64,
@@ -74,7 +74,7 @@ def test_worker_set_num_threads_does_not_leak_to_main_thread() -> None:
     worker_n = 1 if main_before != 1 else 2
     assert worker_n != main_before
 
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     ci.install(
         n_slabs=1, max_num_tokens=1)
     keepalive = _populate_one_qkv_slab(ci, n_threads=worker_n)
@@ -120,7 +120,7 @@ def test_repeated_slab_dispatch_keeps_main_thread_isolated() -> None:
             n if n != main_before else (n + 1) for n in n_threads_sequence
         ]
 
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     n_slabs = len(n_threads_sequence)
     ci.install(
         n_slabs=n_slabs,

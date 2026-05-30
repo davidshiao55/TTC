@@ -28,7 +28,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm._cots_C import CotsCpuInfer
+from vllm._cots_C import CotsWeightTaskRunner
 
 
 # --------------------------------------------------------------------- #
@@ -61,7 +61,7 @@ def _ref_bf16_gemm_transposed(
 # --------------------------------------------------------------------- #
 
 
-def _drive_kernel_to_emit(infer: CotsCpuInfer, value_fp32: float) -> float:
+def _drive_kernel_to_emit(infer: CotsWeightTaskRunner, value_fp32: float) -> float:
     """Drive the kernel so y[0, 0] equals the BF16-rounded `value_fp32`.
 
     Achieved with M=K=N=1 logical work: x = [[1.0]], w = [[value]].
@@ -114,7 +114,7 @@ def test_rne_conversion_matches_pytorch_bf16(value):
     isn't NaN/Inf (which the kernel doesn't canonicalize — documented
     in the kernel's header comment).
     """
-    infer = CotsCpuInfer()
+    infer = CotsWeightTaskRunner()
     got = _drive_kernel_to_emit(infer, value)
     expected = float(torch.tensor(value, dtype=torch.bfloat16))
     assert got == expected, (
@@ -141,7 +141,7 @@ def test_rne_tie_to_even_boundary():
     # PyTorch's BF16 conversion is also RNE, so we can use it as oracle.
     expected = float(torch.tensor(midway_fp32, dtype=torch.bfloat16))
 
-    infer = CotsCpuInfer()
+    infer = CotsWeightTaskRunner()
     got = _drive_kernel_to_emit(infer, midway_fp32)
     assert got == expected, (
         f"tie-to-even mismatch: got {got!r}, expected {expected!r}"
@@ -200,7 +200,7 @@ def test_kernel_parity_per_M_path(M, K, N):
 
     y_ref = _ref_bf16_gemm_transposed(x, w_KN)
 
-    infer = CotsCpuInfer()
+    infer = CotsWeightTaskRunner()
     y_got = torch.empty(M, N, dtype=torch.bfloat16)
     infer.run_bf16_gemm_transposed_inline(x, w_KN, y_got)
 
@@ -249,7 +249,7 @@ def test_kernel_n_tail_correctness(M, K, N):
     x = torch.randn(M, K, dtype=torch.bfloat16)
     w_KN = torch.randn(K, N, dtype=torch.bfloat16)
     y_ref = _ref_bf16_gemm_transposed(x, w_KN)
-    infer = CotsCpuInfer()
+    infer = CotsWeightTaskRunner()
     y_got = torch.empty(M, N, dtype=torch.bfloat16)
     infer.run_bf16_gemm_transposed_inline(x, w_KN, y_got)
     assert torch.equal(y_got, y_ref), (
@@ -290,7 +290,7 @@ def test_kernel_relaxed_parity_at_production_K(M, K, N):
     w_KN = w_NK.t().contiguous()
 
     y_ref = torch.nn.functional.linear(x, w_NK)
-    infer = CotsCpuInfer()
+    infer = CotsWeightTaskRunner()
     y_got = torch.empty(M, N, dtype=torch.bfloat16)
     infer.run_bf16_gemm_transposed_inline(x, w_KN, y_got)
 
@@ -324,7 +324,7 @@ def test_kernel_threaded_output_matches_serial():
     torch.manual_seed(0xC07A4)
     x = torch.randn(M, K, dtype=torch.bfloat16)
     w_KN = torch.randn(K, N, dtype=torch.bfloat16)
-    infer = CotsCpuInfer()
+    infer = CotsWeightTaskRunner()
 
     saved = torch.get_num_threads()
     try:

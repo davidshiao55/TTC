@@ -4,7 +4,7 @@
 Confirms that `slab.n_threads` is wired end-to-end:
   * `CotsOffloadConfig.cpu_num_threads_by_bucket` populates per-bucket
     n_threads on the slab specs (`_build_native_slab_specs`).
-  * `NativeCotsRunner.install` populates each slab via
+  * `NativeCotsWeightRunner.install` populates each slab via
     `populate_slab_qkv` / `_mlp` with that n_threads.
   * The C++ worker dispatcher's cache-guarded
     `at::set_num_threads(slab.n_threads)` runs before the GEMM and
@@ -22,13 +22,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm._cots_C import CotsCpuInfer
+from vllm._cots_C import CotsWeightTaskRunner
 from vllm.model_executor.offloader import cots
 
 pytestmark = pytest.mark.needs_cuda
 
 
-def _drive_one_qkv_slab(ci: CotsCpuInfer, num_tokens: int = 1) -> None:
+def _drive_one_qkv_slab(ci: CotsWeightTaskRunner, num_tokens: int = 1) -> None:
     """Submit one QKV slab on the current CUDA stream and drain the
     stream so the worker has finished by the time the test reads
     `last_observed_num_threads()`."""
@@ -39,7 +39,7 @@ def _drive_one_qkv_slab(ci: CotsCpuInfer, num_tokens: int = 1) -> None:
 
 
 def _populate_qkv_slab(
-    ci: CotsCpuInfer,
+    ci: CotsWeightTaskRunner,
     *,
     task_id: int,
     n_threads: int,
@@ -75,7 +75,7 @@ def test_worker_observes_slab_n_threads(n_threads: int) -> None:
     at::set_num_threads(N) before the GEMM and the side-channel
     captured `at::get_num_threads()` post-set).
     """
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     ci.install(
         n_slabs=1, max_num_tokens=1)
     _keepalive = _populate_qkv_slab(ci, task_id=0, n_threads=n_threads)
@@ -95,7 +95,7 @@ def test_per_bucket_n_threads_takes_effect() -> None:
     cache-guarded `if (slab->n_threads != worker_current_n_threads_)`
     branch must trip on each transition.
     """
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     ci.install(
         n_slabs=3, max_num_tokens=1)
     keepalives = [
@@ -233,7 +233,7 @@ def test_native_operator_bucket_requires_dispatch_state() -> None:
     cfg = CotsOffloadConfig(f_cpu_store=0.0)
     off = cots.CotsOffloader(config=cfg)
     off._capture_buckets = (1, 4)
-    runner = cots.NativeCotsRunner(dry_run=True)
+    runner = cots.NativeCotsWeightRunner(dry_run=True)
     try:
         off._runner = runner
         with pytest.raises(RuntimeError, match="dispatch state was published"):
@@ -252,7 +252,7 @@ def test_set_worker_affinity_zero_mask_is_noop() -> None:
     """`set_worker_affinity(0)` is documented as a no-op (no
     affinity change). Sanity that no error is set and the worker
     continues to run."""
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     ci.install(
         n_slabs=1, max_num_tokens=1)
     keepalive = _populate_qkv_slab(ci, task_id=0, n_threads=1)
@@ -275,7 +275,7 @@ def test_set_worker_affinity_accepts_high_bit() -> None:
     What we're testing is the ABI boundary, not the kernel-level
     behavior.
     """
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     ci.install(
         n_slabs=1, max_num_tokens=1)
     keepalive = _populate_qkv_slab(ci, task_id=0, n_threads=1)
@@ -305,7 +305,7 @@ def test_set_worker_affinity_with_intersected_mask_succeeds() -> None:
         pytest.skip("test bitmask is int64 — skip cpu_id >= 64")
     mask = 1 << cpu_id
 
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     ci.install(
         n_slabs=1, max_num_tokens=1)
     keepalive = _populate_qkv_slab(ci, task_id=0, n_threads=1)

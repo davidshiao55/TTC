@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""§1c.29 commit 2 — wait-kernel sync safety gates.
+"""§1c.29 commit 2 — wait_kernel sync safety gates.
 
 `CotsOffloader.post_init` enforces the four hard-fail preconditions
 documented in `David/Docs/phase1c_findings.md` §1c.29 when
-`cots_capture_sync_mode="wait_kernel"`:
+`weight_capture_sync_mode="wait_kernel"`:
 
   1. cpu_runner != 'native' → RuntimeError
   2. enforce_eager=True     → RuntimeError
@@ -84,7 +84,7 @@ def _drive_post_init(
     *,
     cpu_runner: str,
     enforce_eager: bool,
-    m3: bool,
+    wait_kernel: bool,
     expect_raise: type[BaseException] | None,
     raise_match: str | None = None,
 ) -> None:
@@ -99,7 +99,7 @@ def _drive_post_init(
             config=CotsOffloadConfig(
                 f_cpu_store=0.10,
                 cpu_runner=cpu_runner,
-                cots_capture_sync_mode=("wait_kernel" if m3 else "host_callback"),
+                weight_capture_sync_mode=("wait_kernel" if wait_kernel else "host_callback"),
                 kv_biased=True,
             )
         )
@@ -125,49 +125,49 @@ def _drive_post_init(
                 offloader._runner.close()
 
 
-def test_m3_with_python_runner_raises() -> None:
-    """Gate 1: wait-kernel sync + cpu_runner='python' is rejected. Python runner
+def test_wait_kernel_with_python_runner_raises() -> None:
+    """Gate 1: wait_kernel sync + cpu_runner='python' is rejected. Python runner
     has no host-mapped done_slot, no worker thread to publish, no
-    slab pool — none of the wait-kernel-sync mechanism applies. The gate fires
+    slab pool — none of the wait_kernel-sync mechanism applies. The gate fires
     even with enforce_eager=True (which would otherwise satisfy the
     earlier python+graph check)."""
     _drive_post_init(
         cpu_runner="python",
         enforce_eager=True,
-        m3=True,
+        wait_kernel=True,
         expect_raise=RuntimeError,
-        raise_match=r"cots_capture_sync_mode='wait_kernel' requires cpu_runner='native'",
+        raise_match=r"weight_capture_sync_mode='wait_kernel' requires cpu_runner='native'",
     )
 
 
-def test_m3_with_eager_mode_raises() -> None:
-    """Gate 2: wait-kernel sync + enforce_eager=True is rejected. The wait kernel
+def test_wait_kernel_with_eager_mode_raises() -> None:
+    """Gate 2: wait_kernel sync + enforce_eager=True is rejected. The wait kernel
     replaces a captured sync_cb host_fn node; under enforce_eager
-    there is no captured node to replace, so wait-kernel sync adds round-trip
+    there is no captured node to replace, so wait_kernel sync adds round-trip
     cost without removing any captured cost — net negative."""
     _drive_post_init(
         cpu_runner="native",
         enforce_eager=True,
-        m3=True,
+        wait_kernel=True,
         expect_raise=RuntimeError,
-        raise_match=r"cots_capture_sync_mode='wait_kernel' requires enforce_eager=False",
+        raise_match=r"weight_capture_sync_mode='wait_kernel' requires enforce_eager=False",
     )
 
 
-def test_m3_native_graph_passes() -> None:
-    """Production config: wait-kernel sync + cpu_runner='native' + enforce_eager=False.
-    No gates fire; the offloader installs the slab pool AND the wait-kernel sync
+def test_wait_kernel_native_graph_passes() -> None:
+    """Production config: wait_kernel sync + cpu_runner='native' + enforce_eager=False.
+    No gates fire; the offloader installs the slab pool AND the wait_kernel sync
     host-mapped slots successfully."""
     _drive_post_init(
         cpu_runner="native",
         enforce_eager=False,
-        m3=True,
+        wait_kernel=True,
         expect_raise=None,
     )
 
 
-def test_m3_disabled_default_path_unchanged() -> None:
-    """Default config: cots_capture_sync_mode="host_callback". None of the wait-kernel sync
+def test_wait_kernel_disabled_default_path_unchanged() -> None:
+    """Default config: weight_capture_sync_mode="host_callback". None of the wait_kernel sync
     gates fire; the legacy sync_cb host_fn path is wired (verified
     indirectly — post_init succeeds under both eager and graph-capture
     mode regardless of cpu_runner, as the existing test suite
@@ -175,14 +175,14 @@ def test_m3_disabled_default_path_unchanged() -> None:
     _drive_post_init(
         cpu_runner="native",
         enforce_eager=False,
-        m3=False,
+        wait_kernel=False,
         expect_raise=None,
     )
 
 
-def test_m3_install_marks_every_slab() -> None:
-    """After post_init with wait-kernel sync enabled, every slab in the pool has
-    `wait_kernel_sync_installed=True`. Confirms the install_m3 walk reaches all
+def test_wait_kernel_install_marks_every_slab() -> None:
+    """After post_init with wait_kernel sync enabled, every slab in the pool has
+    `wait_kernel_sync_installed=True`. Confirms the install_wait_kernel walk reaches all
     task_ids (no off-by-one) and that the per-slab gate inside
     `sync_or_wait_on_stream` will dispatch to the wait kernel for
     every dispatch."""
@@ -195,7 +195,7 @@ def test_m3_install_marks_every_slab() -> None:
             config=CotsOffloadConfig(
                 f_cpu_store=0.10,
                 cpu_runner="native",
-                cots_capture_sync_mode="wait_kernel",
+                weight_capture_sync_mode="wait_kernel",
                 kv_biased=True,
             )
         )
@@ -214,8 +214,8 @@ def test_m3_install_marks_every_slab() -> None:
         try:
             from vllm.model_executor.offloader import cots_ops
 
-            infer = cots_ops._lookup_infer(
-                offloader._runner._runner_id, "test_m3_install_marks_every_slab"
+            infer = cots_ops.lookup_weight_runner(
+                offloader._runner._runner_id, "test_wait_kernel_install_marks_every_slab"
             )
             n_slabs = offloader._runner._n_slabs
             assert n_slabs > 0, "test fixture should produce at least one slab"

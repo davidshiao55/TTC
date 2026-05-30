@@ -106,7 +106,7 @@ Production configuration:
 | `CotsOffloadConfig.cpu_runner="native"` | default |
 | `cpu_runner="python"` | eager-only diagnostic kill switch |
 | `auto_graph_split=True` | default for native COTS |
-| `cots_capture_sync_mode="wait_kernel"` | native graph default after auto-upgrade |
+| `weight_capture_sync_mode="wait_kernel"` | native graph default after auto-upgrade |
 | `cpu_num_threads_by_bucket` | Planner hook |
 | `dry_run` / `--cots-dry-run` | control-plane diagnostic |
 | `VLLM_COTS_NVTX`, `VLLM_COTS_COUNTERS`, `VLLM_COTS_WAIT_KERNEL_DIAG` | env-gated diagnostics |

@@ -6,7 +6,7 @@ the captured graph-bucket size (e.g., 256). Replays at B=1 decode
 would otherwise run CPU GEMMs for the bucket size, costing ~17 ms
 per GEMM instead of <1 ms (the §1c.21 regression).
 
-Fix: `CotsCpuInfer.set_runtime_num_tokens(n)` overrides the
+Fix: `CotsWeightTaskRunner.set_live_num_tokens(n)` overrides the
 worker's row-count arithmetic. Set OUT OF GRAPH before each
 captured replay; the worker reads it on the next host-callback
 fire and uses it for at::from_blob shapes, GEMM input rows, and
@@ -46,14 +46,14 @@ def _require_diag_env() -> None:
 def _new_runner_with_qkv_slab(
     bucket_size: int, in_dim: int, n_cpu: int
 ) -> tuple[object, torch.Tensor, torch.Tensor]:
-    """Construct a NativeCotsRunner with one QKV slab. The slab's
+    """Construct a NativeCotsWeightRunner with one QKV slab. The slab's
     pinned buffers are sized for the full `bucket_size`; the worker
     can be told via runtime_num_tokens to only process the first N."""
     pytest.importorskip("vllm._cots_C")
     from vllm.model_executor.offloader import cots, cots_ops
 
-    r = cots.NativeCotsRunner(dry_run=False)
-    cots_ops.install_infer(
+    r = cots.NativeCotsWeightRunner(dry_run=False)
+    cots_ops.install_weight_runner(
         r._runner_id,
         n_slabs=1,
         max_num_tokens=bucket_size,
@@ -61,7 +61,7 @@ def _new_runner_with_qkv_slab(
     x_pin = torch.empty(bucket_size, in_dim, dtype=torch.bfloat16, pin_memory=True)
     y_pin = torch.empty(bucket_size, n_cpu, dtype=torch.bfloat16, pin_memory=True)
     w_cpu = torch.randn(n_cpu, in_dim, dtype=torch.bfloat16)
-    infer = cots_ops._lookup_infer(r._runner_id, "test")
+    infer = cots_ops.lookup_weight_runner(r._runner_id, "test")
     infer.populate_slab_qkv(
         task_id=0,
         n_threads=1,
@@ -76,7 +76,7 @@ def _new_runner_with_qkv_slab(
     return r, x_pin, y_pin
 
 
-def test_set_runtime_num_tokens_smaller_than_bucket_processes_only_n_rows() -> None:
+def test_set_live_num_tokens_smaller_than_bucket_processes_only_n_rows() -> None:
     """The reviewer's load-bearing test: set runtime=1 against a
     slab populated for bucket=256, run a real GEMM, and confirm
     only the first row of y_pin is touched (the rest stays at the
@@ -101,7 +101,7 @@ def test_set_runtime_num_tokens_smaller_than_bucket_processes_only_n_rows() -> N
         # (slab.num_tokens.store fires inside submit_on_stream). We
         # don't actually submit a GEMM yet — just need the slab cap
         # populated.
-        infer = cots_ops._lookup_infer(r._runner_id, "test")
+        infer = cots_ops.lookup_weight_runner(r._runner_id, "test")
         # Force slab.num_tokens=bucket via a dryrun-style 0-ptr submit.
         stream = torch.cuda.current_stream().cuda_stream
         # First write slab.num_tokens=bucket. submit_on_stream needs
@@ -109,7 +109,7 @@ def test_set_runtime_num_tokens_smaller_than_bucket_processes_only_n_rows() -> N
         # We need slab.num_tokens.store to happen; that requires a
         # call. Use the runtime_num_tokens=0 path so the worker uses
         # slab capacity for any subsequent GEMM.
-        infer.set_runtime_num_tokens(0)  # fall back to slab cap
+        infer.set_live_num_tokens(0)  # fall back to slab cap
         infer.submit_on_stream(
             task_id=0, num_tokens=bucket, x_gpu_ptr=0,
             x_cols=0, x_stride0=0, x_stride1=1, cuda_stream=stream
@@ -124,7 +124,7 @@ def test_set_runtime_num_tokens_smaller_than_bucket_processes_only_n_rows() -> N
 
         # Now: set runtime=1 and re-submit. Worker should compute 1
         # row of GEMM and leave rows 1..bucket untouched.
-        infer.set_runtime_num_tokens(1)
+        infer.set_live_num_tokens(1)
         infer.submit_on_stream(
             task_id=0, num_tokens=bucket, x_gpu_ptr=0,
             x_cols=0, x_stride0=0, x_stride1=1, cuda_stream=stream
@@ -147,7 +147,7 @@ def test_set_runtime_num_tokens_smaller_than_bucket_processes_only_n_rows() -> N
         r.close()
 
 
-def test_set_runtime_num_tokens_zero_falls_back_to_slab_cap() -> None:
+def test_set_live_num_tokens_zero_falls_back_to_slab_cap() -> None:
     """Sentinel: setting runtime=0 reverts to using slab.num_tokens.
     This is the default state at construction and also the explicit
     'clear override' value."""
@@ -158,11 +158,11 @@ def test_set_runtime_num_tokens_zero_falls_back_to_slab_cap() -> None:
     bucket = 8
     r, x_pin, y_pin = _new_runner_with_qkv_slab(bucket, 8, 6)
     try:
-        infer = cots_ops._lookup_infer(r._runner_id, "test")
+        infer = cots_ops.lookup_weight_runner(r._runner_id, "test")
         x_pin.zero_()
         y_pin.fill_(-99.0)
         # First a submit at full bucket to set slab.num_tokens.
-        infer.set_runtime_num_tokens(0)
+        infer.set_live_num_tokens(0)
         stream = torch.cuda.current_stream().cuda_stream
         infer.submit_on_stream(
             task_id=0, num_tokens=bucket, x_gpu_ptr=0,
@@ -179,7 +179,7 @@ def test_set_runtime_num_tokens_zero_falls_back_to_slab_cap() -> None:
         r.close()
 
 
-def test_set_runtime_num_tokens_above_slab_cap_clamps() -> None:
+def test_set_live_num_tokens_above_slab_cap_clamps() -> None:
     """§1c.31 commit-3-real fix: runtime_num_tokens > slab.num_tokens
     is no longer a hard-fail; the worker treats the override as a
     CAP and clamps to slab_cap. A diagnostic counter
@@ -187,8 +187,8 @@ def test_set_runtime_num_tokens_above_slab_cap_clamps() -> None:
     per §1c.34 cleanup C) records each clamp so the case is
     observable.
 
-    Rationale: under eager mode, set_runtime_num_tokens applies
-    globally per CotsCpuInfer to whatever slab fires next,
+    Rationale: under eager mode, set_live_num_tokens applies
+    globally per CotsWeightTaskRunner to whatever slab fires next,
     regardless of which bucket sized that slab. Pre-fix behavior
     (TORCH_CHECK) hard-failed B=4 prefill at input_len=8 when a
     small-bucket slab fired with the global override set to 32
@@ -203,9 +203,9 @@ def test_set_runtime_num_tokens_above_slab_cap_clamps() -> None:
     bucket = 4
     r, _, _ = _new_runner_with_qkv_slab(bucket, 8, 6)
     try:
-        infer = cots_ops._lookup_infer(r._runner_id, "test")
+        infer = cots_ops.lookup_weight_runner(r._runner_id, "test")
         infer.reset_counters()
-        infer.set_runtime_num_tokens(0)
+        infer.set_live_num_tokens(0)
         stream = torch.cuda.current_stream().cuda_stream
         infer.submit_on_stream(
             task_id=0, num_tokens=bucket, x_gpu_ptr=0,
@@ -220,7 +220,7 @@ def test_set_runtime_num_tokens_above_slab_cap_clamps() -> None:
         )
 
         # Override above slab capacity → clamp + counter increment.
-        infer.set_runtime_num_tokens(bucket + 1)
+        infer.set_live_num_tokens(bucket + 1)
         infer.submit_on_stream(
             task_id=0, num_tokens=bucket, x_gpu_ptr=0,
             x_cols=0, x_stride0=0, x_stride1=1, cuda_stream=stream
@@ -238,7 +238,7 @@ def test_set_runtime_num_tokens_above_slab_cap_clamps() -> None:
             "worker should not record an error after a clamp; the "
             "override is a cap, not a row-count requirement"
         )
-        infer.set_runtime_num_tokens(0)
+        infer.set_live_num_tokens(0)
         infer.submit_on_stream(
             task_id=0, num_tokens=bucket, x_gpu_ptr=0,
             x_cols=0, x_stride0=0, x_stride1=1, cuda_stream=stream
@@ -277,11 +277,11 @@ def test_clamp_b4_prefill_scenario_no_deadlock() -> None:
     bucket = 8  # matches the original error: slab.num_tokens=8
     r, _, _ = _new_runner_with_qkv_slab(bucket, 8, 6)
     try:
-        infer = cots_ops._lookup_infer(r._runner_id, "test")
+        infer = cots_ops.lookup_weight_runner(r._runner_id, "test")
         infer.reset_counters()
         stream = torch.cuda.current_stream().cuda_stream
         # Submit at bucket=8 first to set slab.num_tokens.
-        infer.set_runtime_num_tokens(0)
+        infer.set_live_num_tokens(0)
         infer.submit_on_stream(
             task_id=0, num_tokens=bucket, x_gpu_ptr=0,
             x_cols=0, x_stride0=0, x_stride1=1, cuda_stream=stream
@@ -289,7 +289,7 @@ def test_clamp_b4_prefill_scenario_no_deadlock() -> None:
         infer.sync_on_stream(cuda_stream=stream)
         torch.cuda.current_stream().synchronize()
         # Now simulate the B=4 prefill: global override at 25.
-        infer.set_runtime_num_tokens(25)
+        infer.set_live_num_tokens(25)
         for _ in range(5):  # multiple replays at the over-cap setting
             infer.submit_on_stream(
                 task_id=0, num_tokens=bucket, x_gpu_ptr=0,
@@ -313,19 +313,19 @@ def test_clamp_b4_prefill_scenario_no_deadlock() -> None:
             pass
 
 
-def test_set_runtime_num_tokens_negative_raises() -> None:
+def test_set_live_num_tokens_negative_raises() -> None:
     """Defensive: passing a negative value at the Python boundary is
     rejected immediately."""
     pytest.importorskip("vllm._cots_C")
     from vllm.model_executor.offloader import cots, cots_ops
 
-    r = cots.NativeCotsRunner(dry_run=False)
+    r = cots.NativeCotsWeightRunner(dry_run=False)
     try:
-        cots_ops.install_infer(
+        cots_ops.install_weight_runner(
             r._runner_id, n_slabs=0, max_num_tokens=0,
         )
-        infer = cots_ops._lookup_infer(r._runner_id, "test")
+        infer = cots_ops.lookup_weight_runner(r._runner_id, "test")
         with pytest.raises(RuntimeError, match="< 0"):
-            infer.set_runtime_num_tokens(-1)
+            infer.set_live_num_tokens(-1)
     finally:
         r.close()

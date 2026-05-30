@@ -12,8 +12,8 @@ Phase 1c made COTS production-faithful:
 - `CotsOffloadConfig.cpu_runner="native"` is the default.
 - Native COTS supports `enforce_eager=False`.
 - `auto_graph_split=True` is the default graph policy.
-- COTS submit/sync custom ops are piecewise graph split points.
-- `wait_kernel` is the native graph sync path.
+- COTS weight submit/sync custom ops are piecewise graph split points.
+- `weight_capture_sync_mode="wait_kernel"` is the native weight graph sync path.
 - CPU worker row count is live-token capped.
 - Active bucket and live row count are published out of graph.
 - Python runner remains only as an eager diagnostic fallback.

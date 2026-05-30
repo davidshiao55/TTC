@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage 1 smoke: `vllm._cots_C` loads and `CotsCpuInfer` instantiates."""
+"""Stage 1 smoke: `vllm._cots_C` loads and `CotsWeightTaskRunner` instantiates."""
 
 import torch
 
@@ -8,26 +8,26 @@ def test_module_imports():
     import vllm._cots_C as _cots_C  # noqa: F401
 
 
-def test_cotscpuinfer_constructs():
-    from vllm._cots_C import CotsCpuInfer
+def test_cots_weight_task_runner_constructs():
+    from vllm._cots_C import CotsWeightTaskRunner
 
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     assert ci is not None
 
 
 def test_install_zero_slabs_ok():
     """install(0, 0, 0) is a valid degenerate configuration — the offloader
     may install a runner before any handles are populated."""
-    from vllm._cots_C import CotsCpuInfer
+    from vllm._cots_C import CotsWeightTaskRunner
 
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     ci.install(n_slabs=0, max_num_tokens=0)
 
 
 def test_install_some_slabs_ok():
-    from vllm._cots_C import CotsCpuInfer
+    from vllm._cots_C import CotsWeightTaskRunner
 
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     ci.install(n_slabs=8, max_num_tokens=0)
     for i in range(8):
         ci.populate_slab_dryrun(i, bucket_capacity_tokens=0, x_pinned_ptr=0, in_dim=0, y_pinned_ptr=0, cpu_out_dim=0)
@@ -40,9 +40,9 @@ def test_at_linear_inline_returns_correct_result():
     """Sanity that `run_at_linear_inline` (test-only helper) computes
     `at::linear` from C++ correctly. The microbench gate tests perf;
     here we just confirm correctness end-to-end through pybind."""
-    from vllm._cots_C import CotsCpuInfer
+    from vllm._cots_C import CotsWeightTaskRunner
 
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     torch.manual_seed(0)
     x = torch.randn(4, 32, dtype=torch.bfloat16)
     w = torch.randn(16, 32, dtype=torch.bfloat16)

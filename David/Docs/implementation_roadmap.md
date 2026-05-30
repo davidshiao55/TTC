@@ -307,9 +307,10 @@ Every stage gated on green tests + a measured invariant before the next started:
 §1.14 ABSOLUTE on Qwen2.5-7B + FastTTS is now closed by the final
 Phase 1c production validation:
 
-- **Default path:** `cpu_runner="native"`, `auto_graph_split=True`,
-  piecewise graph split at the COTS submit/sync custom ops, and
-  `wait_kernel` sync in graph mode.
+- **Default Phase 1 weight path:** `cpu_runner="native"`,
+  `auto_graph_split=True`, piecewise graph split at the COTS weight
+  submit/sync custom ops, and `weight_capture_sync_mode="wait_kernel"`
+  in graph mode.
 - **Retained validation harnesses:**
   `bench_capture_gap_qwen.py`, `bench_capture_gap_qwen_grid.py`, and
   `check_capture_piecewise_parity_qwen.py`.

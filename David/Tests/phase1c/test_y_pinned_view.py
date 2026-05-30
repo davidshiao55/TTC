@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""§1c.20 — `CotsCpuInfer.y_pinned_view(task_id, num_tokens)` C++/pybind
+"""§1c.20 — `CotsWeightTaskRunner.y_pinned_view(task_id, num_tokens)` C++/pybind
 contract.
 
 This is the bridge that makes the new sync-side schema work: instead
@@ -22,20 +22,20 @@ import torch
 def _make_runner_with_one_qkv_slab(
     num_tokens: int, in_dim: int, n_cpu: int
 ) -> tuple[object, torch.Tensor, torch.Tensor]:
-    """Construct a NativeCotsRunner and populate one QKV slab pointed at
+    """Construct a NativeCotsWeightRunner and populate one QKV slab pointed at
     a real pinned buffer + a CPU weight. Returns (runner, x_pin, y_pin).
     """
     pytest.importorskip("vllm._cots_C")
     from vllm.model_executor.offloader import cots
 
-    r = cots.NativeCotsRunner(dry_run=False)
+    r = cots.NativeCotsWeightRunner(dry_run=False)
     x_pin = torch.empty(num_tokens, in_dim, dtype=torch.bfloat16, pin_memory=True)
     y_pin = torch.empty(num_tokens, n_cpu, dtype=torch.bfloat16, pin_memory=True)
     w_cpu = torch.empty(n_cpu, in_dim, dtype=torch.bfloat16)
     r.install(slab_specs=[], max_num_tokens=num_tokens)
     # We didn't pass slab_specs to install (so the slab pool is size 0).
     # Switch strategy: use the per-task populate methods directly via
-    # the cots_ops registry, which is what NativeCotsRunner.install
+    # the cots_ops registry, which is what NativeCotsWeightRunner.install
     # would have done if we had given it specs.
     return r, x_pin, y_pin
 
@@ -49,10 +49,10 @@ def _populate_qkv_slab_directly(
 ) -> None:
     """Reach into the registry and populate task_id directly. Used for
     the test fixtures here so we don't need to go through
-    `_NativeSlabSpecQkv` machinery."""
+    `_NativeWeightSlabSpecQkv` machinery."""
     from vllm.model_executor.offloader import cots_ops
 
-    infer = cots_ops._lookup_infer(runner_id, "test_y_pinned_view")
+    infer = cots_ops.lookup_weight_runner(runner_id, "test_y_pinned_view")
     infer.populate_slab_qkv(
         task_id=task_id,
         n_threads=1,
@@ -73,13 +73,13 @@ def test_y_pinned_view_shape_dtype_device() -> None:
     from vllm.model_executor.offloader import cots
 
     num_tokens, in_dim, n_cpu = 8, 16, 12
-    r = cots.NativeCotsRunner(dry_run=False)
+    r = cots.NativeCotsWeightRunner(dry_run=False)
     try:
         # install with one slab; we need slab_count > 0 for the pybind
         # call to succeed (the C++ side bounds-checks task_id).
         r.install(slab_specs=[], max_num_tokens=num_tokens)
         # n_slabs=0 makes y_pinned_view raise (out-of-range), so do a
-        # second install path: we go around `install` and call install_infer
+        # second install path: we go around `install` and call install_weight_runner
         # directly with n_slabs=1, then populate.
     finally:
         r.close()
@@ -87,9 +87,9 @@ def test_y_pinned_view_shape_dtype_device() -> None:
     # Re-do with 1 slab.
     from vllm.model_executor.offloader import cots_ops
 
-    r = cots.NativeCotsRunner(dry_run=False)
+    r = cots.NativeCotsWeightRunner(dry_run=False)
     try:
-        cots_ops.install_infer(
+        cots_ops.install_weight_runner(
             r._runner_id,
             n_slabs=1,
             max_num_tokens=num_tokens,
@@ -101,7 +101,7 @@ def test_y_pinned_view_shape_dtype_device() -> None:
         w_cpu = torch.empty(n_cpu, in_dim, dtype=torch.bfloat16)
         _populate_qkv_slab_directly(r._runner_id, 0, x_pin, y_pin, w_cpu)
 
-        infer = cots_ops._lookup_infer(r._runner_id, "test")
+        infer = cots_ops.lookup_weight_runner(r._runner_id, "test")
         view = infer.y_pinned_view(task_id=0, num_tokens=num_tokens)
         assert view.shape == (num_tokens, n_cpu)
         assert view.dtype == torch.bfloat16
@@ -118,9 +118,9 @@ def test_y_pinned_view_data_ptr_matches_slab() -> None:
     from vllm.model_executor.offloader import cots, cots_ops
 
     num_tokens, in_dim, n_cpu = 4, 8, 6
-    r = cots.NativeCotsRunner(dry_run=False)
+    r = cots.NativeCotsWeightRunner(dry_run=False)
     try:
-        cots_ops.install_infer(
+        cots_ops.install_weight_runner(
             r._runner_id,
             n_slabs=1,
             max_num_tokens=num_tokens,
@@ -132,7 +132,7 @@ def test_y_pinned_view_data_ptr_matches_slab() -> None:
         w_cpu = torch.empty(n_cpu, in_dim, dtype=torch.bfloat16)
         _populate_qkv_slab_directly(r._runner_id, 0, x_pin, y_pin, w_cpu)
 
-        infer = cots_ops._lookup_infer(r._runner_id, "test")
+        infer = cots_ops.lookup_weight_runner(r._runner_id, "test")
         view = infer.y_pinned_view(task_id=0, num_tokens=num_tokens)
         assert view.data_ptr() == y_pin.data_ptr()
     finally:
@@ -149,9 +149,9 @@ def test_y_pinned_view_reads_worker_writes() -> None:
     from vllm.model_executor.offloader import cots, cots_ops
 
     num_tokens, in_dim, n_cpu = 4, 8, 6
-    r = cots.NativeCotsRunner(dry_run=False)
+    r = cots.NativeCotsWeightRunner(dry_run=False)
     try:
-        cots_ops.install_infer(
+        cots_ops.install_weight_runner(
             r._runner_id,
             n_slabs=1,
             max_num_tokens=num_tokens,
@@ -169,7 +169,7 @@ def test_y_pinned_view_reads_worker_writes() -> None:
         ).reshape(num_tokens, n_cpu)
         y_pin.copy_(pattern)
 
-        infer = cots_ops._lookup_infer(r._runner_id, "test")
+        infer = cots_ops.lookup_weight_runner(r._runner_id, "test")
         view = infer.y_pinned_view(task_id=0, num_tokens=num_tokens)
         assert torch.equal(view, pattern)
     finally:
@@ -182,12 +182,12 @@ def test_y_pinned_view_rejects_out_of_range_task_id() -> None:
     pytest.importorskip("vllm._cots_C")
     from vllm.model_executor.offloader import cots, cots_ops
 
-    r = cots.NativeCotsRunner(dry_run=False)
+    r = cots.NativeCotsWeightRunner(dry_run=False)
     try:
-        cots_ops.install_infer(
+        cots_ops.install_weight_runner(
             r._runner_id, n_slabs=1, max_num_tokens=4,
         )
-        infer = cots_ops._lookup_infer(r._runner_id, "test")
+        infer = cots_ops.lookup_weight_runner(r._runner_id, "test")
         with pytest.raises(Exception, match="out of range|task_id"):
             infer.y_pinned_view(task_id=99, num_tokens=4)
     finally:
@@ -203,9 +203,9 @@ def test_y_pinned_view_partial_num_tokens() -> None:
     from vllm.model_executor.offloader import cots, cots_ops
 
     max_tokens, in_dim, n_cpu = 8, 8, 6
-    r = cots.NativeCotsRunner(dry_run=False)
+    r = cots.NativeCotsWeightRunner(dry_run=False)
     try:
-        cots_ops.install_infer(
+        cots_ops.install_weight_runner(
             r._runner_id, n_slabs=1, max_num_tokens=max_tokens,
         )
         x_pin = torch.empty(max_tokens, in_dim, dtype=torch.bfloat16,
@@ -215,7 +215,7 @@ def test_y_pinned_view_partial_num_tokens() -> None:
         w_cpu = torch.empty(n_cpu, in_dim, dtype=torch.bfloat16)
         _populate_qkv_slab_directly(r._runner_id, 0, x_pin, y_pin, w_cpu)
 
-        infer = cots_ops._lookup_infer(r._runner_id, "test")
+        infer = cots_ops.lookup_weight_runner(r._runner_id, "test")
         for n in [1, 4, max_tokens]:
             view = infer.y_pinned_view(task_id=0, num_tokens=n)
             assert view.shape == (n, n_cpu)

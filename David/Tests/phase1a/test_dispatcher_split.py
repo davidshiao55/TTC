@@ -1,7 +1,6 @@
 """Phase 1a §3-4 — CPU-side GEMM split correctness for col & row parallel.
 
-Exercises the CPU compute path directly via `CpuTaskRunner` /
-`PythonCotsRunner` (Phase 1c renamed; alias preserved) on synthetic
+Exercises the CPU compute path directly via `PythonCotsWeightRunner` on synthetic
 shapes — no Linear modules involved. Verifies the assembled output
 matches the unsplit reference within BF16 tolerance, mirroring
 `phase0/bench_split_correctness.py §A` and §C.
@@ -22,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm.model_executor.offloader.cots import (
-    CpuTaskRunner,
+    PythonCotsWeightRunner,
     uva_copy_into_gpu,
 )
 
@@ -48,7 +47,7 @@ def _alloc_gpu(numel: int, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
 
 
 def _run_cpu_gemm(
-    runner: CpuTaskRunner,
+    runner: PythonCotsWeightRunner,
     x_gpu: torch.Tensor,
     w_cpu: torch.Tensor,
     x_pinned_view: torch.Tensor,
@@ -125,7 +124,7 @@ def test_col_parallel_split(f_cpu, batch):
 
     x_gpu = torch.randn(batch, in_dim, dtype=torch.bfloat16, device="cuda")
 
-    runner = CpuTaskRunner()
+    runner = PythonCotsWeightRunner()
     out_gpu_slice = F.linear(x_gpu, gpu_weight, None)
     out_cpu_on_gpu = _run_cpu_gemm(
         runner, x_gpu, w_cpu, x_pinned_view, y_pinned_view, y_gpu_view
@@ -170,7 +169,7 @@ def test_row_parallel_split(f_cpu, batch):
     x_gpu_input = x_gpu[:, : in_dim - n_cpu].contiguous()
     x_cpu_input = x_gpu[:, in_dim - n_cpu :].contiguous()
 
-    runner = CpuTaskRunner()
+    runner = PythonCotsWeightRunner()
     out_gpu_partial = F.linear(x_gpu_input, gpu_weight, None)
     out_cpu_partial = _run_cpu_gemm(
         runner, x_cpu_input, w_cpu, x_pinned_view, y_pinned_view, y_gpu_view

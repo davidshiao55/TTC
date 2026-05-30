@@ -3,16 +3,16 @@
 
 FastTTS launches a generator + verifier as two `LLM` engines in the
 same process. Each engine has its own `CotsOffloader` instance, which
-constructs its own `NativeCotsRunner` registered in the module-private
+constructs its own `NativeCotsWeightRunner` registered in the module-private
 `cots_ops._COTS_RUNNERS` weak map under a unique `runner_id`. The
 custom-op impls (`vllm.cots_submit_gemm`, `vllm.cots_sync_then_uva`)
 look up the right runner by id, so two offloaders coexist with
 independent slab pools and no C++ singleton.
 
 This test confirms:
-  * Two NativeCotsRunner instances get distinct runner_ids.
+  * Two NativeCotsWeightRunner instances get distinct runner_ids.
   * Both register in the registry; both look up correctly.
-  * Interleaved submits across two CotsCpuInfer instances don't
+  * Interleaved submits across two CotsWeightTaskRunner instances don't
     cross-talk — each runner's slab pool stays its own.
   * Closing one runner unregisters it without disturbing the other.
 """
@@ -130,17 +130,17 @@ def _dispatch(offloader: CotsOffloader) -> None:
 
 
 def test_two_runners_have_distinct_runner_ids() -> None:
-    """Trivial registry sanity: each NativeCotsRunner gets a unique id,
-    and each id resolves to a distinct `CotsCpuInfer` in the registry
+    """Trivial registry sanity: each NativeCotsWeightRunner gets a unique id,
+    and each id resolves to a distinct `CotsWeightTaskRunner` in the registry
     (§1c.19: registry now holds infers, not runners)."""
     from vllm.model_executor.offloader import cots
 
-    r1 = cots.NativeCotsRunner(dry_run=False)
-    r2 = cots.NativeCotsRunner(dry_run=False)
+    r1 = cots.NativeCotsWeightRunner(dry_run=False)
+    r2 = cots.NativeCotsWeightRunner(dry_run=False)
     try:
         assert r1._runner_id != r2._runner_id
-        infer1 = cots_ops._COTS_INFER.get(r1._runner_id)
-        infer2 = cots_ops._COTS_INFER.get(r2._runner_id)
+        infer1 = cots_ops._COTS_WEIGHT_RUNNERS.get(r1._runner_id)
+        infer2 = cots_ops._COTS_WEIGHT_RUNNERS.get(r2._runner_id)
         assert infer1 is not None
         assert infer2 is not None
         assert infer1 is not infer2
@@ -154,17 +154,17 @@ def test_close_one_runner_does_not_affect_other() -> None:
     stays valid in the registry."""
     from vllm.model_executor.offloader import cots
 
-    r1 = cots.NativeCotsRunner(dry_run=False)
-    r2 = cots.NativeCotsRunner(dry_run=False)
+    r1 = cots.NativeCotsWeightRunner(dry_run=False)
+    r2 = cots.NativeCotsWeightRunner(dry_run=False)
     try:
         rid1, rid2 = r1._runner_id, r2._runner_id
-        assert cots_ops._COTS_INFER.get(rid1) is not None
-        infer2 = cots_ops._COTS_INFER.get(rid2)
+        assert cots_ops._COTS_WEIGHT_RUNNERS.get(rid1) is not None
+        infer2 = cots_ops._COTS_WEIGHT_RUNNERS.get(rid2)
         assert infer2 is not None
 
         r1.close()
-        assert cots_ops._COTS_INFER.get(rid1) is None
-        assert cots_ops._COTS_INFER.get(rid2) is infer2
+        assert cots_ops._COTS_WEIGHT_RUNNERS.get(rid1) is None
+        assert cots_ops._COTS_WEIGHT_RUNNERS.get(rid2) is infer2
     finally:
         r2.close()
 

@@ -76,12 +76,12 @@ def arm_kwargs(name: str, max_model_len: int) -> dict[str, Any]:
     if name == "cots_default_real":
         return {**base, **cots}
     if name == "capture_wait_kernel_real":
-        return {**base, **legacy_cots, "cots_capture_sync_mode": "wait_kernel"}
+        return {**base, **legacy_cots, "cots_weight_capture_sync_mode": "wait_kernel"}
     if name == "piecewise_wait_kernel_real":
         return {
             **base,
             **legacy_cots,
-            "cots_capture_sync_mode": "wait_kernel",
+            "cots_weight_capture_sync_mode": "wait_kernel",
             "compilation_config": {"cudagraph_mode": "PIECEWISE"},
         }
     if name == "piecewise_host_callback_real":
@@ -103,7 +103,7 @@ def arm_kwargs(name: str, max_model_len: int) -> dict[str, Any]:
         return {
             **base,
             **legacy_cots,
-            "cots_capture_sync_mode": "wait_kernel",
+            "cots_weight_capture_sync_mode": "wait_kernel",
             "compilation_config": {
                 "cudagraph_mode": "PIECEWISE",
                 "splitting_ops": COTS_SPLITTING_OPS,
@@ -123,7 +123,7 @@ def arm_kwargs(name: str, max_model_len: int) -> dict[str, Any]:
         return {
             **base,
             **legacy_cots,
-            "cots_capture_sync_mode": "wait_kernel",
+            "cots_weight_capture_sync_mode": "wait_kernel",
             "compilation_config": {
                 "cudagraph_mode": "PIECEWISE",
                 "use_inductor_graph_partition": True,

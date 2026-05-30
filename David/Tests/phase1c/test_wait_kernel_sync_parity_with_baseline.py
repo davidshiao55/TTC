@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""§1c.29 commit 2 — wait-kernel sync parity gate.
+"""§1c.29 commit 2 — wait_kernel sync parity gate.
 
 Captured-graph replay results MUST match between the legacy
-`cudaLaunchHostFunc(sync_cb)` path (`cots_capture_sync_mode="host_callback"`) and
-the wait-kernel-sync path (`cots_capture_sync_mode="wait_kernel"`) at bf16 tolerance, on both
+`cudaLaunchHostFunc(sync_cb)` path (`weight_capture_sync_mode="host_callback"`) and
+the wait_kernel-sync path (`weight_capture_sync_mode="wait_kernel"`) at bf16 tolerance, on both
 the QKV operator and the MLP-block operator. Same inputs / same
 weights / same captured graph topology except the sync node — any
-output divergence indicates the wait-kernel-sync ordering or done_slot publish is
+output divergence indicates the wait_kernel-sync ordering or done_slot publish is
 wrong.
 
 This complements `test_graph_capture_e2e.py` (which compares native
@@ -126,7 +126,7 @@ def _make_vllm_config() -> VllmConfig:
     return vc
 
 
-def _build_qkv(*, f_cpu_store: float, m3: bool) -> tuple[_QkvLayer, CotsOffloader]:
+def _build_qkv(*, f_cpu_store: float, wait_kernel: bool) -> tuple[_QkvLayer, CotsOffloader]:
     vc = _make_vllm_config()
     with set_current_vllm_config(vc):
         layer = _QkvLayer().cuda()
@@ -136,7 +136,7 @@ def _build_qkv(*, f_cpu_store: float, m3: bool) -> tuple[_QkvLayer, CotsOffloade
                 f_prefetch=0.0,
                 kv_biased=True,
                 cpu_runner="native",
-                cots_capture_sync_mode=("wait_kernel" if m3 else "host_callback"),
+                weight_capture_sync_mode=("wait_kernel" if wait_kernel else "host_callback"),
             )
         )
         set_offloader(offloader)
@@ -154,7 +154,7 @@ def _build_qkv(*, f_cpu_store: float, m3: bool) -> tuple[_QkvLayer, CotsOffloade
     return layer, offloader
 
 
-def _build_mlp(*, f_cpu_store: float, m3: bool) -> tuple[_MlpLayer, CotsOffloader]:
+def _build_mlp(*, f_cpu_store: float, wait_kernel: bool) -> tuple[_MlpLayer, CotsOffloader]:
     vc = _make_vllm_config()
     with set_current_vllm_config(vc):
         layer = _MlpLayer().cuda()
@@ -164,7 +164,7 @@ def _build_mlp(*, f_cpu_store: float, m3: bool) -> tuple[_MlpLayer, CotsOffloade
                 f_prefetch=0.0,
                 kv_biased=True,
                 cpu_runner="native",
-                cots_capture_sync_mode=("wait_kernel" if m3 else "host_callback"),
+                weight_capture_sync_mode=("wait_kernel" if wait_kernel else "host_callback"),
             )
         )
         set_offloader(offloader)
@@ -229,17 +229,17 @@ def _capture_replay(*, offloader: CotsOffloader, forward, x: torch.Tensor):
 
 
 @pytest.mark.parametrize("f_cpu_store", [0.10, 0.25, 0.50])
-def test_qkv_m3_matches_baseline(f_cpu_store: float) -> None:
+def test_qkv_wait_kernel_path_matches_baseline(f_cpu_store: float) -> None:
     """QKV captured-replay output is bit-identical between wait_kernel-on and
     wait_kernel-off (within bf16 atol). This is the load-bearing parity gate
-    for the operator-side wait-kernel-sync wiring: the captured graph is identical
+    for the operator-side wait_kernel-sync wiring: the captured graph is identical
     in every node EXCEPT the sync node (sync_cb host_fn vs
-    cots_wait_done_kernel), so any divergence indicates the wait-kernel-sync ordering or
+    cots_wait_done_kernel), so any divergence indicates the wait_kernel-sync ordering or
     done_slot publish is broken."""
     torch.manual_seed(31)
     x = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
 
-    layer_off, off_off = _build_qkv(f_cpu_store=f_cpu_store, m3=False)
+    layer_off, off_off = _build_qkv(f_cpu_store=f_cpu_store, wait_kernel=False)
     try:
         _, replays_off = _capture_replay(
             offloader=off_off, forward=layer_off.qkv_proj, x=x
@@ -248,7 +248,7 @@ def test_qkv_m3_matches_baseline(f_cpu_store: float) -> None:
         if off_off._runner is not None:
             off_off._runner.close()
 
-    layer_on, off_on = _build_qkv(f_cpu_store=f_cpu_store, m3=True)
+    layer_on, off_on = _build_qkv(f_cpu_store=f_cpu_store, wait_kernel=True)
     try:
         _, replays_on = _capture_replay(
             offloader=off_on, forward=layer_on.qkv_proj, x=x
@@ -260,20 +260,20 @@ def test_qkv_m3_matches_baseline(f_cpu_store: float) -> None:
     for i, (r_off, r_on) in enumerate(zip(replays_off, replays_on)):
         torch.testing.assert_close(
             r_on, r_off, rtol=BF16_RTOL, atol=BF16_ATOL,
-            msg=f"replay #{i}: wait-kernel-sync path diverged from baseline at f_cpu_store={f_cpu_store}",
+            msg=f"replay #{i}: wait_kernel-sync path diverged from baseline at f_cpu_store={f_cpu_store}",
         )
 
 
 @pytest.mark.parametrize("f_cpu_store", [0.10, 0.25, 0.50])
-def test_mlp_m3_matches_baseline(f_cpu_store: float) -> None:
+def test_mlp_wait_kernel_path_matches_baseline(f_cpu_store: float) -> None:
     """MLP-block captured-replay output is bit-identical between wait_kernel-on
-    and wait_kernel-off. Exercises the strided down-proj slab dispatch with wait-kernel sync
+    and wait_kernel-off. Exercises the strided down-proj slab dispatch with wait_kernel sync
     enabled (the worker still publishes done_slot=seq after the
     silu*up + at::linear chain finishes)."""
     torch.manual_seed(37)
     x = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
 
-    layer_off, off_off = _build_mlp(f_cpu_store=f_cpu_store, m3=False)
+    layer_off, off_off = _build_mlp(f_cpu_store=f_cpu_store, wait_kernel=False)
     try:
         _, replays_off = _capture_replay(
             offloader=off_off, forward=layer_off.mlp, x=x
@@ -282,7 +282,7 @@ def test_mlp_m3_matches_baseline(f_cpu_store: float) -> None:
         if off_off._runner is not None:
             off_off._runner.close()
 
-    layer_on, off_on = _build_mlp(f_cpu_store=f_cpu_store, m3=True)
+    layer_on, off_on = _build_mlp(f_cpu_store=f_cpu_store, wait_kernel=True)
     try:
         _, replays_on = _capture_replay(
             offloader=off_on, forward=layer_on.mlp, x=x
@@ -295,14 +295,14 @@ def test_mlp_m3_matches_baseline(f_cpu_store: float) -> None:
     for i, (r_off, r_on) in enumerate(zip(replays_off, replays_on)):
         torch.testing.assert_close(
             r_on, r_off, rtol=BF16_RTOL, atol=atol,
-            msg=f"replay #{i}: wait-kernel-sync path diverged from baseline at f_cpu_store={f_cpu_store}",
+            msg=f"replay #{i}: wait_kernel-sync path diverged from baseline at f_cpu_store={f_cpu_store}",
         )
 
 
-def test_diag_counters_increment_under_m3() -> None:
+def test_diag_counters_increment_under_wait_kernel() -> None:
     """When VLLM_COTS_DIAG=1 is set BEFORE process start, the diag
     wait kernel runs and `wait_kernel_immediate_resume_count + wait_kernel_lagging_wait_count`
-    increments by exactly the captured wait-kernel fire count per
+    increments by exactly the captured wait_kernel fire count per
     replay. Skipped when env is not set (the env is read once at
     diag_enabled() first call; setting it mid-process is a no-op)."""
     import os
@@ -311,20 +311,20 @@ def test_diag_counters_increment_under_m3() -> None:
         pytest.skip(
             "VLLM_COTS_DIAG=1 must be set before process start. "
             "Re-run with VLLM_COTS_DIAG=1 to validate diag counter "
-            "increment under wait-kernel sync."
+            "increment under wait_kernel sync."
         )
 
     torch.manual_seed(41)
     x = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
-    layer, off = _build_qkv(f_cpu_store=0.10, m3=True)
+    layer, off = _build_qkv(f_cpu_store=0.10, wait_kernel=True)
     try:
         from vllm.model_executor.offloader import cots_ops
 
-        infer = cots_ops._lookup_infer(off._runner._runner_id, "diag_test")
+        infer = cots_ops.lookup_weight_runner(off._runner._runner_id, "diag_test")
         infer.reset_counters()
 
         _, replays = _capture_replay(offloader=off, forward=layer.qkv_proj, x=x)
-        # 5 replays × N wait-kernel fires per replay.
+        # 5 replays × N wait_kernel fires per replay.
         counters = dict(infer.get_counters())
         total = (
             counters.get("wait_kernel_immediate_resume_count", 0)

@@ -28,7 +28,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm._cots_C import CotsCpuInfer
+from vllm._cots_C import CotsWeightTaskRunner
 
 pytestmark = pytest.mark.needs_cuda
 
@@ -61,7 +61,7 @@ def _ref_production_mlp_block(
     """
     import torch.nn.functional as F
 
-    infer = CotsCpuInfer()
+    infer = CotsWeightTaskRunner()
     gate_out = torch.empty(
         x.shape[0], w_gate.shape[0], dtype=torch.bfloat16, pin_memory=True
     )
@@ -113,7 +113,7 @@ def test_native_runner_contig_down_proj_matches_python():
     )
     y_pinned = _alloc_pinned(NUM_TOKENS, HIDDEN)
 
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     ci.install(
         n_slabs=1,
         max_num_tokens=NUM_TOKENS,
@@ -190,7 +190,7 @@ def test_native_runner_contig_down_proj_offset_pointer_is_load_bearing():
         n_threads=1,
     )
 
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     ci.install(
         n_slabs=2,
         max_num_tokens=NUM_TOKENS,

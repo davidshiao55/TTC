@@ -9,9 +9,9 @@ The TaskSlab has two distinct token-count fields:
     descriptor bucket. Replay byte counters MUST read this so attribution
     stays stable across mutations of the other state.
 
-The test directly exercises CotsCpuInfer (no Python runner involved):
+The test directly exercises CotsWeightTaskRunner (no Python runner involved):
   1. Populate slab with `bucket_capacity_tokens=N`.
-  2. Drive the C++ `set_runtime_num_tokens` live-cap field with a
+  2. Drive the C++ `set_live_num_tokens` live-cap field with a
      different value → assert bucket_capacity_tokens unchanged.
   3. Drive `submit_on_stream` with a different num_tokens (mutates
      slab.num_tokens) → assert bucket_capacity_tokens unchanged.
@@ -31,9 +31,9 @@ if not torch.cuda.is_available():
 
 @pytest.fixture
 def runner():
-    from vllm._cots_C import CotsCpuInfer
+    from vllm._cots_C import CotsWeightTaskRunner
 
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     ci.install(n_slabs=2, max_num_tokens=8)
     yield ci
 
@@ -57,13 +57,13 @@ def _populate_qkv(ci, task_id: int, bucket: int) -> dict:
     return {"x_pin": x_pin, "y_pin": y_pin, "w_cpu": w_cpu}
 
 
-def test_set_runtime_num_tokens_does_not_touch_bucket_capacity(runner):
+def test_set_live_num_tokens_does_not_touch_bucket_capacity(runner):
     """The C++ live-token field is separate from slab capacity."""
     _populate_qkv(runner, task_id=0, bucket=8)
     assert runner.slab_bucket_capacity_tokens(0) == 8
-    runner.set_runtime_num_tokens(1)
+    runner.set_live_num_tokens(1)
     assert runner.slab_bucket_capacity_tokens(0) == 8
-    runner.set_runtime_num_tokens(4)
+    runner.set_live_num_tokens(4)
     assert runner.slab_bucket_capacity_tokens(0) == 8
 
 
@@ -103,7 +103,7 @@ def test_each_slab_keeps_its_own_bucket_capacity(runner):
     _populate_qkv(runner, task_id=1, bucket=16)
     assert runner.slab_bucket_capacity_tokens(0) == 4
     assert runner.slab_bucket_capacity_tokens(1) == 16
-    runner.set_runtime_num_tokens(2)
+    runner.set_live_num_tokens(2)
     assert runner.slab_bucket_capacity_tokens(0) == 4
     assert runner.slab_bucket_capacity_tokens(1) == 16
 
@@ -145,7 +145,7 @@ def test_replay_bucket_counters_read_capacity_not_num_tokens():
             "d2h/uva_replay_bucket_bytes counters are diag-gated "
             "(§1c.34 cleanup C). Re-run with VLLM_COTS_DIAG=1 pytest ..."
         )
-    from vllm._cots_C import CotsCpuInfer
+    from vllm._cots_C import CotsWeightTaskRunner
 
     BUCKET = 64
     IN_DIM = 32
@@ -153,7 +153,7 @@ def test_replay_bucket_counters_read_capacity_not_num_tokens():
     BF16 = 2
     LIVE = 1
 
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     ci.install(n_slabs=1, max_num_tokens=BUCKET)
 
     # Pinned bufs sized for the bucket so the worker's at::from_blob
@@ -173,7 +173,7 @@ def test_replay_bucket_counters_read_capacity_not_num_tokens():
     # Make slab.num_tokens diverge from bucket_capacity_tokens. The
     # counter MUST read capacity, not this.
     ci.reset_counters()
-    ci.set_runtime_num_tokens(LIVE)
+    ci.set_live_num_tokens(LIVE)
     stream = torch.cuda.current_stream().cuda_stream
     ci.submit_on_stream(
         task_id=0, num_tokens=LIVE, cuda_stream=stream,

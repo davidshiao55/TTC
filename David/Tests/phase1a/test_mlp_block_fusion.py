@@ -185,7 +185,7 @@ def test_fused_mlp_emits_exactly_one_uva_copy():
     import vllm.model_executor.offloader.cots_runners as cots_runners_mod
 
     # Phase 1c §1c.20 split the UVA helpers: `uva_copy_into_gpu` is the
-    # public eager-path helper (PythonCotsRunner.wait_and_uva); the
+    # public eager-path helper (PythonCotsWeightRunner.wait_and_uva); the
     # native-runner captured path uses `_uva_copy_trusted_host_into_gpu`
     # (skips the pinned-storage assertion because the slab pointer's
     # page-locked-ness is an install-time invariant). Patch the actual

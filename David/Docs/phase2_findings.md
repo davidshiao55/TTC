@@ -76,6 +76,7 @@ For decode:
 - The native prepared CPU suffix runner reads staged buffers and CPU KV metadata.
 - CPU suffix outputs and LSE remain in pinned CPU memory and are consumed by GPU merge through UVA views.
 - Staging-buffer reuse is protected by CUDA events.
+- In graph mode, hybrid KV uses normal piecewise attention boundaries; it does not add Phase 1 weight-offload custom-op split points unless weight offload is also active.
 
 ## Production Surface
 

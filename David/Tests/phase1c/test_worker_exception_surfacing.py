@@ -5,7 +5,7 @@ A C++ exception inside a worker task must:
   (a) be caught (TaskQueue::Worker decrements pending and notifies cv_
       so subsequent `sync()` doesn't deadlock — verified by the test
       reaching a normal stream-synchronize after the failing task);
-  (b) be stored on the CotsCpuInfer (`has_error_` + `last_error_msg_`);
+  (b) be stored on the CotsWeightTaskRunner (`has_error_` + `last_error_msg_`);
   (c) re-raise as a Python RuntimeError on the NEXT entry-point call
       (submit / sync / populate_slab) — the `check_error()` guard at
       the top of every entry point.
@@ -18,7 +18,7 @@ hang the whole engine.
 import pytest
 import torch
 
-from vllm._cots_C import CotsCpuInfer
+from vllm._cots_C import CotsWeightTaskRunner
 
 pytestmark = pytest.mark.needs_cuda
 
@@ -38,10 +38,10 @@ def _force_mlp_worker_error():
 
     Returns ``(ci, keepalive)``. The caller MUST bind ``keepalive``
     locally so the pinned-host backing buffers outlive the C++ slab —
-    `CotsCpuInfer` is a pybind class without a __dict__, so we can't
+    `CotsWeightTaskRunner` is a pybind class without a __dict__, so we can't
     smuggle the keepalive onto the instance.
     """
-    ci = CotsCpuInfer()
+    ci = CotsWeightTaskRunner()
     ci.install(n_slabs=1, max_num_tokens=0)
 
     in_dim = 4
