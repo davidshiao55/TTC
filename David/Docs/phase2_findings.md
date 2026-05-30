@@ -4521,3 +4521,498 @@ Current planner behavior is intentionally manual again:
 This keeps the codebase honest before the next round of policy work: throughput
 measurements can guide experiments, but the planner will not automatically choose
 hybrid until the combined KV/weight-offload policy is modeled and validated.
+
+## 2026-05-30 Follow-up: Suffix-Active Admission Pause Rejected
+
+The next policy probe tested an env-gated scheduler hook that paused admission
+of waiting requests whenever an already-running request had crossed the hybrid
+KV split. The intent was to reduce the large mixed prefix-only/suffix-active
+windows seen in the Llama total1024/split960 stats run without changing the
+split itself.
+
+Matched same-session Llama3.1-8B runs used B512, prompt608, total1024,
+`gpu_memory_utilization=0.80`, split960, eager mode, async scheduling disabled,
+`max_num_seqs=512`, and a 12 GiB CPU KV pool:
+
+| Mode | Out tok/s | vs GPU-only | vs default hybrid |
+|---|---:|---:|---:|
+| GPU-only | 2623.508 | 1.000x | n/a |
+| Hybrid default | 2469.535 | 0.941x | 1.000x |
+| Hybrid + suffix-active admission pause | 2371.487 | 0.904x | 0.960x |
+
+A stats-enabled pause run measured `2368.742 out tok/s` and explained the
+regression. The hook sometimes prevented large mixed-prefix windows, but it also
+left useful work queued while GPU KV was underused. Representative 5-second
+windows included:
+
+| Running | Waiting | GPU KV usage | COTS shape |
+|---:|---:|---:|---|
+| 17 | 378 | 29.6% | 544 suffix rows / 32 layer calls, no mixed prefix rows |
+| 48 | 124 | 40.3% | no hybrid decode calls in the window |
+| 34 | 31 | 56.6% | 928 suffix rows and 160 mixed prefix rows / 32 layer calls |
+| 55 | 313 | 90.0% | 1024 suffix rows and 736 mixed prefix rows / 32 layer calls |
+
+Conclusion: suffix-active-aware scheduling is still a plausible planner concept,
+but this particular runtime rule is the wrong shape. It reduces suffix/mixed
+work by shrinking the model-forward batch and can strand waiting requests while
+GPU KV capacity is available. The env knob, scheduler hook, and focused unit
+test were removed after this negative result; keep the evidence only as a
+measurement artifact. A future policy needs a predictive capacity/overhead model
+rather than a reactive "any suffix row pauses admission" rule.
+
+## 2026-05-30 Follow-up: Policy-Cell Feature Audit
+
+A small analysis helper now lives at
+`David/Benchmarks/phase2/analyze_kv_policy_cells.py`. It normalizes the measured
+Phase 2 cell artifact into the features that matter for policy work:
+execution mode, actual effective capacity, exposed CPU suffix blocks, active
+suffix fraction, and hybrid/GPU throughput ratio. This is intentionally an
+offline measurement analysis tool, not a planner hook.
+
+Running it with the default `--win-margin 0.01` currently promotes only two
+exact cells:
+
+| Cell | Cap gain | Suffix blocks | Hybrid/GPU |
+|---|---:|---:|---:|
+| Llama3.1-8B eager, mem0.80, total768, split736 | 4.3% | 2 | 1.017x |
+| Qwen2.5-7B graph, mem0.67, total768, split672 | 6.6% | 6 | 1.031x |
+
+Near ties remain below the promotion margin and should stay GPU-only unless
+repeated or improved:
+
+| Cell | Cap gain | Suffix blocks | Hybrid/GPU |
+|---|---:|---:|---:|
+| Llama3.1-8B graph, mem0.80, total768, split736 | 3.4% | 2 | 1.004x |
+| Qwen2.5-7B eager, mem0.67, total768, split704 | 9.1% | 4 | 1.006x |
+
+The feature audit also makes the failure mode of simple rules explicit.
+Capacity gain alone is not a sufficient policy rule: Llama total1024/split960 has
+`6.7%` effective-capacity gain and still loses at `0.938x`; Qwen graph
+total1024/split864 has `10.3%` gain and loses at `0.834x`. The active CPU suffix
+interval and model-specific suffix/artifact cost must be part of the profile.
+
+A midpoint Llama memory-boundary probe further tightened the conclusion. Same
+B512/prompt608/total768/split736/eager setup:
+
+| gpu_memory_utilization | GPU-only effective cap | Hybrid effective cap | GPU-only out tok/s | Hybrid out tok/s | Hybrid/GPU |
+|---:|---:|---:|---:|---:|---:|
+| 0.72 | 9.98x | 10.41x | 2266.497 | 2166.693 | 0.956x |
+| 0.74 | 15.02x | 15.67x | 2881.030 | 2766.800 | 0.960x |
+| 0.75 | 17.54x | 18.30x | 3019.741 | 3006.745 | 0.996x |
+| 0.78 | 25.10x | 26.20x | 3528.780 | 3340.093 | 0.947x |
+| 0.79 | 27.62x | 28.83x | 3531.807 | 3493.045 | 0.989x |
+| 0.80 | 30.15x | 31.46x | 3706.770 | 3769.650 | 1.017x |
+
+This boundary is not smooth enough to interpolate from
+`gpu_memory_utilization`. The useful profile key is the realized capacity table
+reported by vLLM after model load and graph/eager memory reservations. For Llama
+split736, the measured win only appears at the high-capacity 0.80 point; the new
+0.72 and 0.74 probes are clear losses, and 0.79 is still below GPU-only despite
+nearly identical relative capacity gain to 0.80. Current policy direction:
+profile exact runtime/workload cells, then generalize only through measured
+features such as realized GPU KV tokens, effective capacity, suffix blocks, and
+execution mode. Do not use a global capacity-gain threshold.
+
+## 2026-05-30 Follow-up: Llama Boundary Scheduler Shape
+
+A stats-enabled scheduler-shape check compared the Llama split736 boundary at
+`gpu_memory_utilization=0.79` and `0.80`. The point was to determine whether the
+0.80 win is a smooth capacity-gain effect or a discrete scheduler wave effect.
+Stats were enabled with `VLLM_LOG_STATS_INTERVAL=5`, so use these runs for shape
+attribution rather than replacing the non-stats headline numbers.
+
+| Mode | Mem | Effective cap | Out tok/s | First logged running/waiting | Later active-suffix shape |
+|---|---:|---:|---:|---:|---|
+| GPU-only | 0.79 | 27.62x | 3556.514 | 257 / 255 | n/a |
+| Hybrid | 0.79 | 28.83x | 3489.960 | 257 / 255 | 223 / 32 with 1760 suffix rows; then 153 / 0 with 2240 suffix rows |
+| GPU-only | 0.80 | 30.15x | 3740.578 | 281 / 231 | n/a |
+| Hybrid | 0.80 | 31.46x | 3788.300 | 281 / 231 | 194 / 84 with 3008 suffix rows; then 97 / 0 with 2464 suffix rows |
+
+The same 0.79 -> 0.80 capacity step changes the first scheduled wave from 257 to
+281 running requests for both GPU-only and hybrid. That explains why both modes
+speed up sharply at 0.80. Hybrid only wins once this larger wave is available:
+at 0.79 the CPU suffix path is active but does not create enough extra useful
+throughput to pay for the split/merge path; at 0.80 it crosses the same scheduler
+capacity boundary and the two-block suffix overhead is small enough to keep a
+small positive margin.
+
+Planner implication: realized effective capacity should be treated as a discrete
+wave/admission feature, not a smooth scalar. The profile key should include the
+actual post-load GPU KV token count and the resulting running-wave sizes for the
+workload bucket. A cheap heuristic like "relative capacity gain per suffix block"
+can rank candidate splits, but it cannot decide admission without a measured or
+modeled scheduler-wave boundary.
+
+## 2026-05-30 Follow-up: Qwen Graph Scheduler Shape
+
+The same scheduler-wave question was checked for the Qwen graph-mode positive
+cell. This uses the B512/prompt608/total768/`gpu_memory_utilization=0.67`
+workload. GPU-only graph used vLLM's normal `FULL_AND_PIECEWISE` graph mode;
+COTS hybrid KV defaulted to `PIECEWISE` graph mode, which is the current safe
+COTS graph policy.
+
+Stats-enabled results:
+
+| Mode | Split | Effective cap | Out tok/s | Representative running/waiting shape |
+|---|---:|---:|---:|---|
+| GPU-only graph | n/a | 7.62x | 2179.166 | small waves: 45/431, 64/334, 42/292, 73/184 |
+| Hybrid graph | 704 | 7.75x | 1993.774 | similar small waves plus suffix overhead: 63/406, 43/375, 48/305 |
+| Hybrid graph | 672 | 8.12x | 2248.874 | larger first wave and sustained suffix waves: 82/370, then about 58-61 running |
+
+This reinforces the Llama boundary result. Qwen split704 has only a tiny
+realized capacity increase over GPU-only (`7.62x -> 7.75x`) and loses badly once
+suffix/UVA work is active. Moving the split earlier to 672 costs two more CPU
+suffix blocks but increases effective capacity to `8.12x`; that is enough to
+create a larger useful running wave and beat GPU-only by about `3.2%` in the
+stats-enabled rerun.
+
+Planner implication: the split choice should be evaluated as a discrete wave
+transition, not as a smooth capacity/overhead tradeoff. Earlier split can win
+when it crosses the next useful admission wave and the model's suffix path is
+cheap enough; a later split can lose even with less suffix work if it does not
+move the wave. This is exactly why Qwen graph wants split672 while Qwen eager
+near-tie wanted split704 and Llama eager wants split736 for the current
+prompt608/total768 bucket.
+
+## 2026-05-30 Follow-up: Lower-Memory Throughput Claim
+
+The broad claim "lower GPU memory utilization makes KV more limited, therefore
+hybrid KV should increase throughput" is falsified by the current measurements.
+Lower memory pressure can make hybrid more likely to matter, but it is not a
+monotonic or sufficient condition for a throughput win.
+
+The cleanest counterexample is Llama3.1-8B with the same B512/prompt608/total768
+workload, same split736, and eager mode. Hybrid loses at `0.75`, `0.78`, and
+`0.79`, then wins only at `0.80`:
+
+| gpu_memory_utilization | GPU-only effective cap | Hybrid effective cap | Hybrid/GPU |
+|---:|---:|---:|---:|
+| 0.72 | 9.98x | 10.41x | 0.956x |
+| 0.74 | 15.02x | 15.67x | 0.960x |
+| 0.75 | 17.54x | 18.30x | 0.996x |
+| 0.78 | 25.10x | 26.20x | 0.947x |
+| 0.79 | 27.62x | 28.83x | 0.989x |
+| 0.80 | 30.15x | 31.46x | 1.017x |
+
+This fixed-split table means the 0.80 split736 win is not explained by
+"lower memory is better" or by the relative capacity gain alone. The 0.72 and
+0.74 split736 probes are losses, but they do not rule out lower-memory hybrid
+wins with a different split; they show that split choice has to move with the
+realized capacity wave.
+
+The longer-context cells give the other important counterexample. At Llama
+total1024, hybrid has larger effective-capacity gains than the positive
+total768/split736 cell, but it still loses: split960 has `6.7%` capacity gain and
+lands at `0.938x`, while split864 has `18.5%` gain and lands at `0.883x`. Qwen
+graph total1024 shows the same pattern: split864 has `10.3%` gain and lands at
+`0.834x`. More KV capacity does not help if the corresponding suffix work and
+artifact merge path are on the critical path for too much of the decode.
+
+The more defensible throughput claim is narrower: hybrid KV can improve
+throughput when the split changes the realized admission wave enough to repay
+the model-specific suffix and merge overhead. Lower GPU memory is one input to
+that condition, not the condition itself. The planner should therefore remain
+profile-gated on realized GPU KV tokens, scheduler-wave shape, suffix blocks,
+model, execution mode, and workload length. A generic "lower memory => enable
+hybrid" rule should be rejected for the current implementation.
+
+## 2026-05-30 Follow-up: Llama Capacity-Window Split Frontier
+
+A follow-up sweep tested the corrected claim: not "lower memory always wins,"
+but "hybrid can improve throughput inside the KV-limited capacity window if the
+split crosses a useful scheduler wave before GPU-only reaches its memory-sufficient
+throughput." The raw sweep output is in
+`/TTC/results/phase2_capacity_window_llama_20260530.jsonl`, with repeat checks in
+`/TTC/results/phase2_capacity_window_llama_20260530_repeats.jsonl`.
+
+Workload stayed fixed: Llama3.1-8B, B512, prompt608/total768, eager mode,
+async scheduling disabled, `max_num_seqs=512`, CPU pool 12 GiB, no explicit
+suffix-thread env.
+
+| Mem | GPU-only cap | GPU-only out tok/s | Best hybrid split | Hybrid cap | Hybrid out tok/s | Hybrid/GPU |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.72 | 9.98x | 2278.8 mean, 2 runs | 640 | 11.97x | 2347.7 mean, 2 runs | 1.030x |
+| 0.74 | 15.02x | 2881.0 | 704 | 16.39x | 2793.7 | 0.970x |
+| 0.75 | 17.54x | 3019.7 | 736 | 18.30x | 3006.7 | 0.996x |
+| 0.78 | 25.10x | 3528.8 | 704 | 27.39x | 3451.3 | 0.978x |
+| 0.79 | 27.62x | 3531.8 | 736 | 28.83x | 3493.0 | 0.989x |
+| 0.80 | 30.15x | 3706.8 | 736 | 31.46x | 3769.7 | 1.017x |
+
+The 0.72 point is the first lower-memory Llama capacity-window win. Fixed
+split736 lost at 0.72 (`2166.7 out tok/s`), but split640 repeats positive:
+`2349.563` and `2345.891` hybrid out tok/s versus `2266.497` and `2291.143`
+GPU-only out tok/s. That is about `1.03x` on paired means.
+
+The local 0.72 split shape also shows the overhead boundary: split608 raises
+capacity further to `12.61x` but falls to `2159.0 out tok/s`; split640 lands on
+the useful wave; split656 is near parity; split672 and later do not move the
+wave enough. This is the cleanest evidence so far that the claim can be made
+more general only through a split frontier, not through a fixed split or a global
+memory threshold.
+
+Updated policy conclusion: hybrid KV can increase throughput before GPU-only is
+memory-sufficient, but only for measured model/workload/memory/split cells where
+the admission-wave gain exceeds suffix/merge overhead. The current Llama
+positive cells are now 0.72/split640 and 0.80/split736; 0.74, 0.75, 0.78, and
+0.79 remain GPU-only on the measured frontier.
+
+## 2026-05-30 Follow-up: Mixed-Prefix Wrapper Overhead Reduction
+
+A small overhead-reduction pass targeted the mixed-prefix/coalesced-prefix path,
+where GPU-only prefix rows and CPU-suffix rows share one decode batch. Three
+changes were tested:
+
+1. Add `merge_attn_states_indexed`, a CUDA merge op that reads full prefix
+   output/LSE by row index, reads compact CPU suffix output/LSE, and writes the
+   merged suffix rows directly into the full output buffer. This removes compact
+   prefix `index_select` and the final output `index_copy_` for the coalesced
+   path.
+2. Skip the GPU-side `query.index_select` when the coalesced-prefix path already
+   has a valid staged CPU query/QKV buffer for the suffix worker. This avoids a
+   per-layer compact GPU query copy that is not consumed by the CPU suffix path.
+3. Avoid allocating a compact GPU output temp in the indexed coalesced-prefix
+   path. This was correct cleanup but did not produce a measurable extra win.
+
+Llama3.1-8B, B512, prompt608/total768, eager mode, async scheduling disabled,
+CPU pool 12 GiB:
+
+| Cell | Mode / variant | Effective cap | Out tok/s | Ratio |
+|---|---:|---:|---:|---:|
+| mem0.75 split736 | old hybrid frontier | 18.30x | 3006.7 | 0.996x vs old GPU mean |
+| mem0.75 split736 | indexed merge only | 18.30x | 3005.6 | unchanged |
+| mem0.75 split736 | indexed + staged-query skip | 18.30x | 3036.1 | 0.994x vs same-build GPU |
+| mem0.75 split736 | same-build GPU-only | 17.54x | 3053.1 | baseline |
+| mem0.75 split736 | indexed + query skip + no compact output temp | 18.30x | 3032.3 | no extra gain |
+| mem0.72 split640 | optimized hybrid | 11.97x | 2352.4 | 1.026x vs same-build GPU |
+| mem0.72 | same-build GPU-only | 9.98x | 2292.9 | baseline |
+
+Conclusion: the overhead can be reduced, but the first useful reduction is only
+about `1%` on the 0.75/split736 near-miss cell. That is enough to move hybrid
+from roughly `3006.7` to `3036.1 out tok/s`, but the fresh GPU-only baseline was
+`3053.1 out tok/s`, so 0.75 remains a loss under same-build comparison. The
+0.72/split640 capacity-window win remains positive at `1.026x` on the same
+optimized code.
+
+This narrows the remaining gap: compact prefix gather/scatter was not the main
+problem, and compact output allocation was not measurable. The material wrapper
+tax was the unnecessary GPU query compaction. The remaining non-win cells now
+need either a larger scheduler-wave capacity gain or a deeper reduction in the
+real suffix path itself, not just cleanup around the merge call.
+
+## 2026-05-30 Follow-up: Coalesced Prefix/Suffix Overlap Attempt
+
+The next attempted optimization was to overlap CPU suffix attention with the
+coalesced GPU prefix FlashAttention path. The intended schedule was:
+
+```text
+submit CPU suffix attention
+run full-batch GPU prefix FlashAttention
+sync CPU suffix only at merge
+indexed merge suffix rows into full output
+```
+
+Implementation-wise, the suffix submission helper was lifted out of
+`cots_hybrid_decode_attention()` so the coalesced path could submit the native
+prepared suffix task before launching full-batch prefix attention. The hook was
+conservatively gated on the existing early-submit conditions: native prepared
+runner, valid staged CPU query/QKV, submit stream/event available, and not inside
+CUDA graph capture.
+
+The A/B on the Llama3.1-8B B512/prompt608/total768 mem0.75/split736 near-miss
+cell was negative:
+
+| Variant | Out tok/s | Notes |
+|---|---:|---|
+| overlap enabled | 3009.2 | CPU suffix submitted before coalesced GPU prefix |
+| overlap disabled by env | 3033.6 | same code, `VLLM_COTS_HYBRID_EARLY_SUFFIX_SUBMIT=0` |
+| default after backing out coalesced hook | 3038.3 | non-overlap optimized path restored |
+
+Conclusion: naive coalesced prefix/suffix overlap does not close the gap; it
+regresses the near-miss cell by about `0.8-1.0%`. The likely reason is that the
+extra host-callback/task submission and concurrent CPU suffix work interfere with
+launch/host-side scheduling more than the GPU prefix work hides. Since CPU suffix
+was not the dominant critical-path term in this cell, starting it earlier is not
+a free win.
+
+The default coalesced early-submit hook was therefore backed out. The remaining
+safe refactor is only that suffix submission is now a reusable helper inside the
+hybrid attention module; behavior stays on the non-overlap path for coalesced
+mixed-prefix batches.
+
+## 2026-05-30 Follow-up: Launch Order With More CPU Suffix Blocks
+
+A follow-up launch-order sweep tested whether the negative CPU-first result at
+split736 was only a 2-suffix-block artifact. The same Llama3.1-8B
+B512/prompt608/total768 mem0.75 workload was run with progressively earlier
+splits. GPU-first is the default non-overlap coalesced-prefix path; CPU-first is
+the diagnostic path that submits CPU suffix attention before full-batch GPU
+prefix FlashAttention.
+
+| Split | CPU suffix blocks/request | Effective cap | GPU-first out tok/s | CPU-first out tok/s | CPU-first delta |
+|---:|---:|---:|---:|---:|---:|
+| 736 | 2 | 18.30x | 3023.8 | 3007.6 | -0.5% |
+| 704 | 4 | 19.14x | 2983.3 | 2992.3 | +0.3% |
+| 672 | 6 | 20.05x | 2786.1 | 2801.4 | +0.5% |
+| 640 | 8 | 21.05x | 2652.7 | 2646.5 | -0.2% |
+
+This gives a more general launch-order rule: CPU-first is not universally wrong,
+but it only helps slightly once suffix work is larger, and the gain is far too
+small to justify pushing more blocks to CPU. Earlier splits raise effective
+capacity (`18.30x -> 21.05x`) but throughput drops sharply (`3023.8 -> 2652.7`
+in the GPU-first path). CPU-first recovers only about `9-15 out tok/s` at the
+4/6-block splits, while the extra CPU suffix work costs hundreds of out tok/s.
+
+Conclusion: launch order is a second-order tuning knob. Split choice and suffix
+work dominate. For the current Llama mem0.75 workload, the best split remains
+near split736; pushing more KV blocks to CPU is not rescued by CPU-first launch.
+The failed diagnostic hook was removed from the default code path after this
+measurement.
+
+## 2026-05-30 Follow-up: Production-Like Suffix Runner Curve
+
+A focused suffix-runner sweep checked whether the next throughput attempt should
+target the prepared runner wrapper or the CPU suffix work itself. The benchmark
+used Llama3-8B shape, B512, 32 layers, 24 suffix threads, and the hot suffix
+lengths corresponding to the mem0.75 split sweep:
+
+| Suffix tokens | Prepared+scatter median ms, default snapshot | Prepared+scatter median ms, no snapshot |
+|---:|---:|---:|
+| 32 | 75.0 | 52.7 |
+| 64 | 118.5 | 108.2 |
+| 96 | 160.9 | 137.7 |
+| 128 | 202.2 | 180.6 |
+
+The default standalone benchmark is pessimistic for current production decode
+because it snapshots input metadata for eager safety. The production static
+staging path disables snapshots once staging reuse is protected. With
+`--no-snapshot-inputs`, the 32-token point is essentially tied with blocking
+direct scatter (`54.3 ms direct` vs `52.7 ms prepared`) and graph replay is
+slightly lower (`50.9 ms`). At 64 tokens, prepared no-snapshot remains above
+direct (`108.2 ms` vs `95.6 ms`) but the gap is much smaller than the snapshot
+case.
+
+Conclusion: the prepared runner wrapper is not the main remaining throughput
+lever in the current static-staging path. The runner has a small envelope cost,
+but the curve is dominated by real suffix attention/scatter as suffix length
+grows. This supports the launch-order conclusion: pushing more blocks to CPU is
+not rescued by orchestration. The next useful attempt should either reduce the
+actual suffix work paid per active request, or measure/select cells where the
+capacity gain is large enough to cover the real suffix curve.
+
+## 2026-05-30 Follow-up: Llama Total896 Capacity Window
+
+An out-of-sample capacity-window sweep tested whether the Llama throughput win
+extends smoothly from `total768` to a longer decode bucket. Workload was
+Llama3.1-8B, B512, prompt608/total896, eager mode, async scheduling disabled,
+`max_num_seqs=512`, and a 12 GiB CPU KV pool. Splits 768, 800, 832, and 864
+correspond to 8, 6, 4, and 2 active CPU suffix blocks at the end of decode.
+
+| Mem | GPU-only cap | GPU-only out tok/s | Best hybrid split | Hybrid cap | Hybrid out tok/s | Hybrid/GPU |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.72 | 8.55x | 1628.7 mean, 2 runs | 768 | 9.98x | 1582.3 mean, 2 runs | 0.972x |
+| 0.80 | 25.84x | 3137.7 | 864 | 26.80x | 2964.6 | 0.945x |
+
+Full frontier rows:
+
+| Mem | Split | CPU suffix blocks | Effective cap | Out tok/s |
+|---:|---:|---:|---:|---:|
+| 0.72 | GPU-only | n/a | 8.55x | 1628.7 |
+| 0.72 | 768 | 8 | 9.98x | 1578.6, repeat 1586.0 |
+| 0.72 | 800 | 6 | 9.58x | 1551.2 |
+| 0.72 | 832 | 4 | 9.21x | 1532.9 |
+| 0.72 | 864 | 2 | 8.87x | 1505.2 |
+| 0.80 | GPU-only | n/a | 25.84x | 3137.7 |
+| 0.80 | 768 | 8 | 30.15x | 2748.3 |
+| 0.80 | 800 | 6 | 28.94x | 2852.7 |
+| 0.80 | 832 | 4 | 27.83x | 2941.3 |
+| 0.80 | 864 | 2 | 26.80x | 2964.6 |
+
+This bucket is a clear negative result. At mem0.72, split768 raises effective
+capacity by about `16.7%`, but the 8-block suffix path still loses by about
+`2.8%` on repeated means. At mem0.80, even the best 2-block suffix split864 loses
+by about `5.5%`; the capacity gain is only `3.7%` and does not cover the suffix
+path. The result tightens the general claim: hybrid wins are not just a function
+of lower memory or larger capacity gain. The generated-length bucket matters
+because longer decode keeps suffix-active work on the critical path for more
+steps. The planner profile key therefore needs `prompt_tokens`, `total_tokens`,
+split, execution mode, realized capacity, and measured suffix-path cost.
+
+## 2026-05-30 Follow-up: Qwen Total896 Capacity Window
+
+The same out-of-sample total896 check was run for Qwen2.5-7B in graph mode,
+where the total768 split672 cell is positive and the Qwen CPU suffix path is
+cheaper than Llama. Workload was B512, prompt608/total896,
+`gpu_memory_utilization=0.67`, graph mode, async scheduling disabled,
+`max_num_seqs=512`, and a 12 GiB CPU KV pool.
+
+| Split | CPU suffix blocks | Effective cap | Out tok/s | Hybrid/GPU |
+|---:|---:|---:|---:|---:|
+| GPU-only | n/a | 6.54x | 1509.6 | 1.000x |
+| 736 | 10 | 7.41x | 1421.9 | 0.942x |
+| 768 | 8 | 7.10x | 1381.8 | 0.915x |
+| 800 | 6 | 6.82x | 1331.1 | 0.882x |
+| 832 | 4 | 6.56x | 1301.4 | 0.862x |
+| 864 | 2 | 6.31x | 1290.2 | 0.855x |
+
+The best Qwen total896 hybrid point is split736, but it still loses by about
+`5.8%`. This is a useful contrast with the Qwen total768 graph win: even though
+Qwen suffix attention is cheaper, the longer generated bucket keeps CPU suffix
+work active for enough steps that the capacity gain does not pay back the suffix
+path. Split736 has a large effective-capacity gain (`6.54x -> 7.41x`), but it
+also exposes 10 active CPU suffix blocks at the end of decode. Later splits lower
+suffix work but barely move capacity and lose more.
+
+Updated claim boundary: current Phase 2 hybrid KV has validated positive cells,
+but they are short-window capacity-frontier wins. The more general throughput
+claim must be keyed by generated-length bucket and split, not only model,
+memory pressure, or total capacity gain. Total896 is negative for both Llama and
+Qwen under the measured settings.
+
+## 2026-05-30 Follow-up: Split-Crossing Prefill Spillover Profile
+
+A small eager-mode profile checked the current split-crossing prefill behavior directly, using `David/Benchmarks/phase2/benchmark_prefill_spillover_e2e.py`. The workload was Qwen2.5-7B, unique synthetic prompts, prefix caching disabled, `gpu_memory_utilization=0.67`, `max_num_seqs=128`, prompt704/total705, and split672 for the spillover case.
+
+| Mode | Batch | Split | Spill prompt tokens/request | Elapsed s | Prompt tok/s | Behavior |
+|---|---:|---:|---:|---:|---:|---|
+| GPU-only | 8 | n/a | n/a | 0.513 | 10971.5 | no COTS path |
+| Hybrid | 8 | 672 | 32 | 0.679 | 8293.9 | mixed prefix/suffix rows active |
+| Hybrid no-spill prefill-only | 16 | 704 | 0 | 1.003 | 11228.4 | zero COTS activity |
+| Hybrid no-spill + one decode step | 16 | 704 | 0 | 1.215 | 9267.3 | decode suffix path active |
+
+The clean B8 spillover run logged 28 hybrid decode calls, 131712 GPU-prefix rows, 6272 CPU-suffix rows, 45.0 MiB query D2H, 12.8 MiB KV D2H, and 45.7 MiB artifact H2D. CPU suffix attention itself was about 14.7 ms across the run and the CPU worker used 24 threads. This confirms the current semantic behavior: when prefill crosses the split, rows at positions `>= split_tokens` naturally take the CPU suffix path; vLLM is not doing an all-GPU prefill followed by a separate spill copy.
+
+This is a negative throughput result for the prefill-heavy diagnostic, not a throughput policy win. B8 is below the GPU-only capacity limit, so the hybrid capacity gain is not useful and the row-expanded spillover path exposes D2H, artifact transfer, merge, and CPU suffix work. The current conclusion is to keep natural split-crossing prefill as the simple correctness path, but not spend optimization effort on long prefill spillover unless the planner workload makes those rows common enough to matter.
+
+## 2026-05-30 Follow-up: Consolidated Hybrid Boundary Packet
+
+The win/loss boundary is now consolidated instead of scattered across the investigation notes. Running `David/Benchmarks/phase2/analyze_kv_policy_cells.py` with the default `--win-margin 0.01` promotes three exact measured cells:
+
+| Cell | Effective capacity gain | Active CPU suffix blocks | Headline Hybrid/GPU |
+|---|---:|---:|---:|
+| Llama3.1-8B eager, mem0.72, total768, split640 | 19.9% | 8 | 1.030x |
+| Llama3.1-8B eager, mem0.80, total768, split736 | 4.3% | 2 | 1.017x |
+| Qwen2.5-7B graph, mem0.67, total768, split672 | 6.6% | 6 | 1.031x |
+
+Near-ties remain below the 1% promotion margin and should stay profile-gated or GPU-only: Llama graph mem0.80/split736 is `1.004x`, and Qwen eager mem0.67/split704 is `1.006x`. The important negative controls are still total896 and total1024: large capacity gains there do not win because the suffix-active interval is too long.
+
+The exact promoted cells now have scheduler-shape evidence:
+
+| Cell | Diagnostic status | Main shape signal |
+|---|---|---|
+| Llama mem0.72/split640 | New stats-enabled fill-in | GPU-only first logged wave was 40 running / 472 waiting; hybrid was 147 / 365 with 8 CPU suffix blocks/request. |
+| Llama mem0.80/split736 | Existing stats-enabled 0.79/0.80 boundary packet | The 0.80 point crosses a larger running wave than 0.79; the two-block suffix overhead is small enough to keep the margin positive. |
+| Qwen graph mem0.67/split672 | Existing split672 vs split704 graph packet | split672 moves to a larger useful wave; split704 has too little capacity gain and loses despite less suffix work. |
+
+For the new Llama mem0.72/split640 fill-in, CUDA timing and COTS diagnostics perturb throughput, so use it only for mechanism. The non-instrumented headline remains `2347.7` hybrid out tok/s versus `2278.8` GPU-only out tok/s. The stats-enabled run measured `2210.4` hybrid out tok/s versus `2299.1` GPU-only, but it exposed the key behavior: most hybrid windows were all-suffix decode rows (`4704` suffix rows over 32 layer calls, no mixed-prefix rows), with mixed prefix/suffix rows appearing only when newer requests were admitted while older requests were already past the split.
+
+Current conclusion: Phase 2 can support a narrower throughput claim, but only as a profiled capacity-frontier claim. Hybrid wins when the split changes the scheduler wave enough to cover suffix attention, artifact movement, and merge overhead. Capacity gain alone, lower memory alone, or fewer suffix blocks alone are not sufficient rules. After this pass there is no obvious missing counter for the current promoted cells; the next work should be either policy cleanup around profile-gated selection, or a separate optimization project aimed at lowering the real suffix path cost.
+
+## 2026-05-30 Cleanup: Phase 2 Runtime Surface
+
+A small cleanup pass froze the current Phase 2 surface around the measured production path rather than keeping every investigation knob alive.
+
+Kept: coalesced-prefix hybrid decode, indexed merge/writeback for precomputed full-prefix rows, staged-query skip, natural split-crossing prefill, COTS suffix counters/timing diagnostics, and the profile-analysis scripts.
+
+Removed from the public env surface: `VLLM_COTS_HYBRID_EARLY_SUFFIX_SUBMIT`. The early suffix submit path remains an internal all-suffix decode optimization guarded by runtime conditions; the coalesced-prefix mixed-row path passes precomputed prefix output and intentionally does not use it. The already-negative suffix-active admission pause knob remains removed.
+
+Benchmark cleanup: `run_capacity_window_sweep.py` now includes split640 in its default split frontier, so the default Llama lower-memory sweep can reproduce the current mem0.72/split640 positive cell. The indexed-merge Python wrapper now aliases the custom op import to avoid name shadowing.

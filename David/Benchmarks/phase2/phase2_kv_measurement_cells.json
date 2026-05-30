@@ -2,7 +2,7 @@
   "schema": "phase2_kv_measurements.v1",
   "hardware": "RTX4090+i9-14900KF",
   "dtype": "bfloat16",
-  "notes": "Measured Phase 2 synthetic B512 prompt608 total768 cells for measurement analysis only. The FastTTS manual planner no longer consumes this artifact; automatic hybrid policy selection is deferred until the general hybrid/weight-offload policy is pinned down.",
+  "notes": "Measured Phase 2 synthetic B512 prompt608 cells for measurement analysis only. The FastTTS manual planner no longer consumes this artifact; automatic hybrid policy selection is deferred until the general hybrid/weight-offload policy is pinned down.",
   "cells": [
     {
       "label": "qwen-graph-0.67-split672-repeat-mean",
@@ -37,7 +37,9 @@
       "prompt_tokens": 608,
       "total_tokens": 768,
       "suffix_tokens": 160,
-      "prompt_mode": "shared"
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 7.62,
+      "hybrid_effective_capacity": 8.12
     },
     {
       "label": "qwen-eager-0.67-split704-two-pass",
@@ -68,7 +70,9 @@
       "prompt_tokens": 608,
       "total_tokens": 768,
       "suffix_tokens": 160,
-      "prompt_mode": "shared"
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 8.04,
+      "hybrid_effective_capacity": 8.77
     },
     {
       "label": "llama-eager-0.80-split736-current-repeat",
@@ -103,7 +107,9 @@
           3776.895,
           3762.405
         ]
-      }
+      },
+      "gpu_only_effective_capacity": 30.15,
+      "hybrid_effective_capacity": 31.46
     },
     {
       "label": "llama-graph-0.80-split736",
@@ -128,7 +134,9 @@
       "prompt_tokens": 608,
       "total_tokens": 768,
       "suffix_tokens": 160,
-      "prompt_mode": "shared"
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 29.96,
+      "hybrid_effective_capacity": 30.98
     },
     {
       "label": "llama-eager-0.75-split736-negative",
@@ -153,7 +161,108 @@
       "prompt_tokens": 608,
       "total_tokens": 768,
       "suffix_tokens": 160,
-      "prompt_mode": "shared"
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 17.54,
+      "hybrid_effective_capacity": 18.3
+    },
+    {
+      "label": "llama-eager-0.74-split736-lower-boundary-negative",
+      "roles": [
+        "generator"
+      ],
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.74,
+      "enforce_eager": true,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "split_blocks": 46,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 2881.03,
+      "hybrid_out_tok_s": 2766.8,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "suffix_tokens": 160,
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 15.02,
+      "hybrid_effective_capacity": 15.67,
+      "notes": "Lower-memory boundary probe below the 0.75 loss. Hybrid remains negative, so no lower-memory gain cliff appeared at 0.74."
+    },
+    {
+      "label": "llama-eager-0.72-split736-lower-boundary-negative",
+      "roles": [
+        "generator"
+      ],
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.72,
+      "enforce_eager": true,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "split_blocks": 46,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 2266.497,
+      "hybrid_out_tok_s": 2166.693,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "suffix_tokens": 160,
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 9.98,
+      "hybrid_effective_capacity": 10.41,
+      "notes": "Lower-memory boundary probe below 0.74. Hybrid remains negative even with a small effective-capacity increase, reinforcing that lower memory is not sufficient."
+    },
+    {
+      "label": "llama-eager-0.72-split640-frontier-repeat-win",
+      "roles": [
+        "generator"
+      ],
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.72,
+      "enforce_eager": true,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "split_blocks": 40,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 2278.82,
+      "hybrid_out_tok_s": 2347.727,
+      "repeats": {
+        "gpu_only_out_tok_s": [
+          2266.497,
+          2291.143
+        ],
+        "hybrid_out_tok_s": [
+          2349.563,
+          2345.891
+        ]
+      },
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "suffix_tokens": 160,
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 9.98,
+      "hybrid_effective_capacity": 11.97,
+      "sweep_artifacts": {
+        "jsonl": "/TTC/results/phase2_capacity_window_llama_20260530.jsonl",
+        "repeat_jsonl": "/TTC/results/phase2_capacity_window_llama_20260530_repeats.jsonl",
+        "log_dir": "/TTC/results/phase2_capacity_window_llama_20260530_logs"
+      },
+      "notes": "Capacity-window split-frontier sweep. At mem0.72, fixed split736 loses, but split640 crosses a useful scheduler wave and repeats as a 1.03x hybrid win over GPU-only."
     },
     {
       "label": "qwen-graph-0.67-split704-negative",
@@ -178,7 +287,9 @@
       "prompt_tokens": 608,
       "total_tokens": 768,
       "suffix_tokens": 160,
-      "prompt_mode": "shared"
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 7.62,
+      "hybrid_effective_capacity": 7.75
     },
     {
       "label": "llama-eager-0.80-total1024-split864-negative",
@@ -360,6 +471,776 @@
       "gpu_only_gpu_kv_tokens": 23152,
       "hybrid_gpu_kv_tokens": 23152,
       "notes": "One-block active-suffix control. Exact no-suffix hybrid split1024 is rejected because COTS hybrid KV requires at least one CPU suffix block."
+    },
+    {
+      "label": "llama-eager-0.80-total1024-split960-suffix-admission-pause-negative",
+      "kind": "e2e_policy_ablation",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.8,
+      "enforce_eager": true,
+      "max_model_len": 1024,
+      "max_num_seqs": 512,
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 1024,
+      "split_blocks": 60,
+      "split_tokens": 960,
+      "cpu_kv_gb": 12,
+      "async_scheduling": false,
+      "prompt_mode": "shared",
+      "cases": [
+        {
+          "mode": "gpu_only",
+          "out_tok_s": 2623.508,
+          "elapsed_s": 81.185954,
+          "effective_capacity": 22.61
+        },
+        {
+          "mode": "hybrid_default",
+          "out_tok_s": 2469.535,
+          "elapsed_s": 86.247828,
+          "hybrid_vs_gpu": 0.941
+        },
+        {
+          "mode": "hybrid_suffix_active_admission_pause",
+          "out_tok_s": 2371.487,
+          "elapsed_s": 89.813681,
+          "hybrid_vs_gpu": 0.904,
+          "pause_vs_default_hybrid": 0.96
+        },
+        {
+          "mode": "hybrid_suffix_active_admission_pause_stats_enabled",
+          "out_tok_s": 2368.742,
+          "elapsed_s": 89.917767,
+          "diagnostic_only": true
+        }
+      ],
+      "representative_pause_stats_windows": [
+        {
+          "running_reqs": 17,
+          "waiting_reqs": 378,
+          "gpu_kv_usage_pct": 29.6,
+          "suffix_rows_per_32_layer_calls": 544,
+          "mixed_prefix_rows": 0
+        },
+        {
+          "running_reqs": 48,
+          "waiting_reqs": 124,
+          "gpu_kv_usage_pct": 40.3,
+          "hybrid_decode_calls_per_window": 0
+        },
+        {
+          "running_reqs": 34,
+          "waiting_reqs": 31,
+          "gpu_kv_usage_pct": 56.6,
+          "suffix_rows_per_32_layer_calls": 928,
+          "mixed_prefix_rows": 160
+        },
+        {
+          "running_reqs": 55,
+          "waiting_reqs": 313,
+          "gpu_kv_usage_pct": 90.0,
+          "suffix_rows_per_32_layer_calls": 1024,
+          "mixed_prefix_rows": 736
+        }
+      ],
+      "notes": "Env-gated suffix-active admission pause was tested and removed. It reduced some mixed-prefix admission but starved useful waiting admission, leaving queued requests while GPU KV was underused in several windows; throughput regressed versus default hybrid."
+    },
+    {
+      "label": "llama-eager-0.78-split736-boundary-negative",
+      "roles": [
+        "generator"
+      ],
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.78,
+      "enforce_eager": true,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "split_blocks": 46,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 3528.78,
+      "hybrid_out_tok_s": 3340.093,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "suffix_tokens": 160,
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 25.1,
+      "hybrid_effective_capacity": 26.2,
+      "gpu_only_gpu_kv_tokens": 19280,
+      "hybrid_gpu_kv_tokens": 19280,
+      "notes": "Boundary probe between known Llama 0.75 loss and 0.80 win; still negative, so relative capacity gain alone is not enough."
+    },
+    {
+      "label": "llama-eager-0.79-split736-boundary-negative",
+      "roles": [
+        "generator"
+      ],
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.79,
+      "enforce_eager": true,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "split_blocks": 46,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 3531.807,
+      "hybrid_out_tok_s": 3493.045,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "suffix_tokens": 160,
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 27.62,
+      "hybrid_effective_capacity": 28.83,
+      "gpu_only_gpu_kv_tokens": 21216,
+      "hybrid_gpu_kv_tokens": 21216,
+      "notes": "Boundary probe near the known Llama 0.80 win; still below GPU-only, indicating the positive cell depends on the discrete effective-capacity point around 30x."
+    },
+    {
+      "label": "llama-eager-split736-0.79-vs-0.80-scheduler-shape",
+      "kind": "e2e_scheduler_shape_diagnostic",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "enforce_eager": true,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "split_blocks": 46,
+      "split_tokens": 736,
+      "cpu_kv_gb": 12,
+      "async_scheduling": false,
+      "prompt_mode": "shared",
+      "stats_interval_s": 5,
+      "cases": [
+        {
+          "mode": "gpu_only",
+          "gpu_memory_utilization": 0.79,
+          "effective_capacity": 27.62,
+          "gpu_kv_tokens": 21216,
+          "out_tok_s": 3556.514,
+          "elapsed_s": 23.033791,
+          "windows": [
+            {
+              "running": 257,
+              "waiting": 255,
+              "gpu_kv_usage_pct": 99.8,
+              "gen_tok_s": 4728.0
+            },
+            {
+              "running": 180,
+              "waiting": 215,
+              "gpu_kv_usage_pct": 99.8,
+              "gen_tok_s": 3199.6
+            },
+            {
+              "running": 244,
+              "waiting": 11,
+              "gpu_kv_usage_pct": 99.0,
+              "gen_tok_s": 3014.6
+            },
+            {
+              "running": 153,
+              "waiting": 0,
+              "gpu_kv_usage_pct": 98.5,
+              "gen_tok_s": 3748.4
+            }
+          ]
+        },
+        {
+          "mode": "hybrid",
+          "gpu_memory_utilization": 0.79,
+          "effective_capacity": 28.83,
+          "gpu_kv_tokens": 21216,
+          "out_tok_s": 3489.96,
+          "elapsed_s": 23.473048,
+          "windows": [
+            {
+              "running": 257,
+              "waiting": 255,
+              "gpu_kv_usage_pct": 99.8,
+              "cpu_kv_blocks": 0,
+              "gen_tok_s": 4625.4
+            },
+            {
+              "running": 213,
+              "waiting": 156,
+              "gpu_kv_usage_pct": 98.7,
+              "cpu_kv_blocks": 143,
+              "gen_tok_s": 3129.4,
+              "hybrid_decode_calls": 0
+            },
+            {
+              "running": 223,
+              "waiting": 32,
+              "gpu_kv_usage_pct": 99.2,
+              "cpu_kv_blocks": 311,
+              "gen_tok_s": 3063.6,
+              "hybrid_decode_calls": 32,
+              "mixed_prefix_rows": 86752,
+              "mixed_suffix_rows": 1760,
+              "uva_artifact_mb": 14.643
+            },
+            {
+              "running": 153,
+              "waiting": 0,
+              "gpu_kv_usage_pct": 99.9,
+              "cpu_kv_blocks": 461,
+              "gen_tok_s": 3889.1,
+              "hybrid_decode_calls": 32,
+              "mixed_prefix_rows": 2656,
+              "mixed_suffix_rows": 2240,
+              "uva_artifact_mb": 18.637
+            }
+          ]
+        },
+        {
+          "mode": "gpu_only",
+          "gpu_memory_utilization": 0.8,
+          "effective_capacity": 30.15,
+          "gpu_kv_tokens": 23152,
+          "out_tok_s": 3740.578,
+          "elapsed_s": 21.90036,
+          "windows": [
+            {
+              "running": 281,
+              "waiting": 231,
+              "gpu_kv_usage_pct": 99.7,
+              "gen_tok_s": 4901.9
+            },
+            {
+              "running": 163,
+              "waiting": 221,
+              "gpu_kv_usage_pct": 87.6,
+              "gen_tok_s": 3460.2
+            },
+            {
+              "running": 126,
+              "waiting": 106,
+              "gpu_kv_usage_pct": 64.9,
+              "gen_tok_s": 3279.6
+            },
+            {
+              "running": 132,
+              "waiting": 0,
+              "gpu_kv_usage_pct": 92.5,
+              "gen_tok_s": 3894.6
+            }
+          ]
+        },
+        {
+          "mode": "hybrid",
+          "gpu_memory_utilization": 0.8,
+          "effective_capacity": 31.46,
+          "gpu_kv_tokens": 23152,
+          "out_tok_s": 3788.3,
+          "elapsed_s": 21.624473,
+          "windows": [
+            {
+              "running": 281,
+              "waiting": 231,
+              "gpu_kv_usage_pct": 99.7,
+              "cpu_kv_blocks": 0,
+              "gen_tok_s": 4784.1
+            },
+            {
+              "running": 191,
+              "waiting": 165,
+              "gpu_kv_usage_pct": 87.1,
+              "cpu_kv_blocks": 156,
+              "gen_tok_s": 3376.5,
+              "hybrid_decode_calls": 0
+            },
+            {
+              "running": 194,
+              "waiting": 84,
+              "gpu_kv_usage_pct": 99.9,
+              "cpu_kv_blocks": 375,
+              "gen_tok_s": 3300.3,
+              "hybrid_decode_calls": 32,
+              "mixed_prefix_rows": 3200,
+              "mixed_suffix_rows": 3008,
+              "uva_artifact_mb": 25.027
+            },
+            {
+              "running": 97,
+              "waiting": 0,
+              "gpu_kv_usage_pct": 62.9,
+              "cpu_kv_blocks": 482,
+              "gen_tok_s": 3893.5,
+              "hybrid_decode_calls": 32,
+              "mixed_prefix_rows": 1376,
+              "mixed_suffix_rows": 2464,
+              "uva_artifact_mb": 20.5
+            }
+          ]
+        }
+      ],
+      "notes": "Stats-enabled diagnostic. The 0.80 point admits a larger initial wave (281 vs 257 running) and both GPU-only and hybrid improve; hybrid crosses GPU-only only at this higher realized-capacity point."
+    },
+    {
+      "label": "qwen-graph-0.67-split672-vs-split704-scheduler-shape",
+      "kind": "e2e_scheduler_shape_diagnostic",
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "dtype": "bfloat16",
+      "enforce_eager": false,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "gpu_memory_utilization": 0.67,
+      "cpu_kv_gb": 12,
+      "async_scheduling": false,
+      "prompt_mode": "shared",
+      "stats_interval_s": 5,
+      "graph_note": "GPU-only used FULL_AND_PIECEWISE graph mode; COTS hybrid defaulted to PIECEWISE graph mode.",
+      "cases": [
+        {
+          "mode": "gpu_only",
+          "effective_capacity": 7.62,
+          "gpu_kv_tokens": 5856,
+          "out_tok_s": 2179.166,
+          "elapsed_s": 37.592371,
+          "windows": [
+            {
+              "running": 45,
+              "waiting": 431,
+              "gpu_kv_usage_pct": 99.2,
+              "gen_tok_s": 2392.3
+            },
+            {
+              "running": 64,
+              "waiting": 334,
+              "gpu_kv_usage_pct": 100.0,
+              "gen_tok_s": 2034.3
+            },
+            {
+              "running": 42,
+              "waiting": 292,
+              "gpu_kv_usage_pct": 100.0,
+              "gen_tok_s": 2199.6
+            },
+            {
+              "running": 73,
+              "waiting": 184,
+              "gpu_kv_usage_pct": 99.5,
+              "gen_tok_s": 2330.3
+            },
+            {
+              "running": 33,
+              "waiting": 164,
+              "gpu_kv_usage_pct": 100.0,
+              "gen_tok_s": 2115.4
+            },
+            {
+              "running": 43,
+              "waiting": 80,
+              "gpu_kv_usage_pct": 98.6,
+              "gen_tok_s": 2304.4
+            },
+            {
+              "running": 41,
+              "waiting": 11,
+              "gpu_kv_usage_pct": 97.0,
+              "gen_tok_s": 2156.3
+            }
+          ]
+        },
+        {
+          "mode": "hybrid_split704",
+          "split_blocks": 44,
+          "split_tokens": 704,
+          "effective_capacity": 7.75,
+          "gpu_kv_tokens": 5456,
+          "out_tok_s": 1993.774,
+          "elapsed_s": 41.087909,
+          "hybrid_vs_gpu": 0.915,
+          "windows": [
+            {
+              "running": 63,
+              "waiting": 406,
+              "gpu_kv_usage_pct": 100.0,
+              "cpu_kv_blocks": 129,
+              "gen_tok_s": 2254.8,
+              "hybrid_decode_calls": 0
+            },
+            {
+              "running": 43,
+              "waiting": 375,
+              "gpu_kv_usage_pct": 99.1,
+              "cpu_kv_blocks": 357,
+              "gen_tok_s": 1888.3,
+              "hybrid_decode_calls": 28,
+              "mixed_prefix_rows": 56,
+              "mixed_suffix_rows": 1148,
+              "uva_artifact_mb": 8.357
+            },
+            {
+              "running": 48,
+              "waiting": 305,
+              "gpu_kv_usage_pct": 99.4,
+              "cpu_kv_blocks": 569,
+              "gen_tok_s": 2085.7,
+              "hybrid_decode_calls": 28,
+              "mixed_prefix_rows": 392,
+              "mixed_suffix_rows": 952,
+              "uva_artifact_mb": 6.931
+            },
+            {
+              "running": 92,
+              "waiting": 181,
+              "gpu_kv_usage_pct": 95.6,
+              "cpu_kv_blocks": 733,
+              "gen_tok_s": 2020.9,
+              "hybrid_decode_calls": 28,
+              "mixed_prefix_rows": 2324,
+              "mixed_suffix_rows": 308,
+              "uva_artifact_mb": 2.242
+            },
+            {
+              "running": 50,
+              "waiting": 167,
+              "gpu_kv_usage_pct": 100.0,
+              "cpu_kv_blocks": 912,
+              "gen_tok_s": 2146.3,
+              "hybrid_decode_calls": 28,
+              "mixed_prefix_rows": 1092,
+              "mixed_suffix_rows": 308,
+              "uva_artifact_mb": 2.242
+            }
+          ]
+        },
+        {
+          "mode": "hybrid_split672",
+          "split_blocks": 42,
+          "split_tokens": 672,
+          "effective_capacity": 8.12,
+          "gpu_kv_tokens": 5456,
+          "out_tok_s": 2248.874,
+          "elapsed_s": 36.427125,
+          "hybrid_vs_gpu": 1.032,
+          "windows": [
+            {
+              "running": 82,
+              "waiting": 370,
+              "gpu_kv_usage_pct": 99.4,
+              "cpu_kv_blocks": 300,
+              "gen_tok_s": 2335.1,
+              "hybrid_decode_calls": 0
+            },
+            {
+              "running": 60,
+              "waiting": 332,
+              "gpu_kv_usage_pct": 99.1,
+              "cpu_kv_blocks": 676,
+              "gen_tok_s": 2431.3,
+              "hybrid_decode_calls": 28,
+              "mixed_prefix_rows": 812,
+              "mixed_suffix_rows": 868,
+              "uva_artifact_mb": 6.319
+            },
+            {
+              "running": 58,
+              "waiting": 266,
+              "gpu_kv_usage_pct": 96.2,
+              "cpu_kv_blocks": 1031,
+              "gen_tok_s": 2321.7,
+              "hybrid_decode_calls": 28,
+              "mixed_prefix_rows": 1232,
+              "mixed_suffix_rows": 896,
+              "uva_artifact_mb": 6.523
+            },
+            {
+              "running": 61,
+              "waiting": 193,
+              "gpu_kv_usage_pct": 99.1,
+              "cpu_kv_blocks": 1430,
+              "gen_tok_s": 2235.8,
+              "hybrid_decode_calls": 28,
+              "mixed_prefix_rows": 280,
+              "mixed_suffix_rows": 1428,
+              "uva_artifact_mb": 10.396
+            },
+            {
+              "running": 61,
+              "waiting": 117,
+              "gpu_kv_usage_pct": 99.4,
+              "cpu_kv_blocks": 1802,
+              "gen_tok_s": 2303.2,
+              "hybrid_decode_calls": 28,
+              "mixed_prefix_rows": 224,
+              "mixed_suffix_rows": 1484,
+              "uva_artifact_mb": 10.804
+            }
+          ]
+        }
+      ],
+      "notes": "Stats-enabled diagnostic. Qwen graph split672 wins because moving the split earlier raises effective capacity enough to create a larger useful running wave; split704 has too little capacity gain and pays suffix/UVA overhead."
+    },
+    {
+      "label": "llama-indexed-queryskip-overhead-ablation",
+      "kind": "e2e_ablation",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "enforce_eager": true,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "cpu_kv_gb": 12,
+      "async_scheduling": false,
+      "prompt_mode": "shared",
+      "artifacts": {
+        "indexed_only": "/TTC/results/phase2_indexed_merge_llama_20260530.jsonl",
+        "indexed_queryskip": "/TTC/results/phase2_indexed_queryskip_llama_20260530.jsonl",
+        "indexed_queryskip_noalloc": "/TTC/results/phase2_indexed_queryskip_noalloc_llama_20260530.jsonl"
+      },
+      "cases": [
+        {
+          "gpu_memory_utilization": 0.75,
+          "split_tokens": 736,
+          "split_blocks": 46,
+          "old_hybrid_out_tok_s": 3006.7,
+          "indexed_merge_only_out_tok_s": 3005.605,
+          "indexed_queryskip_out_tok_s": 3036.134,
+          "indexed_queryskip_noalloc_out_tok_s": 3032.334,
+          "same_build_gpu_only_out_tok_s": 3053.101,
+          "same_build_hybrid_vs_gpu": 0.994,
+          "gpu_only_effective_capacity": 17.54,
+          "hybrid_effective_capacity": 18.3
+        },
+        {
+          "gpu_memory_utilization": 0.72,
+          "split_tokens": 640,
+          "split_blocks": 40,
+          "optimized_hybrid_out_tok_s": 2352.367,
+          "same_build_gpu_only_out_tok_s": 2292.865,
+          "same_build_hybrid_vs_gpu": 1.026,
+          "gpu_only_effective_capacity": 9.98,
+          "hybrid_effective_capacity": 11.97
+        }
+      ],
+      "notes": "Indexed merge alone did not move the 0.75 near-miss. Skipping an unnecessary GPU query index_select when staged CPU query/QKV is valid reduced wrapper overhead by about 1%, but 0.75 still loses to a same-build GPU-only run. The 0.72/split640 capacity-window win remains positive."
+    },
+    {
+      "label": "llama-coalesced-overlap-negative-ablation",
+      "kind": "e2e_ablation",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.75,
+      "enforce_eager": true,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "split_tokens": 736,
+      "split_blocks": 46,
+      "cpu_kv_gb": 12,
+      "async_scheduling": false,
+      "prompt_mode": "shared",
+      "artifacts": {
+        "overlap_enabled": "/TTC/results/phase2_overlap_suffix_llama_20260530.jsonl",
+        "overlap_disabled": "/TTC/results/phase2_overlap_suffix_disabled_llama_20260530.jsonl",
+        "post_backout_default": "/TTC/results/phase2_post_overlap_backout_llama_20260530.jsonl"
+      },
+      "cases": [
+        {
+          "variant": "coalesced_overlap_enabled",
+          "out_tok_s": 3009.161,
+          "hybrid_effective_capacity": 18.3
+        },
+        {
+          "variant": "same_code_overlap_disabled_env",
+          "out_tok_s": 3033.581,
+          "hybrid_effective_capacity": 18.3
+        },
+        {
+          "variant": "default_after_coalesced_hook_backout",
+          "out_tok_s": 3038.291,
+          "hybrid_effective_capacity": 18.3
+        }
+      ],
+      "notes": "Submitting CPU suffix before the coalesced GPU prefix regressed the 0.75/split736 near-miss by about 0.8-1.0%. The default hook was backed out; coalesced mixed-prefix batches stay on the non-overlap path."
+    },
+    {
+      "label": "llama-launch-order-moreblocks-negative",
+      "kind": "e2e_ablation",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.75,
+      "enforce_eager": true,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "cpu_kv_gb": 12,
+      "async_scheduling": false,
+      "prompt_mode": "shared",
+      "artifacts": {
+        "gpu_first": "/TTC/results/phase2_launch_order_moreblocks_gpufirst_llama_20260530.jsonl",
+        "cpu_first": "/TTC/results/phase2_launch_order_moreblocks_cpufirst_llama_20260530.jsonl"
+      },
+      "cases": [
+        {
+          "split_tokens": 736,
+          "cpu_suffix_blocks_per_request": 2,
+          "effective_capacity": 18.3,
+          "gpu_first_out_tok_s": 3023.79,
+          "cpu_first_out_tok_s": 3007.558,
+          "cpu_first_vs_gpu_first": 0.995
+        },
+        {
+          "split_tokens": 704,
+          "cpu_suffix_blocks_per_request": 4,
+          "effective_capacity": 19.14,
+          "gpu_first_out_tok_s": 2983.339,
+          "cpu_first_out_tok_s": 2992.34,
+          "cpu_first_vs_gpu_first": 1.003
+        },
+        {
+          "split_tokens": 672,
+          "cpu_suffix_blocks_per_request": 6,
+          "effective_capacity": 20.05,
+          "gpu_first_out_tok_s": 2786.105,
+          "cpu_first_out_tok_s": 2801.378,
+          "cpu_first_vs_gpu_first": 1.005
+        },
+        {
+          "split_tokens": 640,
+          "cpu_suffix_blocks_per_request": 8,
+          "effective_capacity": 21.05,
+          "gpu_first_out_tok_s": 2652.664,
+          "cpu_first_out_tok_s": 2646.473,
+          "cpu_first_vs_gpu_first": 0.998
+        }
+      ],
+      "notes": "CPU-first launch gives only a tiny lift at 4/6 suffix blocks and does not rescue earlier splits. More CPU suffix blocks raise effective capacity but reduce throughput sharply on this workload."
+    },
+    {
+      "label": "llama-eager-0.72-total896-split768-negative-repeat",
+      "roles": [
+        "generator"
+      ],
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.72,
+      "enforce_eager": true,
+      "max_model_len": 896,
+      "max_num_seqs": 512,
+      "split_blocks": 48,
+      "split_tokens": 768,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 1628.711,
+      "hybrid_out_tok_s": 1582.302,
+      "repeats": {
+        "gpu_only_out_tok_s": [
+          1628.66,
+          1628.761
+        ],
+        "hybrid_out_tok_s": [
+          1578.582,
+          1586.021
+        ]
+      },
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 896,
+      "suffix_tokens": 288,
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 8.55,
+      "hybrid_effective_capacity": 9.98,
+      "sweep_artifacts": {
+        "jsonl": "/TTC/results/phase2_capacity_window_llama_total896_20260530.jsonl",
+        "repeat_jsonl": "/TTC/results/phase2_capacity_window_llama_total896_20260530_repeats.jsonl",
+        "log_dir": "/TTC/results/phase2_capacity_window_llama_total896_20260530_logs"
+      },
+      "notes": "Out-of-sample total896 capacity-window probe. Hybrid split768 raises effective capacity by 16.7% but still loses on repeated means because 8 active CPU suffix blocks are too expensive over the longer decode window."
+    },
+    {
+      "label": "llama-eager-0.80-total896-split864-negative",
+      "roles": [
+        "generator"
+      ],
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.8,
+      "enforce_eager": true,
+      "max_model_len": 896,
+      "max_num_seqs": 512,
+      "split_blocks": 54,
+      "split_tokens": 864,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 3137.699,
+      "hybrid_out_tok_s": 2964.607,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 896,
+      "suffix_tokens": 288,
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 25.84,
+      "hybrid_effective_capacity": 26.8,
+      "sweep_artifacts": {
+        "jsonl": "/TTC/results/phase2_capacity_window_llama_total896_20260530.jsonl",
+        "log_dir": "/TTC/results/phase2_capacity_window_llama_total896_20260530_logs"
+      },
+      "notes": "Out-of-sample total896 capacity-window probe. Best mem0.80 hybrid frontier point was split864, but the 3.7% capacity gain with 2 active CPU suffix blocks still lost to GPU-only."
+    },
+    {
+      "label": "qwen-graph-0.67-total896-split736-negative",
+      "roles": [
+        "generator"
+      ],
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.67,
+      "enforce_eager": false,
+      "max_model_len": 896,
+      "max_num_seqs": 512,
+      "split_blocks": 46,
+      "split_tokens": 736,
+      "cpu_kv_gb": 12,
+      "gpu_only_out_tok_s": 1509.649,
+      "hybrid_out_tok_s": 1421.945,
+      "async_scheduling": false,
+      "engine_overrides": {
+        "disable_hybrid_kv_cache_manager": true
+      },
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 896,
+      "suffix_tokens": 288,
+      "prompt_mode": "shared",
+      "gpu_only_effective_capacity": 6.54,
+      "hybrid_effective_capacity": 7.41,
+      "sweep_artifacts": {
+        "jsonl": "/TTC/results/phase2_capacity_window_qwen_total896_20260530.jsonl",
+        "log_dir": "/TTC/results/phase2_capacity_window_qwen_total896_20260530_logs"
+      },
+      "notes": "Out-of-sample total896 capacity-window probe. Best Qwen graph hybrid point was split736, but the 13.3% capacity gain with 10 active CPU suffix blocks still lost to GPU-only."
     }
   ],
   "diagnostics": [
@@ -613,6 +1494,332 @@
         }
       ],
       "notes": "Coarse max_num_batched_tokens tuning is too blunt: 2048 helps slightly but remains negative; 1024 hurts hybrid more."
+    },
+    {
+      "label": "llama-suffix-runner-hotlen-nosnapshot-curve",
+      "kind": "microbenchmark",
+      "script": "David/Benchmarks/phase2/benchmark_prepared_suffix_runner.py",
+      "model_shape": {
+        "name": "llama3-8b",
+        "num_q_heads": 32,
+        "num_kv_heads": 8,
+        "head_dim": 128
+      },
+      "batch": 512,
+      "layers": 32,
+      "threads": 24,
+      "pin_inputs": false,
+      "modes": [
+        "prepared_scatter",
+        "direct_scatter",
+        "graph_prepared_scatter"
+      ],
+      "cases": [
+        {
+          "seq_len": 32,
+          "prepared_scatter_snapshot_median_ms": 74.984,
+          "direct_scatter_no_snapshot_median_ms": 54.325,
+          "prepared_scatter_no_snapshot_median_ms": 52.7,
+          "graph_prepared_scatter_no_snapshot_median_ms": 50.862
+        },
+        {
+          "seq_len": 64,
+          "prepared_scatter_snapshot_median_ms": 118.475,
+          "direct_scatter_no_snapshot_median_ms": 95.585,
+          "prepared_scatter_no_snapshot_median_ms": 108.231,
+          "graph_prepared_scatter_no_snapshot_median_ms": 102.722
+        },
+        {
+          "seq_len": 96,
+          "prepared_scatter_snapshot_median_ms": 160.922,
+          "prepared_scatter_no_snapshot_median_ms": 137.742
+        },
+        {
+          "seq_len": 128,
+          "prepared_scatter_snapshot_median_ms": 202.213,
+          "prepared_scatter_no_snapshot_median_ms": 180.603
+        }
+      ],
+      "notes": "Default standalone snapshots overstate the production prepared-runner cost. With production-like no-snapshot staging, the wrapper is close to direct at 32 suffix tokens and has a smaller residual envelope at 64; the main cost still scales with real suffix attention/scatter."
+    },
+    {
+      "label": "qwen-prefill-spillover-eager-profile-20260530",
+      "kind": "diagnostic_e2e_profile",
+      "script": "David/Benchmarks/phase2/benchmark_prefill_spillover_e2e.py",
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "dtype": "bfloat16",
+      "gpu_memory_utilization": 0.67,
+      "enforce_eager": true,
+      "max_num_seqs": 128,
+      "cpu_kv_gb": 12,
+      "async_scheduling": false,
+      "prompt_mode": "unique",
+      "enable_prefix_caching": false,
+      "cases": [
+        {
+          "name": "gpu_b8_prompt704_total705",
+          "mode": "gpu",
+          "batch": 8,
+          "prompt_tokens": 704,
+          "total_tokens": 705,
+          "split_tokens": 672,
+          "elapsed_s": 0.51333,
+          "prompt_tok_s": 10971.505,
+          "out_tokens": 8,
+          "out_tok_s": 15.585
+        },
+        {
+          "name": "hybrid_spillover_b8_prompt704_total705_split672",
+          "mode": "hybrid",
+          "batch": 8,
+          "prompt_tokens": 704,
+          "total_tokens": 705,
+          "split_tokens": 672,
+          "spill_prompt_tokens_per_req": 32,
+          "active_suffix_tokens_per_req": 33,
+          "gpu_prefix_rows": 131712,
+          "cpu_suffix_rows": 6272,
+          "q_d2h_mb": 44.958,
+          "kv_d2h_mb": 12.845,
+          "uva_artifact_h2d_mb": 45.66,
+          "cpu_suffix_attention_ms": 14.706,
+          "cpu_worker_threads": 24,
+          "elapsed_s": 0.679053,
+          "prompt_tok_s": 8293.906,
+          "out_tokens": 8,
+          "out_tok_s": 11.781,
+          "hybrid_vs_gpu_elapsed": 1.323,
+          "hybrid_vs_gpu_prompt_tok_s": 0.756
+        },
+        {
+          "name": "hybrid_no_spill_prefill_only_b16_prompt704_total705_split704",
+          "mode": "hybrid",
+          "batch": 16,
+          "prompt_tokens": 704,
+          "total_tokens": 705,
+          "split_tokens": 704,
+          "spill_prompt_tokens_per_req": 0,
+          "active_suffix_tokens_per_req": 1,
+          "elapsed_s": 1.003168,
+          "prompt_tok_s": 11228.429,
+          "out_tokens": 16,
+          "out_tok_s": 15.949,
+          "cots_activity": "zero"
+        },
+        {
+          "name": "hybrid_no_spill_decode_b16_prompt704_total706_split704",
+          "mode": "hybrid",
+          "batch": 16,
+          "prompt_tokens": 704,
+          "total_tokens": 706,
+          "split_tokens": 704,
+          "spill_prompt_tokens_per_req": 0,
+          "active_suffix_tokens_per_req": 2,
+          "elapsed_s": 1.215459,
+          "prompt_tok_s": 9267.28,
+          "out_tokens": 32,
+          "out_tok_s": 26.327,
+          "cots_activity": "decode suffix active"
+        }
+      ],
+      "notes": "Diagnostic for split-crossing prefill behavior. Prompt rows at positions >= split_tokens naturally take the CPU suffix path; this is not an all-GPU prefill followed by a separate spill copy. The B8 spillover case is throughput-negative because it is below the GPU-only capacity frontier and exposes row-expanded spillover overhead."
+    },
+    {
+      "label": "llama-eager-0.72-split640-scheduler-shape",
+      "kind": "e2e_scheduler_shape_diagnostic",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "dtype": "bfloat16",
+      "enforce_eager": true,
+      "max_model_len": 768,
+      "max_num_seqs": 512,
+      "batch": 512,
+      "prompt_tokens": 608,
+      "total_tokens": 768,
+      "split_blocks": 40,
+      "split_tokens": 640,
+      "cpu_kv_gb": 12,
+      "async_scheduling": false,
+      "prompt_mode": "shared",
+      "stats_interval_s": 5,
+      "headline_non_stats": {
+        "gpu_only_out_tok_s_mean": 2278.82,
+        "hybrid_out_tok_s_mean": 2347.727,
+        "hybrid_vs_gpu": 1.03,
+        "gpu_only_effective_capacity": 9.98,
+        "hybrid_effective_capacity": 11.97
+      },
+      "cases": [
+        {
+          "mode": "gpu_only",
+          "gpu_memory_utilization": 0.72,
+          "effective_capacity": 9.98,
+          "gpu_kv_tokens": 7664,
+          "instrumented_out_tok_s": 2299.05,
+          "elapsed_s": 35.632103,
+          "windows": [
+            {
+              "running": 40,
+              "waiting": 472,
+              "gpu_kv_usage_pct": 99.8,
+              "gen_tok_s": 2852.3
+            },
+            {
+              "running": 56,
+              "waiting": 352,
+              "gpu_kv_usage_pct": 97.3,
+              "gen_tok_s": 1951.1
+            },
+            {
+              "running": 57,
+              "waiting": 272,
+              "gpu_kv_usage_pct": 97.5,
+              "gen_tok_s": 2157.5
+            },
+            {
+              "running": 72,
+              "waiting": 181,
+              "gpu_kv_usage_pct": 97.5,
+              "gen_tok_s": 2330.8
+            },
+            {
+              "running": 141,
+              "waiting": 31,
+              "gpu_kv_usage_pct": 100.0,
+              "gen_tok_s": 2293.8
+            },
+            {
+              "running": 63,
+              "waiting": 46,
+              "gpu_kv_usage_pct": 100.0,
+              "gen_tok_s": 2427.5
+            },
+            {
+              "running": 26,
+              "waiting": 0,
+              "gpu_kv_usage_pct": 61.3,
+              "gen_tok_s": 2147.3
+            }
+          ]
+        },
+        {
+          "mode": "hybrid",
+          "gpu_memory_utilization": 0.72,
+          "effective_capacity": 11.97,
+          "gpu_kv_tokens": 7664,
+          "cpu_suffix_blocks_per_request": 8,
+          "instrumented_out_tok_s": 2210.362,
+          "elapsed_s": 37.061798,
+          "instrumentation_note": "CUDA timing and COTS diagnostics perturb throughput; use headline_non_stats for policy ratio.",
+          "windows": [
+            {
+              "running": 147,
+              "waiting": 365,
+              "gpu_kv_usage_pct": 100.0,
+              "cpu_kv_blocks": 588,
+              "gen_tok_s": 2889.2,
+              "hybrid_decode_calls": 32,
+              "mixed_prefix_rows": 0,
+              "mixed_suffix_rows": 0,
+              "suffix_rows": 4704,
+              "q_d2h_mb": 38.535,
+              "kv_d2h_mb": 19.268,
+              "uva_artifact_mb": 39.137,
+              "native_attn_ms": 25.707
+            },
+            {
+              "running": 147,
+              "waiting": 365,
+              "gpu_kv_usage_pct": 100.0,
+              "cpu_kv_blocks": 1176,
+              "gen_tok_s": 1920.1,
+              "hybrid_decode_calls": 32,
+              "mixed_prefix_rows": 0,
+              "mixed_suffix_rows": 0,
+              "suffix_rows": 4704,
+              "q_d2h_mb": 38.535,
+              "kv_d2h_mb": 19.268,
+              "uva_artifact_mb": 39.137,
+              "native_attn_ms": 50.742
+            },
+            {
+              "running": 147,
+              "waiting": 218,
+              "gpu_kv_usage_pct": 100.0,
+              "cpu_kv_blocks": 1690,
+              "gen_tok_s": 2750.4,
+              "hybrid_decode_calls": 32,
+              "mixed_prefix_rows": 0,
+              "mixed_suffix_rows": 0,
+              "suffix_rows": 4704,
+              "q_d2h_mb": 38.535,
+              "kv_d2h_mb": 19.268,
+              "uva_artifact_mb": 39.137,
+              "native_attn_ms": 27.821
+            },
+            {
+              "running": 165,
+              "waiting": 127,
+              "gpu_kv_usage_pct": 100.0,
+              "cpu_kv_blocks": 2132,
+              "gen_tok_s": 1854.4,
+              "hybrid_decode_calls": 32,
+              "mixed_prefix_rows": 2912,
+              "mixed_suffix_rows": 2368,
+              "suffix_rows": 2368,
+              "q_d2h_mb": 19.399,
+              "kv_d2h_mb": 9.699,
+              "uva_artifact_mb": 19.702,
+              "native_attn_ms": 26.345
+            },
+            {
+              "running": 147,
+              "waiting": 71,
+              "gpu_kv_usage_pct": 100.0,
+              "cpu_kv_blocks": 2627,
+              "gen_tok_s": 2694.6,
+              "hybrid_decode_calls": 32,
+              "mixed_prefix_rows": 0,
+              "mixed_suffix_rows": 0,
+              "suffix_rows": 4704,
+              "q_d2h_mb": 38.535,
+              "kv_d2h_mb": 19.268,
+              "uva_artifact_mb": 39.137,
+              "native_attn_ms": 27.016
+            },
+            {
+              "running": 150,
+              "waiting": 30,
+              "gpu_kv_usage_pct": 99.2,
+              "cpu_kv_blocks": 3140,
+              "gen_tok_s": 1891.3,
+              "hybrid_decode_calls": 32,
+              "mixed_prefix_rows": 1312,
+              "mixed_suffix_rows": 3520,
+              "suffix_rows": 3520,
+              "q_d2h_mb": 28.836,
+              "kv_d2h_mb": 14.418,
+              "uva_artifact_mb": 29.286,
+              "native_attn_ms": 36.626
+            },
+            {
+              "running": 71,
+              "waiting": 0,
+              "gpu_kv_usage_pct": 52.3,
+              "cpu_kv_blocks": 3525,
+              "gen_tok_s": 1796.2,
+              "hybrid_decode_calls": 32,
+              "mixed_prefix_rows": 0,
+              "mixed_suffix_rows": 0,
+              "suffix_rows": 2272,
+              "q_d2h_mb": 18.612,
+              "kv_d2h_mb": 9.306,
+              "uva_artifact_mb": 18.903,
+              "native_attn_ms": 19.474
+            }
+          ]
+        }
+      ],
+      "notes": "Stats-enabled fill-in for the lower-memory Llama promoted cell. Hybrid increases effective capacity from 9.98x to 11.97x and changes the first logged wave from 40 running GPU-only requests to 147 running hybrid requests. Most active hybrid windows are all-suffix rows; mixed prefix/suffix rows appear only when newer requests are admitted while older requests are already past the split."
     }
   ]
 }
