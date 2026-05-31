@@ -44,12 +44,47 @@ Docker-based on `nvidia/cuda:12.4.1-devel-ubuntu22.04` with Miniconda:
 
 ```bash
 docker build -t davidshiao55_ttc_env .
-./docker_run.sh
-./setup_env.sh
+scripts/ttc-docker-run.sh
+docker exec -it davidshiao55_ttc bash
+cd /TTC && scripts/setup-env.sh
 ```
 
 Model weights are stored on the host at `/home/davidshiao55/models/huggingface`
 and mounted at `/models`; `HF_HOME=/models/huggingface` is set automatically.
+
+### Codex / Agent Workflow
+
+Prefer **host edits + Docker execution**:
+
+- Run Codex from the host repo at `/home/davidshiao55/TTC`, not from inside
+  the container. This keeps `apply_patch` reliable and avoids Docker namespace
+  ownership issues.
+- Run project commands inside Docker via `scripts/ttc-docker-env.sh`. The
+  helper uses the existing `davidshiao55_ttc` container, activates the requested
+  conda env, runs as the host UID/GID, and sets writable cache env vars for
+  PyTorch/vLLM.
+- Keep source edits on the host side. Use Docker for builds, tests, profiling,
+  and experiments.
+
+Common commands:
+
+```bash
+# Start a fresh container from the repo root.
+scripts/ttc-docker-run.sh
+
+# Run a thesis command in the container.
+scripts/ttc-docker-env.sh thesis 'cd /tmp && python -c "import vllm; print(vllm.__version__)"'
+
+# Run vLLM tests from the correct package directory.
+TTC_DOCKER_WORKDIR=/TTC/vllm scripts/ttc-docker-env.sh thesis \
+  'pytest tests/v1/worker/test_cots_hybrid_kv.py -q'
+
+# Open an interactive shell with the thesis env activated.
+scripts/ttc-docker-env.sh thesis
+```
+
+Keep operational shell entrypoints in `scripts/`. Do not add root-level
+compatibility wrappers for new scripts.
 
 | Environment | FastTTS | vLLM | Use for |
 |---|---|---|---|
@@ -62,7 +97,7 @@ For C++/CUDA changes under `vllm/csrc/`, run:
 
 ```bash
 conda activate thesis
-/TTC/rebuild_vllm.sh
+/TTC/scripts/rebuild-vllm.sh
 ```
 
 Run experiments from the package directories, not from `/TTC`:
@@ -82,7 +117,7 @@ python run_all_experiments.py --offload=full
 > the editable install resolves `/TTC/vllm/vllm/`.
 
 > **CMake path gotcha**: For C++/CUDA rebuilds, make sure
-> `conda activate thesis` has actually taken effect before `/TTC/rebuild_vllm.sh`.
+> `conda activate thesis` has actually taken effect before `/TTC/scripts/rebuild-vllm.sh`.
 > The script calls `cmake` from `PATH`; without the thesis env it may pick up
 > `/usr/bin/cmake`, which is too old for current vLLM presets.
 

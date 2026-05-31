@@ -1,10 +1,35 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
+
 source /opt/conda/etc/profile.d/conda.sh
-set -e
+
+configure_git_safe_directories() {
+    # setup-env runs as root inside Docker, while /TTC is host-owned. vLLM's
+    # editable build asks Git for version metadata, so Git must trust the mount.
+    local dir
+    for dir in /TTC /TTC/vllm; do
+        git config --global --add safe.directory "$dir" || true
+    done
+}
+
+conda_env_exists() {
+    conda env list | awk '{print $1}' | grep -qx "$1"
+}
+
+create_or_reuse_env() {
+    local env_name="$1"
+    if conda_env_exists "$env_name"; then
+        echo "=== Reusing existing $env_name env ==="
+    else
+        conda create -y -n "$env_name" python=3.11
+    fi
+}
+
+configure_git_safe_directories
 
 # --- Baseline: original FastTTS-AE + vllm 0.9.2 from PyPI ---
 echo "=== Creating baseline env ==="
-conda create -y -n baseline python=3.11
+create_or_reuse_env baseline
 conda activate baseline
 pip install -e /TTC/FastTTS-AE
 pip install -e /TTC/FastTTS-AE/modified-skywork-o1-prm-inference
@@ -17,14 +42,18 @@ conda deactivate
 # Step 2: cmake full build to compile CUDA kernels (required for CUDA Graph /
 #         cudaLaunchHostFunc). ccache makes subsequent incremental rebuilds fast.
 # Step 3: install FastTTS-thesis on top.
-# For subsequent vllm C/CUDA changes use: ./rebuild_vllm.sh
+# For subsequent vllm C/CUDA changes use: /TTC/scripts/rebuild-vllm.sh
 echo "=== Creating thesis env ==="
-conda create -y -n thesis python=3.11
+create_or_reuse_env thesis
 conda activate thesis
 
 # Install build deps and ccache
 conda install -y ccache
 pip install -r /TTC/vllm/requirements/build.txt
+# Minimal test harness deps for the recorded TTC/vLLM validation bundles.
+# Avoid installing vLLM's full requirements/test.txt here; it is much broader
+# than the thesis smoke/regression checks need.
+pip install pytest pytest-forked tblib
 
 # Python-level install (fast — precompiled .so, no cmake)
 VLLM_USE_PRECOMPILED=1 pip install -e /TTC/vllm
@@ -54,4 +83,4 @@ echo ""
 echo "Usage:"
 echo "  conda activate baseline   # original FastTTS + vllm 0.9.2"
 echo "  conda activate thesis     # modified FastTTS + vllm fork"
-echo "  ./rebuild_vllm.sh         # incremental CUDA rebuild after kernel changes"
+echo "  /TTC/scripts/rebuild-vllm.sh  # incremental CUDA rebuild after kernel changes"

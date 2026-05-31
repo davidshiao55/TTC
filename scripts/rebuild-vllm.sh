@@ -1,8 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Incremental rebuild of vllm CUDA/C++ kernels after changes to csrc/.
-# Uses ccache — only changed files are recompiled. Much faster than pip install.
-# Run with thesis env active: conda activate thesis && ./rebuild_vllm.sh
-set -e
+# Uses ccache; only changed files are recompiled. Much faster than pip install.
+# Run with thesis env active: conda activate thesis && /TTC/scripts/rebuild-vllm.sh
+set -euo pipefail
 
 cd /TTC/vllm
 cmake --build --preset release --target install
