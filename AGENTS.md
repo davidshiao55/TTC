@@ -81,6 +81,17 @@ python run_all_experiments.py --offload=full
 > `thesis` env. Python may resolve `/TTC/vllm/` as a namespace package before
 > the editable install resolves `/TTC/vllm/vllm/`.
 
+> **CMake path gotcha**: For C++/CUDA rebuilds, make sure
+> `conda activate thesis` has actually taken effect before `/TTC/rebuild_vllm.sh`.
+> The script calls `cmake` from `PATH`; without the thesis env it may pick up
+> `/usr/bin/cmake`, which is too old for current vLLM presets.
+
+> **pytest fork gotcha**: Some vLLM config tests rely on `pytest-forked` for
+> CUDA-process isolation. If `pytest.mark.forked` is reported as unknown, a
+> full-file run such as `tests/compile/test_config.py` may retain GPU memory
+> across cases; install `pytest-forked` or rerun affected node IDs in fresh
+> pytest processes.
+
 ### Profiling with Nsight Systems
 
 Use `nsys` for overlap, memcpy engine attribution, and GPU-stall questions.
@@ -119,15 +130,33 @@ Results go to `/TTC/results/`. Figures: `main_results_combined.pdf`, `latency_co
 
 ## Key vLLM Files for Offloading Work
 
-These are the existing building blocks in vLLM relevant to the thesis:
+These are the production COTS surfaces plus upstream reference points most
+relevant to thesis work:
 
-- **Weight offloading**: `vllm/model_executor/offloader/prefetch.py` (PrefetchOffloader), `uva.py` (UVA offloader)
-- **Cascade attention**: `vllm/v1/attention/backends/flash_attn.py` (line ~1038, `cascade_attention()`)
-- **Attention merge**: `vllm/v1/attention/ops/merge_attn_states.py` (online softmax merge)
-- **CPU attention**: `vllm/v1/attention/backends/cpu_attn.py`
-- **KV cache offload**: `vllm/v1/kv_offload/` (CPU-GPU KV cache management)
-- **Fused QKV projection**: `vllm/model_executor/layers/linear.py` (`QKVParallelLinear`)
-- **FFN layers**: `MergedColumnParallelLinear` (gate_up), `RowParallelLinear` (down) in same file
+- **COTS config and graph policy**: `vllm/config/offload.py`,
+  `vllm/config/vllm.py`, `vllm/engine/arg_utils.py`, and
+  `tests/compile/test_config.py`.
+- **Weight offloading runtime**: `vllm/model_executor/offloader/cots_offloader.py`,
+  `cots_runners.py`, `cots_ops.py`, `cots_storage.py`, and C++ pieces under
+  `csrc/cots/` including `cots_weight_task_runner.{h,cpp}`, `task_queue.*`,
+  and `cots_wait_done_kernel.cu`.
+- **Hybrid KV / suffix attention**: `vllm/v1/worker/cots_hybrid_kv.py`,
+  `vllm/v1/worker/gpu_model_runner.py` integration points,
+  `vllm/v1/attention/backends/cots_hybrid_attention.py`,
+  `cots_suffix_attention_ops.py`, and C++ pieces under `csrc/cots/` including
+  `cots_suffix_attention_task_runner.{h,cpp}` and `cots_common.h`.
+- **COTS tests**: Phase 1 tests under `David/Tests/phase1a/` and
+  `David/Tests/phase1c/`; Phase 2 kernel and worker tests under
+  `vllm/tests/kernels/attention/test_cots_*` and
+  `vllm/tests/v1/worker/test_cots_hybrid_kv.py`.
+- **Upstream attention references**: `vllm/v1/attention/backends/flash_attn.py`
+  for cascade attention, `vllm/v1/attention/ops/merge_attn_states.py` for
+  online softmax merge, and `vllm/v1/attention/backends/cpu_attn.py` for the
+  upstream CPU attention backend.
+- **Upstream weight-offload references**: `vllm/model_executor/offloader/prefetch.py`
+  and `uva.py`.
+- **Layer split entry points**: `vllm/model_executor/layers/linear.py`
+  (`QKVParallelLinear`, `MergedColumnParallelLinear`, `RowParallelLinear`).
 
 When working from inside `vllm/`, also read `vllm/AGENTS.md`. For local TTC
 thesis experiments, use the conda workflow above. For upstream vLLM PR work,
@@ -139,13 +168,21 @@ See `David/Docs/implementation_roadmap.md` for the full plan.
 
 - Phase 0: pre-implementation benchmarks complete.
 - Phase 1a/1b/1c: collaborative weight offload complete.
-- Phase 2: attention offloading, CPU suffix attention, and online softmax merge.
+- Phase 2: hybrid CPU/GPU KV implementation generally complete; throughput policy remains profile-gated.
 - Phase 3: end-to-end RTX 4090 benchmarking for 7B and 14B configurations.
 
-### Engineering Gaps (not yet in vLLM)
+### Landed Thesis Pieces and Remaining Policy Work
+
 - ~~Column-parallel weight split + CPU matmul + partial result concat at tensor granularity~~ [LANDED in Phase 1a/1b]
 - ~~`cudaLaunchHostFunc` glue for CUDA Graph + CPU task co-scheduling~~ [LANDED in Phase 1c]
-- CPU attention kernel returning per-head LSE values (Phase 2)
+- ~~CPU suffix attention kernel returning output plus per-head LSE values~~ [LANDED in Phase 2]
+- Phase 2 implementation is generally done: CPU suffix attention, GPU prefix
+  attention, and online-softmax merge work for the current Qwen and Llama GQA
+  envelopes.
+- Remaining Phase 2 policy work belongs in the Planner: choose hybrid KV only
+  when profiled CPU KV suffix cost is smaller than saved weight-offload cost,
+  enabled model fit, or useful scheduler-wave/batch gain. Do not assume lower
+  GPU memory or more CPU KV capacity automatically improves throughput.
 
 ## Key Technical Constraints
 
@@ -153,7 +190,8 @@ See `David/Docs/implementation_roadmap.md` for the full plan.
 - Placement fractions are Planner outputs, not universal constants. `f_cpu_store` is per-model (load-time); `f_cpu_compute` is per-`BatchDescriptor` (per-bucket). `~9%` is the observed optimum at B=1 decode on RTX 4090 + Qwen2.5-7B BF16; see `David/Docs/phase0_findings.md`.
 - Column-parallel weight splits are mathematically exact — verify with unit tests.
 - All PCIe H2D bandwidth goes to weight prefetch; no KV prefetch (see `David/Docs/pcie_bandwidth_allocation_design.md`).
-- CUDA Graph compatibility lands via `cudaLaunchHostFunc` (Phase 1c). Native runner is the post-Phase-1c default (`CotsOffloadConfig.cpu_runner = "native"`); supports `enforce_eager=False`. Python runner kept as kill-switch under `enforce_eager=True` for A/B diagnostics; deprecation one quarter post-Phase-1c.
+- CUDA Graph compatibility is landed for the native COTS runner. Phase 1 weight offload uses piecewise graphs with COTS weight submit/sync split points and `weight_capture_sync_mode="wait_kernel"` in graph mode. Phase 2 hybrid KV uses normal piecewise attention boundaries and does not add Phase 1 weight split points unless weight offload is also active. The Python weight runner remains an eager-only A/B kill switch, not the production path.
+- COTS cleanup convention: use the current names only (`weight_capture_sync_mode`, `CotsWeightTaskRunner`, `CotsSuffixAttentionTaskRunner`, `NativeCotsSuffixAttentionRunner`). Do not add deprecated compatibility aliases unless explicitly requested.
 
 ## Design Documents
 
