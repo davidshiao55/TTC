@@ -49,6 +49,48 @@ def _normalize_dispatch_table(
     return table
 
 
+def _normalize_thread_table(raw: Mapping[Any, Any] | None) -> dict[int, int] | None:
+    if raw is None:
+        return None
+    table: dict[int, int] = {}
+    for key, value in raw.items():
+        bucket = int(key)
+        n_threads = int(value)
+        if bucket <= 0:
+            raise ValueError(
+                f"cpu_num_threads_by_bucket bucket must be positive, got {bucket}"
+            )
+        if n_threads < 1:
+            raise ValueError(
+                "cpu_num_threads_by_bucket values must be positive, got "
+                f"{n_threads} for bucket {bucket}"
+            )
+        table[bucket] = n_threads
+    return table
+
+
+def weight_thread_count_for_score(score: float) -> int:
+    """Map bucket × CPU-compute fraction to the CPU GEMM thread count.
+
+    This is a deterministic policy derived from the 2026-05-31 weight-thread
+    experiment, not an additional Planner search axis.
+    """
+    if score <= 0.08:
+        return 4
+    if score <= 0.24:
+        return 16
+    return 24
+
+
+def derive_weight_thread_policy(
+    dispatch_table: Mapping[int, tuple[float, float]],
+) -> dict[int, int]:
+    return {
+        int(bucket): weight_thread_count_for_score(int(bucket) * f_cpu_compute)
+        for bucket, (f_cpu_compute, _) in dispatch_table.items()
+    }
+
+
 @dataclass(frozen=True)
 class WeightPlacementPlan:
     """Per-engine static weight placement plus optional dispatch table."""
@@ -56,6 +98,8 @@ class WeightPlacementPlan:
     f_cpu_store: float = 0.0
     f_prefetch: float = 0.0
     dispatch_table: dict[int, tuple[float, float]] | None = None
+    cpu_num_threads: int | None = None
+    cpu_num_threads_by_bucket: dict[int, int] | None = None
     backend: Literal["auto", "cots"] = "auto"
 
     @classmethod
@@ -82,10 +126,31 @@ class WeightPlacementPlan:
         dispatch_table = _normalize_dispatch_table(
             raw.get("dispatch_table", defaults.get("cots_dispatch_table"))
         )
+        cpu_num_threads_raw = raw.get(
+            "cpu_num_threads", defaults.get("cots_cpu_num_threads")
+        )
+        cpu_num_threads = (
+            None if cpu_num_threads_raw is None else int(cpu_num_threads_raw)
+        )
+        cpu_num_threads_by_bucket = _normalize_thread_table(
+            raw.get(
+                "cpu_num_threads_by_bucket",
+                defaults.get("cots_cpu_num_threads_by_bucket"),
+            )
+        )
+        derive_threads = bool(raw.get("derive_cpu_num_threads_by_bucket", True))
+        if (
+            cpu_num_threads_by_bucket is None
+            and dispatch_table is not None
+            and derive_threads
+        ):
+            cpu_num_threads_by_bucket = derive_weight_thread_policy(dispatch_table)
         plan = cls(
             f_cpu_store=f_cpu_store,
             f_prefetch=f_prefetch,
             dispatch_table=dispatch_table,
+            cpu_num_threads=cpu_num_threads,
+            cpu_num_threads_by_bucket=cpu_num_threads_by_bucket,
             backend=backend,
         )
         plan.validate()
@@ -101,6 +166,22 @@ class WeightPlacementPlan:
                 f"f_prefetch ({self.f_prefetch}) must be <= "
                 f"f_cpu_store ({self.f_cpu_store})"
             )
+        if self.cpu_num_threads is not None and self.cpu_num_threads < 1:
+            raise ValueError(
+                f"cpu_num_threads must be positive, got {self.cpu_num_threads}"
+            )
+        if self.cpu_num_threads_by_bucket is not None:
+            for bucket, n_threads in self.cpu_num_threads_by_bucket.items():
+                if bucket <= 0:
+                    raise ValueError(
+                        "cpu_num_threads_by_bucket bucket must be positive, "
+                        f"got {bucket}"
+                    )
+                if n_threads < 1:
+                    raise ValueError(
+                        "cpu_num_threads_by_bucket values must be positive, "
+                        f"got {n_threads} for bucket {bucket}"
+                    )
         if self.dispatch_table is None:
             return
         for bucket, (f_cpu_compute, f_prefetch) in self.dispatch_table.items():
@@ -241,6 +322,12 @@ class EnginePlan:
             overrides["cots_f_prefetch"] = self.weight.f_prefetch
             if self.weight.dispatch_table is not None:
                 overrides["cots_dispatch_table"] = self.weight.dispatch_table
+            if self.weight.cpu_num_threads is not None:
+                overrides["cots_cpu_num_threads"] = self.weight.cpu_num_threads
+            if self.weight.cpu_num_threads_by_bucket is not None:
+                overrides["cots_cpu_num_threads_by_bucket"] = (
+                    self.weight.cpu_num_threads_by_bucket
+                )
             if hybrid_kv:
                 overrides["cots_kv_split_blocks"] = self.kv.split_blocks
                 overrides["cots_kv_cpu_pool_bytes"] = self.kv.cpu_kv_bytes

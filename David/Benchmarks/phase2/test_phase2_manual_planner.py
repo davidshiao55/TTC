@@ -35,6 +35,8 @@ def test_manual_planner_applies_generator_and_verifier_overrides():
                     "f_cpu_store": 0.10,
                     "f_prefetch": 0.02,
                     "dispatch_table": {64: (0.08, 0.02)},
+                    "cpu_num_threads": 24,
+                    "cpu_num_threads_by_bucket": {64: 24},
                 },
                 "kv": {
                     "split_blocks": 32,
@@ -58,6 +60,8 @@ def test_manual_planner_applies_generator_and_verifier_overrides():
     assert gen["cots_f_cpu_store"] == 0.10
     assert gen["cots_f_prefetch"] == 0.02
     assert gen["cots_dispatch_table"] == {64: (0.08, 0.02)}
+    assert gen["cots_cpu_num_threads"] == 24
+    assert gen["cots_cpu_num_threads_by_bucket"] == {64: 24}
     assert gen["cots_kv_split_blocks"] == 32
     assert gen["cots_kv_cpu_pool_bytes"] == 8 * GIB
     assert gen["cots_kv_h2d_mode"] == "uva"
@@ -89,6 +93,33 @@ def test_manual_planner_defaults_to_existing_vllm_config():
     assert gen["gpu_memory_utilization"] == 0.42
     assert gen["max_num_seqs"] == 16
     assert "offload_backend" not in gen
+
+
+def test_manual_planner_derives_weight_thread_policy_from_dispatch_table():
+    config = FastTTSConfig(
+        generator_vllm_config={"model": "gen"},
+        verifier_vllm_config={"model": "ver"},
+        planner_config={
+            "generator": {
+                "weight": {
+                    "f_cpu_store": 0.05,
+                    "dispatch_table": {
+                        1: (0.02, 0.03),
+                        4: (0.05, 0.0),
+                        16: (0.05, 0.0),
+                    },
+                },
+            },
+        },
+    )
+
+    _plan_and_apply(config)
+
+    assert config.generator_vllm_config["cots_cpu_num_threads_by_bucket"] == {
+        1: 4,
+        4: 16,
+        16: 24,
+    }
 
 
 def test_phase2_measurement_blocks_are_ignored_until_real_policy_lands():

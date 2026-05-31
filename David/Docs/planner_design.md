@@ -131,6 +131,7 @@ FastTTS planner_config
            cots_f_cpu_store
            cots_f_prefetch
            cots_dispatch_table (optional; complete if set)
+           cots_cpu_num_threads_by_bucket (optional; derived/profiled)
 ```
 
 This keeps Phase 2 work plan-shaped without committing to a performance model
@@ -171,11 +172,37 @@ f_prefetch_compute = f_prefetch
 Do not add a vLLM-side bucket export/partial-policy expansion layer yet. That
 is a future simplification only if complete tables become a practical blocker.
 
-### 4.4 Eager-fallback entry
+### 4.4 Weight CPU Thread Policy
+
+The Planner must be **aware** of CPU GEMM thread policy because the right
+thread count depends on the CPU work implied by each dispatch entry. It should
+not, however, optimize thread count as an independent search dimension. Thread
+count is a deterministic policy derived from the candidate dispatch table:
+
+```text
+score(bucket) = bucket * f_cpu_compute(bucket)
+
+score <= 0.08  -> 4 CPU threads
+score <= 0.24  -> 16 CPU threads
+score >  0.24  -> 24 CPU threads
+```
+
+This policy comes from the 2026-05-31 Phase 1 weight-thread experiment in
+`/TTC/results/thread_policy_20260531/weight_policy_smoke/summary.md`.
+It captures the important interaction between live token bucket and CPU slice
+size without adding a `(slice_size x bucket x threads)` grid to the Planner.
+
+In the manual planner this is emitted as `cots_cpu_num_threads_by_bucket` when
+a `cots_dispatch_table` exists and no explicit thread map is provided. A
+profile may still override the derived map explicitly. The Planner's cost model
+should consume latency/throughput tables measured with this thread policy
+already applied.
+
+### 4.5 Eager-fallback entry
 
 For `num_tokens > max_cudagraph_capture_size`, vLLM falls back to eager execution. The Planner emits one extra entry for this case (simplest: reuse the largest captured bucket's dispatch). The Scheduler looks up this entry for out-of-bucket batches.
 
-### 4.5 Fixed constants (documented outputs, not tuned)
+### 4.6 Fixed constants (documented outputs, not tuned)
 
 - `|B_prefetch_m| = layer-ahead buffer` — sized to hold `Σ_m (f_prefetch × W_m)` across WQKV/MLP1/MLP2 within one layer (see `pcie_bandwidth_allocation_design.md §Prefetch Distance`).
 - **Prefetch distance = layer-ahead** — one prefetch queue per layer, one sync per layer boundary. Committed (not an option). Empirically validated in `phase0_findings.md §0.10.1d`: under uniform spread (G=4 N=1) on Qwen2.5-7B at decode B=64, K=2 buys only 2.9% over K=1 and K=4 OOMs because the buffer pool grows linearly with K.
@@ -185,7 +212,7 @@ For `num_tokens > max_cudagraph_capture_size`, vLLM falls back to eager executio
 
 These appear in the output for completeness so the Scheduler has one place to read the plan, but the Planner does not optimize over them.
 
-### 4.6 Runtime dispatch lookup — graph-enabled vs graph-disabled
+### 4.7 Runtime dispatch lookup — graph-enabled vs graph-disabled
 
 The dispatch table is keyed on `cudagraph_capture_sizes`, independent of whether CUDA graphs are actually enabled at runtime. This keeps the Planner output identical across Phase 1a/1b (graph-disabled prototypes) and Phase 1c (graph-enabled native runner; was Phase 4). The difference is only in how `num_tokens` maps to a bucket at runtime:
 

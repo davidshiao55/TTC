@@ -29,6 +29,8 @@ def test_manual_planner_applies_generator_and_verifier_overrides():
                     "f_cpu_store": 0.02,
                     "f_prefetch": 0.01,
                     "dispatch_table": {"64": [0.01, 0.01]},
+                    "cpu_num_threads": 24,
+                    "cpu_num_threads_by_bucket": {"64": 16},
                 },
                 "kv": {
                     "cpu_kv_bytes": 32 * (1 << 30),
@@ -54,6 +56,8 @@ def test_manual_planner_applies_generator_and_verifier_overrides():
     assert gen["cots_f_cpu_store"] == 0.02
     assert gen["cots_f_prefetch"] == 0.01
     assert gen["cots_dispatch_table"] == {64: (0.01, 0.01)}
+    assert gen["cots_cpu_num_threads"] == 24
+    assert gen["cots_cpu_num_threads_by_bucket"] == {64: 16}
     assert gen["kv_offloading_size"] == 32.0
     assert gen["kv_offloading_backend"] == "native"
 
@@ -94,6 +98,35 @@ def test_manual_planner_emits_cots_hybrid_kv_fields():
     assert gen["cots_kv_h2d_mode"] == "uva"
     assert "kv_offloading_size" not in gen
     assert "kv_offloading_backend" not in gen
+
+
+def test_manual_planner_derives_weight_thread_policy_from_dispatch_table():
+    config = FastTTSConfig(
+        planner_enabled=True,
+        generator_vllm_config={"model": "gen"},
+        planner_config={
+            "generator": {
+                "weight": {
+                    "f_cpu_store": 0.05,
+                    "dispatch_table": {
+                        "1": [0.02, 0.03],
+                        "4": [0.05, 0.0],
+                        "16": [0.05, 0.0],
+                    },
+                },
+            },
+        },
+    )
+
+    plan = ManualTTCPlanner(config).plan(SearchConfig(n=4))
+    apply_ttc_plan_to_config(config, plan)
+
+    gen = config.generator_vllm_config
+    assert gen["cots_cpu_num_threads_by_bucket"] == {
+        1: 4,
+        4: 16,
+        16: 24,
+    }
 
 
 def test_manual_planner_rejects_invalid_max_num_seqs():
