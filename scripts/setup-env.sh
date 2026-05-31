@@ -50,10 +50,10 @@ conda activate thesis
 # Install build deps and ccache
 conda install -y ccache
 pip install -r /TTC/vllm/requirements/build.txt
-# Minimal test harness deps for the recorded TTC/vLLM validation bundles.
+# Minimal test/lint harness deps for recorded TTC/vLLM validation and hooks.
 # Avoid installing vLLM's full requirements/test.txt here; it is much broader
 # than the thesis smoke/regression checks need.
-pip install pytest pytest-forked tblib
+pip install pytest pytest-forked tblib pre-commit
 
 # Python-level install (fast — precompiled .so, no cmake)
 VLLM_USE_PRECOMPILED=1 pip install -e /TTC/vllm

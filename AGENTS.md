@@ -65,6 +65,9 @@ Prefer **host edits + Docker execution**:
   PyTorch/vLLM.
 - Keep source edits on the host side. Use Docker for builds, tests, profiling,
   and experiments.
+- For vLLM commits, run Git from Docker via `scripts/ttc-docker-env.sh` so the
+  installed hooks use the container's `thesis` env. Host-side commits can fail
+  because the hook path points at `/opt/conda/envs/thesis` inside Docker.
 
 Common commands:
 
@@ -78,6 +81,10 @@ scripts/ttc-docker-env.sh thesis 'cd /tmp && python -c "import vllm; print(vllm.
 # Run vLLM tests from the correct package directory.
 TTC_DOCKER_WORKDIR=/TTC/vllm scripts/ttc-docker-env.sh thesis \
   'pytest tests/v1/worker/test_cots_hybrid_kv.py -q'
+
+# Commit vLLM changes with the container's hook environment.
+TTC_DOCKER_WORKDIR=/TTC/vllm scripts/ttc-docker-env.sh thesis \
+  'git commit -m "Describe vLLM change"'
 
 # Open an interactive shell with the thesis env activated.
 scripts/ttc-docker-env.sh thesis

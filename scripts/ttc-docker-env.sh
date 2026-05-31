@@ -43,6 +43,8 @@ workdir="${TTC_DOCKER_WORKDIR:-/TTC}"
 host_uid="$(id -u)"
 host_gid="$(id -g)"
 container_home="/tmp/ttc-codex-home-${host_uid}"
+host_git_user_name="${TTC_GIT_USER_NAME:-$(git config --global --get user.name 2>/dev/null || true)}"
+host_git_user_email="${TTC_GIT_USER_EMAIL:-$(git config --global --get user.email 2>/dev/null || true)}"
 
 docker_args=(
   exec
@@ -54,6 +56,14 @@ docker_args=(
   -e TORCHINDUCTOR_CACHE_DIR="${container_home}/.cache/torchinductor"
   -e HF_HOME="${HF_HOME:-/models/huggingface}"
 )
+
+if [[ -n "$host_git_user_name" ]]; then
+  docker_args+=(-e TTC_HOST_GIT_USER_NAME="$host_git_user_name")
+fi
+
+if [[ -n "$host_git_user_email" ]]; then
+  docker_args+=(-e TTC_HOST_GIT_USER_EMAIL="$host_git_user_email")
+fi
 
 if [[ -t 0 && -t 1 ]]; then
   docker_args+=(-it)
@@ -68,6 +78,12 @@ fi
 docker "${docker_args[@]}" "$container" bash -lc "
 set -euo pipefail
 mkdir -p \"\$HOME\" \"\$XDG_CACHE_HOME\" \"\$TORCHINDUCTOR_CACHE_DIR\"
+if [[ -n \"\${TTC_HOST_GIT_USER_NAME:-}\" ]] && ! git config --global --get user.name >/dev/null 2>&1; then
+  git config --global user.name \"\$TTC_HOST_GIT_USER_NAME\"
+fi
+if [[ -n \"\${TTC_HOST_GIT_USER_EMAIL:-}\" ]] && ! git config --global --get user.email >/dev/null 2>&1; then
+  git config --global user.email \"\$TTC_HOST_GIT_USER_EMAIL\"
+fi
 source /opt/conda/etc/profile.d/conda.sh
 conda activate '$env_name'
 cd '$workdir'
