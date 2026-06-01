@@ -67,6 +67,8 @@ def llm_kwargs(
             cots_f_cpu_store=args.cots_f_cpu_store,
             cots_f_prefetch=args.cots_f_prefetch,
         )
+        if args.cots_weight_modules is not None:
+            kwargs["cots_weight_modules"] = args.cots_weight_modules
     if hybrid:
         kwargs.update(
             offload_backend="cots",
@@ -313,6 +315,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpu-pool-gb", type=float, default=4.0)
     parser.add_argument("--cots-f-cpu-store", type=float, default=0.0)
     parser.add_argument("--cots-f-prefetch", type=float, default=0.0)
+    parser.add_argument(
+        "--cots-weight-modules",
+        nargs="+",
+        default=None,
+        help="COTS weight modules to offload, e.g. qkv mlp or qkv mlp wo.",
+    )
     parser.add_argument(
         "--out-jsonl",
         default="/tmp/phase2_forced_logits.jsonl",

@@ -28,6 +28,7 @@ def test_manual_planner_applies_generator_and_verifier_overrides():
                 "weight": {
                     "f_cpu_store": 0.02,
                     "f_prefetch": 0.01,
+                    "modules": ["qkv", "mlp", "wo"],
                     "dispatch_table": {"64": [0.01, 0.01]},
                     "cpu_num_threads": 24,
                     "cpu_num_threads_by_bucket": {"64": 16},
@@ -55,6 +56,7 @@ def test_manual_planner_applies_generator_and_verifier_overrides():
     assert gen["offload_backend"] == "cots"
     assert gen["cots_f_cpu_store"] == 0.02
     assert gen["cots_f_prefetch"] == 0.01
+    assert gen["cots_weight_modules"] == {"qkv", "mlp", "wo"}
     assert gen["cots_dispatch_table"] == {64: (0.01, 0.01)}
     assert gen["cots_cpu_num_threads"] == 24
     assert gen["cots_cpu_num_threads_by_bucket"] == {64: 16}
@@ -127,6 +129,26 @@ def test_manual_planner_derives_weight_thread_policy_from_dispatch_table():
         4: 16,
         16: 24,
     }
+
+
+def test_manual_planner_accepts_comma_separated_weight_modules():
+    config = FastTTSConfig(
+        planner_enabled=True,
+        generator_vllm_config={"model": "gen"},
+        planner_config={
+            "generator": {
+                "weight": {
+                    "f_cpu_store": 0.05,
+                    "weight_modules": "qkv,wo",
+                },
+            },
+        },
+    )
+
+    plan = ManualTTCPlanner(config).plan(SearchConfig(n=4))
+    apply_ttc_plan_to_config(config, plan)
+
+    assert config.generator_vllm_config["cots_weight_modules"] == {"qkv", "wo"}
 
 
 def test_manual_planner_rejects_invalid_max_num_seqs():

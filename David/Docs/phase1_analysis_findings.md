@@ -47,6 +47,21 @@ cd /TTC/FastTTS-thesis
 /opt/conda/envs/thesis/bin/python \
   /TTC/David/Benchmarks/phase1_analysis/bench_cots_kv_throughput.py \
   --exp --focused-grid --only-arms none cots_prefetch_only --repeat 1
+
+/opt/conda/envs/thesis/bin/python \
+  /TTC/David/Benchmarks/phase1_analysis/bench_wo_offload_e2e.py \
+  --exp --depths 01L 07L 14L --batches 1 16 64
+
+/opt/conda/envs/thesis/bin/python \
+  /TTC/David/Benchmarks/phase1_analysis/bench_cots_wo_offload_e2e.py \
+  --exp --batches 1 16 --input-len 8 --output-len 128 \
+  --f-cpu-store 0.01 --f-prefetch 0.0 --num-iters-warmup 2 --num-iters 3
+
+/opt/conda/envs/thesis/bin/python \
+  /TTC/David/Benchmarks/phase0/bench_wo_offload_tradeoff.py \
+  --model qwen7b --threads 24 --num-tokens 1 16 64 \
+  --slice-fracs 0.02 0.0357 0.05 0.10 \
+  --output-json /TTC/results/phase1_analysis/wo_cpu_compute/20260531_qwen7b_t24_smallf.json
 ```
 
 For the low-memory KV crossover probe, add:
@@ -72,6 +87,97 @@ Values are `COTS latency / best native latency`; `<1` means COTS is faster.
 Conclusion: COTS pure-prefetch and native prefetch are same-order at matched
 bytes. COTS is equal or faster in most eager cells and deeper graph cells. The
 remaining gap is graph-mode shallow offload at high batch.
+
+## WO Inclusion E2E Check
+
+Source:
+`/TTC/results/phase1_analysis/wo_offload_e2e/20260531_graph_qwen7b_decode/summary.md`
+
+This isolates the policy question "should WO participate in weight offload for
+simplicity?" by running the same graph-mode `prefetch_defer` E2E workload with
+the same offloaded layer placement, changing only whether `self_attn.o_proj` is
+included in `--offload-params`. Workload: Qwen2.5-7B, BF16,
+`input_len=8`, `output_len=128`.
+
+| depth | B | no WO s | with WO s | delta | extra WO GiB |
+|---|---:|---:|---:|---:|---:|
+| `01L` | 1 | 2.8111 | 2.9473 | +4.84% | 0.024 |
+| `01L` | 16 | 2.7063 | 2.8441 | +5.09% | 0.024 |
+| `01L` | 64 | 2.7824 | 2.9212 | +4.99% | 0.024 |
+| `07L` | 1 | 18.2534 | 19.2084 | +5.23% | 0.167 |
+
+Conclusion: adding WO is not negligible even in the prefetch-only E2E path. The
+latency tax is consistently around 5% while the memory saved is tiny at 7B.
+Keep `o_proj` GPU-resident in Phase 1/2; do not simplify the Planner/runtime
+strategy by making WO part of the uniform WQKV/MLP weight offload set.
+
+The COTS CPU-compute/communication path is the more important rejection test
+because it includes the activation round trip after attention merge. The runtime
+now exposes WO as an opt-in `cots_weight_modules={"wo"}` module for forced-fit
+experiments, but the default module set remains `qkv,mlp`.
+
+Current post-cleanup sources:
+`/TTC/results/phase1_analysis/cots_wo_offload_e2e/20260601_current_graph_qwen7b_f001_b1_b16/summary.md`
+and
+`/TTC/results/phase1_analysis/cots_wo_offload_e2e/20260601_current_graph_qwen7b_f005_b1_b16/summary.md`
+
+| COTS f | B | no WO s | with WO s | delta | WO rows | extra WO CPU GiB |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1.0% | 1 | 2.1432 | 2.1357 | -0.35% | 0 | 0.000 |
+| 1.0% | 16 | 2.2831 | 2.2850 | +0.08% | 0 | 0.000 |
+| 5.0% | 1 | 2.2681 | 2.4322 | +7.24% | 128 | 0.024 |
+| 5.0% | 16 | 3.6944 | 4.9228 | +33.25% | 128 | 0.024 |
+
+Regression check against the earlier no-WO COTS metrics passed: current no-WO
+at `f=1%` is +0.47% for B=1 and -0.34% for B=16 versus the
+2026-05-31 recorded cells. Current no-WO at `f=5%`, B=1 is +0.23% versus the
+recorded smoke.
+
+Historical source (pre-2026-06-01 head-aligned WO snap cleanup):
+`/TTC/results/phase1_analysis/cots_wo_offload_e2e/20260531_graph_qwen7b_b1_f001/summary.md`
+and
+`/TTC/results/phase1_analysis/cots_wo_offload_e2e/20260531_graph_qwen7b_b1_f005_smoke/summary.md`
+
+| COTS f | B | no WO s | with WO s | delta | extra WO CPU GiB |
+|---:|---:|---:|---:|---:|---:|
+| 1.0% | 1 | 2.1331 | 2.2481 | +5.39% | 0.007 |
+| 1.0% | 16 | 2.2909 | 2.4236 | +5.79% | 0.007 |
+| 5.0% | 1 | 2.2628 | 2.4358 | +7.64% | 0.033 |
+
+Conclusion: the real COTS WO path is not a harmless simplification. With the
+current head-aligned WO snap, `f=1%` selects zero WO rows and is performance
+noise. Once WO crosses the first 128-channel step at `f=5%`, it costs +7.24% at
+B=1 and +33.25% at B=16 while adding only 0.024 GiB of CPU-stored WO relief.
+Keep WO opt-in only; do not include it in the default module set.
+
+Hybrid-KV compatibility was also checked after WO landed. The combined
+`qkv,mlp,wo` + hybrid KV eager path initialized and generated successfully
+(`wo_ops=28`), and a short graph-mode smoke captured/replayed with the expected
+piecewise graph + wait-kernel policy. A forced-context parity probe had no
+forced-output failures, but WO added extra numeric drift versus the no-WO
+hybrid control (`30/32` top-1 positions matched with WO, versus `32/32`
+without WO). This reinforces the policy boundary: WO is mechanically
+compatible with hybrid KV, but remains an opt-in forced-fit module rather than
+a default performance path. Sources:
+`/TTC/results/phase2/wo_hybrid_compat_20260601_summary.json` and
+`/TTC/results/phase2/no_wo_hybrid_compat_20260601_summary.json`.
+
+The older post-merge primitive remains useful as a lower-level communication
+diagnostic with explicit thread control:
+
+Source:
+`/TTC/results/phase1_analysis/wo_cpu_compute/20260531_qwen7b_t24_smallf.json`
+
+| WO f | max delta / layer | max delta / decode step | WO memory saved |
+|---:|---:|---:|---:|
+| 2.0% | +0.123 ms | +3.44 ms | 14 MB |
+| 3.57% | +0.232 ms | +6.49 ms | 26 MB |
+| 5.0% | +0.307 ms | +8.59 ms | 36 MB |
+| 10.0% | +0.569 ms | +15.93 ms | 72 MB |
+
+Conclusion: WO CPU compute adds measurable decode-step latency for very little
+7B memory relief. The implemented path is useful as a forced-fit experiment,
+but the measured default should stay WQKV/MLP only.
 
 ## Prefetch Free-Zone Diagnosis
 

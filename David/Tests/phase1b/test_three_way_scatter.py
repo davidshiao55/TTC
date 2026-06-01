@@ -37,6 +37,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.offloader import CotsOffloader, set_offloader
 from vllm.model_executor.offloader.base import ForwardDispatchInfo
+from vllm.model_executor.offloader.cots import MLP_DOWN_ROLE, MLP_GATE_UP_ROLE
 from vllm.forward_context import BatchDescriptor
 
 HIDDEN = 256
@@ -203,10 +204,10 @@ def test_mlp_counts_snap_to_64_channel_grid():
 
     _, offloader, _, _, _ = _build_mlp(f_cpu_store=0.20, f_prefetch=0.10)
     bucket = offloader._capture_buckets[0]
-    handles = {h.kind: h for h in offloader._handles}
+    handles = {h.role: h for h in offloader._handles}
 
-    col = handles["col"]
-    row = handles["row"]
+    col = handles[MLP_GATE_UP_ROLE]
+    row = handles[MLP_DOWN_ROLE]
     assert col.n_cpu_per_half == 192
     assert col.n_cpu == 384
     assert col.n_prefetch_by_bucket[bucket] == 256
@@ -387,7 +388,7 @@ def test_pure_prefetch_mlp_forward_parity():
     bucket = offloader._capture_buckets[0]
     for h in offloader._handles:
         assert h.n_cpu_compute_by_bucket[bucket] == 0, (
-            f"{h.kind} {h.qualified_name}: expected n_cpu_compute=0, "
+            f"{h.role} {h.qualified_name}: expected n_cpu_compute=0, "
             f"got {h.n_cpu_compute_by_bucket[bucket]}"
         )
 

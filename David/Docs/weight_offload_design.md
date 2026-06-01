@@ -122,7 +122,7 @@ Each individual weight matrix is split across GPU and CPU. The **split axis is p
 WQKV   — column-parallel (shard output dim, K/V-biased picker)
 MLP1   — column-parallel (shard output dim, intermediate direction)
 MLP2   — row-parallel    (shard input dim, matches MLP1's intermediate sharding)
-WO     — not offloaded in Phase 1/2 (fully GPU-resident); see §WO Split Axis Decision
+WO     — opt-in head-aligned dense output split for forced-fit experiments; default GPU-resident
 ```
 
 Both col-split and row-split are **mathematically exact** — they produce identical results to single-device computation, differing only in the assembly operation at the boundary:
@@ -134,11 +134,11 @@ Row-split  (input-sharded):   Y = X[:, gpu_cols] @ W_gpu + X[:, cpu_cols] @ W_cp
 
 For WQKV specifically, the column dimension corresponds to the head dimension — the same dimension tensor parallelism splits across GPU ranks (`QKVParallelLinear` inherits from `ColumnParallelLinear` in vLLM). For MLP2, the input dim corresponds to the intermediate expansion — the same dim `RowParallelLinear` shards in `down_proj`. Our CPU offload maps directly onto these existing vLLM conventions — nothing invented; just applied across the device boundary instead of across GPU ranks.
 
-**WQKV, MLP1, and MLP2 share the `[f_gpu, f_prefetch, f_cpu]` three-path structure and receive the same per-bucket `(f_cpu, f_prefetch)` pair from the Planner**. WO is fully GPU-resident in Phase 1/2 (not offloaded) and carries no dispatch state. Storage is set uniformly: at load time, `f_cpu_store` is a single scalar applied to WQKV, MLP1, and MLP2 alike. This uniform dispatch is empirically justified by the measured uniform CPU μs/MB across sub-modules at decode-regime batch sizes (`phase0_findings.md §0.3.4` — 1.02–1.07× spread at B ∈ {16, 64, 128}); per-sub-module optimization buys at most ~1 percentage point of extra f efficiency, within the rounding error of reasonable operating points.
+**WQKV, MLP1, and MLP2 share the `[f_gpu, f_prefetch, f_cpu]` three-path structure and receive the same per-bucket `(f_cpu, f_prefetch)` pair from the Planner**. WO is supported by the runtime as an opt-in dense output split, but remains disabled in the default Phase 1/2 module policy because measured E2E cost is not negligible (§WO Split Axis Decision). Storage is set uniformly for all enabled modules: at load time, `f_cpu_store` is a single scalar applied to WQKV, MLP1, MLP2, and optionally WO. This uniform dispatch is empirically justified by the measured uniform CPU μs/MB across sub-modules at decode-regime batch sizes (`phase0_findings.md §0.3.4` — 1.02–1.07× spread at B ∈ {16, 64, 128}); per-sub-module optimization buys at most ~1 percentage point of extra f efficiency, within the rounding error of reasonable operating points.
 
 Prefetch distance is committed to **layer-ahead**: the Planner schedules prefetch against the full layer compute-time budget, with a single prefetch queue per layer and one sync per layer boundary. Tensor-ahead (per-sub-phase prefetch) was considered and rejected — its topological constraint (`f_prefetch_{m+1} × W_{m+1} ≤ compute_time_m × PCIe_BW`) would *force* per-sub-module f tuning to avoid prefetch starvation on short-compute sub-modules, a cost we avoid by committing to uniform dispatch. `pcie_bandwidth_allocation_design.md` carries the full comparison.
 
-**Key parameters**: one load-time scalar `f_cpu_store` (applied to WQKV/MLP1/MLP2); per-bucket `(f_cpu, f_prefetch)` pair emitted by the Planner; split axis fixed per sub-module (not a Planner knob).
+**Key parameters**: one load-time scalar `f_cpu_store` (applied to the enabled module set, default WQKV/MLP1/MLP2); per-bucket `(f_cpu, f_prefetch)` pair emitted by the Planner; split axis fixed per sub-module (not a Planner knob); `weight_modules` selects `{qkv, mlp, wo}` with default `{qkv, mlp}`.
 
 ### Per-Sub-Module Split Axis
 
@@ -180,19 +180,84 @@ SwiGLU-on-slice is safe because `MergedColumnParallelLinear` (gate_up) stores ga
 
 ### WO Split Axis Decision
 
-**WO is not offloaded in Phase 1/2 — fully GPU-resident, no CPU path, no prefetch path.** This is stricter than the original §0.4.3 Alt B (which only ruled out CPU compute for WO): we additionally exclude `f_prefetch_WO` to avoid the load-time dispatch asymmetry that would arise if WO participated in prefetch-only while other sub-modules have the full three-path structure. At 7B on RTX 4090, WO weight is ~686 MB across layers — a small fraction of the 24 GB budget after MLP/WQKV offload, not worth the design complication.
+**WO is implemented but not part of the default module set.** The runtime accepts `cots_weight_modules={"wo"}` and uses a dense output-channel split for `o_proj`, sharing the generic output-split CPU/GPU runner used by WQKV. The split snaps to the layer's WQKV head-size alignment when a QKV projection is present, even though WO itself has no semantic heads. This exists for forced-fit and larger-model experiments. The measured default remains `qkv,mlp`: at 7B on RTX 4090, WO weight is ~686 MB across layers, and the extra activation communication after attention merge is expensive relative to the small memory relief at normal fractions.
+
+The post-Phase 1 E2E check confirms this is not just a primitive-model
+artifact. Using vLLM `prefetch_defer` in graph mode with the same layer
+placement and only `o_proj` inclusion changed, Qwen2.5-7B decode-heavy
+`input/output=8/128` showed a stable ~5% latency tax for WO prefetch:
+
+| offload depth | B | no WO | with WO | delta | extra WO memory |
+|---|---:|---:|---:|---:|---:|
+| 1 layer | 1 | 2.811 s | 2.947 s | +4.84% | 0.024 GiB |
+| 1 layer | 16 | 2.706 s | 2.844 s | +5.09% | 0.024 GiB |
+| 1 layer | 64 | 2.782 s | 2.921 s | +4.99% | 0.024 GiB |
+| 7 layers | 1 | 18.253 s | 19.208 s | +5.23% | 0.167 GiB |
+
+Source:
+`/TTC/results/phase1_analysis/wo_offload_e2e/20260531_graph_qwen7b_decode/summary.md`.
+This experiment measures the least invasive WO-inclusion variant
+(prefetch-only, no CPU WO GEMM). Even that variant is not free, so Phase 1/2
+keep the explicit WO exclusion rather than simplifying the strategy by
+offloading all projection weights uniformly.
+
+The implemented COTS CPU-compute path points in the same direction. After the
+2026-06-01 cleanup that made WO snap to the WQKV head-size grid, graph-mode
+Qwen2.5-7B decode (`input/output=8/128`, native COTS, `qkv,mlp` versus
+`qkv,mlp,wo`) measured:
+
+| COTS f | B | no WO | with WO | delta | WO rows | extra WO CPU memory |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1.0% | 1 | 2.143 s | 2.136 s | -0.35% | 0 | 0.000 GiB |
+| 1.0% | 16 | 2.283 s | 2.285 s | +0.08% | 0 | 0.000 GiB |
+| 5.0% | 1 | 2.268 s | 2.432 s | +7.24% | 128 | 0.024 GiB |
+| 5.0% | 16 | 3.694 s | 4.923 s | +33.25% | 128 | 0.024 GiB |
+
+Sources:
+`/TTC/results/phase1_analysis/cots_wo_offload_e2e/20260601_current_graph_qwen7b_f001_b1_b16/summary.md`
+and
+`/TTC/results/phase1_analysis/cots_wo_offload_e2e/20260601_current_graph_qwen7b_f005_b1_b16/summary.md`.
+At `f=1%`, Qwen2.5-7B snaps WO to zero rows, so the opt-in knob is effectively
+no-op. Once WO crosses the first 128-channel step at `f=5%`, the latency tax is
+large relative to 0.024 GiB of extra memory relief.
+
+WO was also tested together with Phase 2 hybrid KV. The combined path is
+runtime-compatible in eager mode and in the graph-mode smoke: `qkv,mlp,wo`
+initialized with `wo_ops=28`, hybrid KV initialized normally, and graph mode
+defaulted to piecewise graphs plus wait-kernel sync as intended. Correctness
+smoke remains weaker than the default no-WO path: forced outputs matched, but a
+short suffix-only parity probe saw `30/32` top-1 positions match with WO versus
+`32/32` without WO. This is acceptable for an opt-in memory-pressure escape
+hatch, not for the default planner policy. Sources:
+`/TTC/results/phase2/wo_hybrid_compat_20260601_summary.json` and
+`/TTC/results/phase2/no_wo_hybrid_compat_20260601_summary.json`.
+
+The lower-level post-merge primitive with 24 CPU threads shows the same
+communication cost shape:
+
+| WO f | max delta / layer | max delta / decode step | WO memory saved |
+|---:|---:|---:|---:|
+| 2.0% | +0.123 ms | +3.44 ms | 14 MB |
+| 3.57% | +0.232 ms | +6.49 ms | 26 MB |
+| 5.0% | +0.307 ms | +8.59 ms | 36 MB |
+| 10.0% | +0.569 ms | +15.93 ms | 72 MB |
+
+Source:
+`/TTC/results/phase1_analysis/wo_cpu_compute/20260531_qwen7b_t24_smallf.json`.
+The opt-in runtime path is therefore useful for forced-fit validation, but not
+for the default 7B Phase 1/2 policy.
 
 §0.4.2 measured both alternatives that were on the table:
 
 **Alternative A — WO col-split with merge-before-WO.** Col-split weight offload applied to the merged attention output: GPU merges prefix + suffix via online softmax, sends merged `attn_out` slice to CPU, CPU computes its WO slice, returns partial for concat. Saves `f_cpu_store_WO · 686 MB` of GPU weight (~69 MB at f=10%, ~206 MB at f=30%). **Rejected**: 3 PCIe round trips per layer + ~0.4 ms added critical-path latency per layer (~11 ms per decode step across 28 layers).
 
-**Alternative B — WO GPU-resident, no CPU compute.** GPU does full WO after merge in its idle slack during CPU attention. Single D2H per layer. **Adopted, and extended** to also exclude `f_prefetch_WO` (see above) — WO has no dispatch at all in Phase 1/2.
+**Alternative B — WO GPU-resident by default.** GPU does full WO after merge in its idle slack during CPU attention. Single D2H per layer. **Adopted as the default policy.** The implementation still exposes opt-in WO output-split dispatch for forced-fit experiments, but the Planner should not select it unless memory pressure makes the added latency worthwhile.
 
-**Phase 3 revisit condition.** At 14B, WO weight is ~2.5 GB (48 layers × 52 MB). If 14B memory pressure exceeds what MLP+WQKV offload can relieve, Phase 3 can add `f_prefetch_WO` as a late extension — adds a prefetch-only dispatch path for WO, no CPU compute (Alt B's no-f_cpu rule still stands). The asymmetry is accepted in exchange for the 2.5 GB of GPU memory relief.
+**Phase 3 revisit condition.** At 14B, WO weight is ~2.5 GB (48 layers × 52 MB). If 14B memory pressure exceeds what MLP+WQKV offload can relieve, the Planner can opt into WO using the existing `weight_modules` hook. That decision must be memory-gated, not a default simplification.
 
 **Note on the withdrawn "merge-after-WO fusion" idea.** An earlier design considered duplicating WO on CPU and merging at the WO-output level via the linearity of WO (`WO @ merge(a_p, a_s) = α_p · WO(a_p) + α_s · WO(a_s)`). Withdrawn after timing analysis: adds CPU_WO (~2–3 ms for 7B) to CPU's critical path, which is already the bottleneck from memory-bound CPU attention. D2H bytes identical either way, no comm win. See Phase 0 §0.5 and §0.4.2 for the measurement.
 
-**Key parameters**: f_gpu, f_prefetch, f_cpu per tensor (WQKV, WO, MLP1, MLP2).
+**Key parameters**: f_gpu, f_prefetch, f_cpu per enabled tensor (WQKV, MLP1, MLP2, optional WO).
 
 ### WQKV Column Choice: K/V-Biased Slice
 
@@ -300,7 +365,7 @@ All three granularities can use f_cpu to compute on CPU in parallel. But finer g
 | | Group (vLLM) | Layer (FlexGen) | Tensor (Ours) |
 |---|---|---|---|
 | Placement unit | Layer | Whole tensor | Tensor columns (col-parallel) or input cols (row-parallel), per sub-module |
-| f_gpu/f_prefetch/f_cpu | Per-layer (uniform within layer) | Per-tensor (binary: 0 or 1) | Uniform across WQKV/MLP1/MLP2 per bucket; WO not offloaded |
+| f_gpu/f_prefetch/f_cpu | Per-layer (uniform within layer) | Per-tensor (binary: 0 or 1) | Uniform across enabled modules per bucket; default WQKV/MLP1/MLP2, opt-in WO |
 | Prefetch distance | K offloaded-modules ahead (default K=1; ≈ (G−1) actual layers when N=1) | Layer-ahead | **Layer-ahead** (committed; empirically validated in `phase0_findings.md §0.10.1d`) |
 | Exploits sub-module non-uniformity | No | Partially (different tensors, different placement) | Yes — different split axes per sub-module; uniform dispatch over them |
 | Buffer size | layer_weight | f_prefetch × layer_weight | sum_m (f_prefetch × W_m) ≈ f_prefetch × layer_weight |
@@ -314,7 +379,7 @@ All three granularities can use f_cpu to compute on CPU in parallel. But finer g
 
 *This is a Planner concern, not a runtime guard.*
 
-WQKV's CPU-stored output columns are laid out by the K/V-biased picker as `[Q_tail | K | V]` — K/V groups are assigned to CPU storage first, Q columns last. The runtime applies the dispatch table verbatim across all sub-modules (WQKV / MLP1 / MLP2): prefetch consumes the contiguous prefix of cpu_indices, CPU compute takes the residual.
+WQKV's CPU-stored output columns are laid out by the K/V-biased picker as `[Q_tail | K | V]` — K/V groups are assigned to CPU storage first, Q columns last. The runtime applies the dispatch table verbatim across all enabled sub-modules (WQKV / MLP1 / MLP2, and optional WO): prefetch consumes the contiguous prefix of cpu_indices, CPU compute takes the residual.
 
 **K/V round-trip cost belongs in the Planner's objective.** If the per-bucket `f_cpu_compute` lands below the K/V fraction (the K/V portion of out_dim, e.g. ~22% of WQKV at Qwen2.5-7B), the residual K/V columns flow through the prefetch path: weight H2D to GPU, K/V computed on GPU, K/V output D2H back to the CPU suffix cache (Phase 2). That's a PCIe round-trip the Planner can avoid by biasing the WQKV-bucket cost model toward `f_cpu_compute ≥ K/V fraction`. See `planner_design.md §7.3`.
 

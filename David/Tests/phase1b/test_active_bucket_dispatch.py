@@ -8,15 +8,14 @@ using the slot's prior-iter bucket as the source of truth for compute
 shape.
 
 Tests:
-  - post_init max-fills layer 0 to max_n_prefetch.
+  - prepare_before_forward lazily fills layer 0 for the active bucket.
   - Layer 0's pre-compute hook starts prefetch for layer 1.
   - Operators dispatch off the active bucket, not the slot's last fill.
   - Owner mismatch raises (slot-scheduling bug, not a recoverable state).
   - prepare_for_forward_bucket suffix-copies when avail < required.
-  - Operators consume only the active bucket's prefix when avail > required.
-  - Col fixed-max layout `[gate_max | up_max]` lets the operator pull
-    `gate[:n_half]` and `up[max_half:max_half+n_half]` correctly at
-    smaller active buckets than max.
+  - Operators consume only the active bucket's prefix when the slot has more
+    rows than required.
+  - Col active-adjacent layout `[gate_active | up_active]` is filled correctly.
 """
 
 from collections import Counter
@@ -45,6 +44,9 @@ from vllm.model_executor.offloader.base import ForwardDispatchInfo
 from vllm.model_executor.offloader.cots import (
     CotsLinearHandle,
     CotsPrefetchBufferPool,
+    MLP_DOWN_ROLE,
+    MLP_GATE_UP_ROLE,
+    QKV_ROLE,
     WeightPrefetchStreamer,
     _complement,
 )
@@ -65,7 +67,7 @@ BF16_RTOL = 2e-2
 
 
 # ---------------------------------------------------------------------------
-# End-to-end fixtures (post_init max-fill etc.)
+# End-to-end fixtures (lazy layer-0 fill etc.)
 # ---------------------------------------------------------------------------
 class _MiniMlp(nn.Module):
     def __init__(self):
@@ -200,7 +202,8 @@ def _make_col(layer_idx, n_cpu_per_half=64, half=INTERMEDIATE, in_dim=HIDDEN):
     base = torch.arange(half - n_cpu_per_half, half, dtype=torch.long)
     cpu_indices = torch.cat([base, base + half])
     h = CotsLinearHandle(
-        kind="col", linear=_fake_linear(out_dim, in_dim),
+        role=MLP_GATE_UP_ROLE,
+        linear=_fake_linear(out_dim, in_dim),
         qualified_name=f"layer{layer_idx}.col",
         in_dim=in_dim, out_dim=out_dim, n_cpu=n_cpu,
         cpu_indices=cpu_indices, gpu_indices=_complement(cpu_indices, out_dim),
@@ -215,7 +218,8 @@ def _make_col(layer_idx, n_cpu_per_half=64, half=INTERMEDIATE, in_dim=HIDDEN):
 def _make_row(layer_idx, n_cpu=64, in_dim=INTERMEDIATE, out_dim=HIDDEN):
     cpu_indices = torch.arange(in_dim - n_cpu, in_dim, dtype=torch.long)
     h = CotsLinearHandle(
-        kind="row", linear=_fake_linear(out_dim, in_dim),
+        role=MLP_DOWN_ROLE,
+        linear=_fake_linear(out_dim, in_dim),
         qualified_name=f"layer{layer_idx}.row",
         in_dim=in_dim, out_dim=out_dim, n_cpu=n_cpu,
         cpu_indices=cpu_indices, gpu_indices=_complement(cpu_indices, in_dim),
@@ -227,7 +231,7 @@ def _make_row(layer_idx, n_cpu=64, in_dim=INTERMEDIATE, out_dim=HIDDEN):
     return h
 
 
-def _setup_synthetic(n_layers=N_LAYERS, table=None):
+def _setup_synthetic(n_layers=N_LAYERS, table=None, n_cpu=64):
     """Build n_layers col+row pairs with the given dispatch table, allocate
     pool + transposed row source. Returns (layer_handles, streamer).
     """
@@ -236,8 +240,8 @@ def _setup_synthetic(n_layers=N_LAYERS, table=None):
     layer_handles: list[list[CotsLinearHandle]] = []
     flat: list[CotsLinearHandle] = []
     for i in range(n_layers):
-        c = _make_col(i)
-        r = _make_row(i)
+        c = _make_col(i, n_cpu_per_half=n_cpu)
+        r = _make_row(i, n_cpu=n_cpu)
         c.apply_prefetch_split_per_bucket(table)
         r.apply_prefetch_split_per_bucket(table)
         layer_handles.append([c, r])
@@ -250,11 +254,10 @@ def _setup_synthetic(n_layers=N_LAYERS, table=None):
 
 
 # ---------------------------------------------------------------------------
-def test_post_init_fills_only_layer0_to_max():
-    """post_init max-fills only layer 0 to max_n_prefetch.
+def test_prepare_before_forward_fills_only_layer0_for_active_bucket():
+    """Layer 0 is filled lazily at the first forward boundary.
 
-    Layer 0 is consumed before the current forward can issue a prefetch.
-    Layer 1 and later are filled by their predecessor's pre-compute
+    Layer 1 and later are still filled by their predecessor's pre-compute
     `start_prefetch` hook.
     """
     if not torch.cuda.is_available():
@@ -268,11 +271,24 @@ def test_post_init_fills_only_layer0_to_max():
         for h in offloader._layer_handles[idx]:
             if h.max_n_prefetch == 0:
                 continue
+            assert h.prefetch_available_rows_in_slot[h.slot_idx] == 0
+
+    _dispatch(offloader)
+    offloader._streamer.copy_stream.synchronize()
+    bucket = offloader._bucket_for(MAX_NUM_TOKENS)
+
+    for idx, _ in enumerate(offloader._layer_handles):
+        if idx > 1:
+            break
+        for h in offloader._layer_handles[idx]:
+            if h.max_n_prefetch == 0:
+                continue
             if idx == 0:
+                n_pref = h.n_prefetch_by_bucket[bucket]
                 expected = (
-                    h.max_n_prefetch // 2
-                    if h.kind == "col"
-                    else h.max_n_prefetch
+                    n_pref // 2
+                    if h.role == MLP_GATE_UP_ROLE
+                    else n_pref
                 )
                 assert h.prefetch_available_rows_in_slot[h.slot_idx] == expected, (
                     f"layer {idx} {h.qualified_name}: avail="
@@ -312,7 +328,7 @@ def test_layer0_precompute_hook_starts_layer1_prefetch():
         if h.max_n_prefetch == 0:
             continue
         n_pref = h.n_prefetch_by_bucket[bucket]
-        expected = n_pref // 2 if h.kind == "col" else n_pref
+        expected = n_pref // 2 if h.role == MLP_GATE_UP_ROLE else n_pref
         assert h.prefetch_available_rows_in_slot[h.slot_idx] == expected, (
             f"layer 1 {h.qualified_name}: avail="
             f"{h.prefetch_available_rows_in_slot[h.slot_idx]}, "
@@ -380,7 +396,7 @@ def test_owner_mismatch_raises():
     # Find the first qkv handle.
     h = next(
         h for h in offloader._handles
-        if h.kind == "qkv" and h.max_n_prefetch > 0
+        if h.role == QKV_ROLE and h.max_n_prefetch > 0
     )
 
     other = object()  # any sentinel != h
@@ -405,8 +421,8 @@ def test_available_less_than_required_copies_suffix():
     # avail < required. Phase 1b uniform fill doesn't normally produce
     # this; we hand-craft a per-bucket dispatch table here.
     table = {1: (0.20, 0.05), 64: (0.20, 0.20)}
-    layer_handles, streamer = _setup_synthetic(table=table)
-    h = layer_handles[0][0]  # col handle
+    layer_handles, streamer = _setup_synthetic(table=table, n_cpu=192)
+    h = layer_handles[0][0]  # MLP gate/up handle
     assert h.n_prefetch_by_bucket[1] < h.n_prefetch_by_bucket[64]
 
     # Fill at small bucket.
@@ -447,7 +463,7 @@ def test_available_greater_than_required_consumes_only_active():
     h_col = layer_handles[0][0]
     h_row = layer_handles[0][1]
 
-    # Hand max-fill the slots (mimic post_init).
+    # Hand-fill an oversized slot to verify active-bucket reads stay bounded.
     max_half_col = h_col.max_n_prefetch // 2
     n_cpu_per_half_total = h_col.n_cpu // 2
     torch.manual_seed(0)
@@ -486,35 +502,39 @@ def test_available_greater_than_required_consumes_only_active():
     assert avail_after >= n_per_half_small  # invariant for the operator
 
 
-def test_gate_up_max_fill_layout():
-    """Col handle filled at max via post_init max-fill. Active bucket is
-    smaller. The operator pulls `gate[:n_per_half]` from `slot[:n_per_half]`
-    AND `up[:n_per_half]` from `slot[max_half:max_half + n_per_half]` —
-    fixed-max layout. Verify content directly by inspecting the slot
-    against w_cpu (which has [gate_full | up_full] row layout).
+def test_gate_up_active_bucket_fill_layout():
+    """Col handle uses active-adjacent prefetch layout.
+
+    The streamer writes `gate[:n_per_half]` to `slot[:n_per_half]` and
+    `up[:n_per_half]` to `slot[n_per_half:2*n_per_half]`. Verify content
+    directly by inspecting the slot against w_cpu, which has
+    `[gate_full | up_full]` row layout.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
     _, offloader = _build(f_cpu_store=0.20, f_prefetch=0.05)
+    _dispatch(offloader)
+    offloader._streamer.copy_stream.synchronize()
     h = next(
         h for h in offloader._layer_handles[0]
-        if h.kind == "col" and h.max_n_prefetch > 0
+        if h.role == MLP_GATE_UP_ROLE and h.max_n_prefetch > 0
     )
-    max_half = h.max_n_prefetch // 2
+    bucket = offloader._bucket_for(MAX_NUM_TOKENS)
+    active_half = h.n_prefetch_by_bucket[bucket] // 2
     n_cpu_per_half_total = h.n_cpu // 2
     slot = h.w_prefetch_slots[h.slot_idx]
 
-    # Gate region: slot[:max_half] should equal w_cpu[:max_half] bit-exact
+    # Gate region: slot[:active_half] should equal w_cpu[:active_half] bit-exact
     # (the loader copies bytes; both bf16, no GEMM noise).
-    gate_dst = slot[:max_half, :].cpu()
-    gate_src = h.w_cpu[:max_half, :].cpu()
+    gate_dst = slot[:active_half, :].cpu()
+    gate_src = h.w_cpu[:active_half, :].cpu()
     assert torch.equal(gate_dst, gate_src)
 
-    # Up region: slot[max_half:2*max_half] should equal
-    # w_cpu[n_cpu_per_half_total : n_cpu_per_half_total + max_half].
-    up_dst = slot[max_half : 2 * max_half, :].cpu()
+    # Up region: slot[active_half:2*active_half] should equal
+    # w_cpu[n_cpu_per_half_total : n_cpu_per_half_total + active_half].
+    up_dst = slot[active_half : 2 * active_half, :].cpu()
     up_src = h.w_cpu[
-        n_cpu_per_half_total : n_cpu_per_half_total + max_half, :
+        n_cpu_per_half_total : n_cpu_per_half_total + active_half, :
     ].cpu()
     assert torch.equal(up_dst, up_src)

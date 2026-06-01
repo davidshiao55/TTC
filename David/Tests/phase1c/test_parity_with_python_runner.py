@@ -111,6 +111,44 @@ class _MlpLayer(nn.Module):
         self.mlp = _MlpBlock()
 
 
+class _WoLayer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        bf16 = torch.bfloat16
+        self.o_proj = RowParallelLinear(
+            input_size=HIDDEN,
+            output_size=HIDDEN,
+            bias=False,
+            disable_tp=True,
+            params_dtype=bf16,
+            prefix="self_attn.o_proj",
+        )
+
+
+class _WoLayerWithQkv(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        bf16 = torch.bfloat16
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=HIDDEN,
+            head_size=HEAD_DIM,
+            total_num_heads=NUM_HEADS,
+            total_num_kv_heads=NUM_KV_HEADS,
+            bias=False,
+            disable_tp=True,
+            params_dtype=bf16,
+            prefix="self_attn.qkv_proj",
+        )
+        self.o_proj = RowParallelLinear(
+            input_size=HIDDEN,
+            output_size=HIDDEN,
+            bias=False,
+            disable_tp=True,
+            params_dtype=bf16,
+            prefix="self_attn.o_proj",
+        )
+
+
 def _make_vllm_config() -> VllmConfig:
     mc = ModelConfig.__new__(ModelConfig)
     object.__setattr__(mc, "enforce_eager", True)
@@ -185,6 +223,30 @@ def _build_mlp(
         layer.mlp.down_proj.weight_loader(layer.mlp.down_proj.weight, down)
         offloader.post_init()
     return layer, offloader, gate, up, down
+
+
+def _build_wo(
+    *, f_cpu_store: float, f_prefetch: float, cpu_runner: str
+) -> tuple[_WoLayerWithQkv, CotsOffloader, torch.Tensor]:
+    vc = _make_vllm_config()
+    with set_current_vllm_config(vc):
+        layer = _WoLayerWithQkv().cuda()
+        offloader = CotsOffloader(
+            config=CotsOffloadConfig(
+                f_cpu_store=f_cpu_store,
+                f_prefetch=f_prefetch,
+                kv_biased=True,
+                weight_modules={"wo"},
+                cpu_runner=cpu_runner,
+            )
+        )
+        set_offloader(offloader)
+        offloader.wrap_modules(iter([layer]))
+        torch.manual_seed(0)
+        weight = torch.randn(HIDDEN, HIDDEN, dtype=torch.bfloat16, device="cuda")
+        layer.o_proj.weight_loader(layer.o_proj.weight, weight)
+        offloader.post_init()
+    return layer, offloader, weight
 
 
 def _dispatch(offloader: CotsOffloader, n: int = MAX_NUM_TOKENS) -> None:
@@ -262,6 +324,72 @@ def test_mlp_native_matches_python(f_cpu_store: float) -> None:
 
     atol = MLP_BLOCK_RTOL * float(out_py.abs().max())
     torch.testing.assert_close(out_nat, out_py, rtol=BF16_RTOL, atol=atol)
+
+
+def test_default_weight_modules_do_not_wrap_wo() -> None:
+    vc = _make_vllm_config()
+    with set_current_vllm_config(vc):
+        layer = _WoLayer().cuda()
+        offloader = CotsOffloader(
+            config=CotsOffloadConfig(f_cpu_store=0.25, cpu_runner="python")
+        )
+        offloader.wrap_modules(iter([layer]))
+
+    assert not hasattr(layer.o_proj, "_cots_handle")
+    assert offloader._handles == []
+    if offloader._runner is not None:
+        offloader._runner.close()
+
+
+def test_wo_output_split_uses_qkv_head_granularity() -> None:
+    vc = _make_vllm_config()
+    with set_current_vllm_config(vc):
+        layer = _WoLayerWithQkv().cuda()
+        offloader = CotsOffloader(
+            config=CotsOffloadConfig(
+                f_cpu_store=0.10,
+                weight_modules={"wo"},
+                cpu_runner="python",
+            )
+        )
+        offloader.wrap_modules(iter([layer]))
+
+    handle = layer.o_proj._cots_handle
+    assert handle.output_granularity == HEAD_DIM
+    assert handle.n_cpu == HEAD_DIM
+    assert all(h.role != "qkv" for h in offloader._handles)
+    if offloader._runner is not None:
+        offloader._runner.close()
+
+
+@pytest.mark.parametrize(
+    "f_cpu_store",
+    [0.25, 0.50, 0.75],
+    ids=["fcpu_025", "fcpu_050", "fcpu_075"],
+)
+def test_wo_native_matches_python(f_cpu_store: float) -> None:
+    """WO uses the generic output-split linear path, but its native slab
+    descriptor and op-kind routing are distinct from QKV."""
+    torch.manual_seed(457)
+    x = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
+
+    _, off_py, _ = _build_wo(
+        f_cpu_store=f_cpu_store, f_prefetch=0.0, cpu_runner="python"
+    )
+    _dispatch(off_py)
+    out_py, _ = off_py._layer_modules[0].o_proj(x)
+    if off_py._runner is not None:
+        off_py._runner.close()
+
+    _, off_nat, _ = _build_wo(
+        f_cpu_store=f_cpu_store, f_prefetch=0.0, cpu_runner="native"
+    )
+    _dispatch(off_nat)
+    out_nat, _ = off_nat._layer_modules[0].o_proj(x)
+    if off_nat._runner is not None:
+        off_nat._runner.close()
+
+    torch.testing.assert_close(out_nat, out_py, rtol=BF16_RTOL, atol=BF16_ATOL)
 
 
 @pytest.mark.parametrize(
@@ -373,6 +501,36 @@ def test_mlp_three_way_native_matches_python(
 
     atol = MLP_BLOCK_RTOL * float(out_py.abs().max())
     torch.testing.assert_close(out_nat, out_py, rtol=BF16_RTOL, atol=atol)
+
+
+@pytest.mark.parametrize(
+    "f_cpu_store,f_prefetch",
+    [(0.50, 0.25), (0.75, 0.25)],
+    ids=["fcs050_fp025", "fcs075_fp025"],
+)
+def test_wo_three_way_native_matches_python(
+    f_cpu_store: float, f_prefetch: float
+) -> None:
+    torch.manual_seed(17)
+    x = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
+
+    _, off_py, _ = _build_wo(
+        f_cpu_store=f_cpu_store, f_prefetch=f_prefetch, cpu_runner="python"
+    )
+    _prime_prefetch(off_py)
+    out_py, _ = off_py._layer_modules[0].o_proj(x)
+    if off_py._runner is not None:
+        off_py._runner.close()
+
+    _, off_nat, _ = _build_wo(
+        f_cpu_store=f_cpu_store, f_prefetch=f_prefetch, cpu_runner="native"
+    )
+    _prime_prefetch(off_nat)
+    out_nat, _ = off_nat._layer_modules[0].o_proj(x)
+    if off_nat._runner is not None:
+        off_nat._runner.close()
+
+    torch.testing.assert_close(out_nat, out_py, rtol=BF16_RTOL, atol=BF16_ATOL)
 
 
 def test_prepare_before_forward_sets_current_bucket() -> None:

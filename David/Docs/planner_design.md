@@ -108,7 +108,16 @@ Per model `m ∈ {generator, verifier}`:
 
 - `gpu_memory_utilization_m` or equivalent GPU-byte budget — the global GPU
   budget assigned to this vLLM engine.
-- `f_cpu_store_m ∈ [0, 1]` — single scalar applied uniformly to **WQKV, MLP1, MLP2**. WQKV's CPU-stored bytes are ordered by the K/V-biased picker (K+V head groups first, then Q tail). WO is not offloaded in Phase 1/2 (`f_cpu_store_WO = 0`, fixed — see `weight_offload_design.md §WO Split Axis Decision`).
+- `weight_modules_m ⊆ {qkv, mlp, wo}` — semantic weight modules eligible for
+  COTS storage/compute. Default is `{qkv, mlp}`; `wo` is an opt-in forced-fit
+  module only.
+- `f_cpu_store_m ∈ [0, 1]` — single scalar applied uniformly to the enabled
+  module set. WQKV's CPU-stored bytes are ordered by the K/V-biased picker
+  (K+V head groups first, then Q tail). WO uses the implemented head-aligned
+  dense output split when, and only when, `wo ∈ weight_modules_m`; planner
+  policy should keep it disabled unless memory pressure makes the measured
+  latency cost worthwhile (see `weight_offload_design.md §WO Split Axis
+  Decision`).
 - `KV_gpu_bytes_m` — GPU KV pool size
 - `KV_cpu_bytes_m` — CPU KV pool size (the "extension")
 
@@ -128,6 +137,7 @@ FastTTS planner_config
            gpu_memory_utilization
            kv_offloading_size/backend
            offload_backend="cots"
+           cots_weight_modules
            cots_f_cpu_store
            cots_f_prefetch
            cots_dispatch_table (optional; complete if set)
@@ -145,7 +155,7 @@ Per model, a table keyed by `BatchDescriptor`:
 dispatch[model][BatchDescriptor] → (f_cpu_compute, f_prefetch_compute)
 ```
 
-One entry per captured CUDA graph bucket, emitting a **single `(f_cpu, f_prefetch)` pair applied uniformly to WQKV, MLP1, and MLP2** at that bucket. WO has no per-bucket dispatch (not offloaded in Phase 1/2). Constraint per entry:
+One entry per captured CUDA graph bucket, emitting a **single `(f_cpu, f_prefetch)` pair applied uniformly to the enabled module set** at that bucket. In the default plan this means WQKV, MLP1, and MLP2. If the Planner enables WO for a forced-fit case, WO receives the same dispatch pair rather than its own per-bucket tuning. Constraint per entry:
 
 ```
 f_cpu_compute + f_prefetch_compute = f_cpu_store_m
@@ -204,10 +214,10 @@ For `num_tokens > max_cudagraph_capture_size`, vLLM falls back to eager executio
 
 ### 4.6 Fixed constants (documented outputs, not tuned)
 
-- `|B_prefetch_m| = layer-ahead buffer` — sized to hold `Σ_m (f_prefetch × W_m)` across WQKV/MLP1/MLP2 within one layer (see `pcie_bandwidth_allocation_design.md §Prefetch Distance`).
+- `|B_prefetch_m| = layer-ahead buffer` — sized to hold `Σ_m (f_prefetch × W_m)` across the enabled COTS weight modules within one layer (default WQKV/MLP1/MLP2; optional WO) (see `pcie_bandwidth_allocation_design.md §Prefetch Distance`).
 - **Prefetch distance = layer-ahead** — one prefetch queue per layer, one sync per layer boundary. Committed (not an option). Empirically validated in `phase0_findings.md §0.10.1d`: under uniform spread (G=4 N=1) on Qwen2.5-7B at decode B=64, K=2 buys only 2.9% over K=1 and K=4 OOMs because the buffer pool grows linearly with K.
 - KV placement policy — see `attention_offload_design.md §Two-Pool KV Model` for the two candidate mechanisms (position-split vs head-split); one is selected globally and baked in before Phase 2 locks.
-- Per-sub-module split axis — `{WQKV: col, MLP1: col, MLP2: row}` is hardcoded across all models and buckets (see `weight_offload_design.md §Per-Sub-Module Split Axis`). WO is not offloaded in Phase 1/2 (`f_gpu` only, no dispatch).
+- Per-sub-module split axis — `{WQKV: output-col, MLP1: output-col, MLP2: input-row, WO: output-col}` is hardcoded across all models and buckets (see `weight_offload_design.md §Per-Sub-Module Split Axis`). WO is runtime-supported but planner-disabled by default.
 - PCIe allocation — 100% weight prefetch (see `pcie_bandwidth_allocation_design.md`).
 
 These appear in the output for completeness so the Scheduler has one place to read the plan, but the Planner does not optimize over them.

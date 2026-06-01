@@ -1,6 +1,6 @@
 """Phase 1a §5 — TP-style loader closures (col / merged-col / qkv / row).
 
-Verifies the per-kind loader closures on `CotsLinearHandle` correctly split
+Verifies the per-role loader closures on `CotsLinearHandle` correctly split
 each shard's `loaded_weight` into:
   * GPU portion (FIRST cols/rows) → `param.data` (already at GPU slice shape)
   * CPU portion (LAST cols/rows)  → `handle.w_cpu` at the right offset
@@ -17,6 +17,9 @@ import torch.nn as nn
 
 from vllm.model_executor.offloader.cots import (
     CotsLinearHandle,
+    MLP_DOWN_ROLE,
+    MLP_GATE_UP_ROLE,
+    QKV_ROLE,
     _complement,
     _qkv_kv_biased_indices,
 )
@@ -40,7 +43,8 @@ def _make_handle_row(in_dim, out_dim, n_cpu, dtype=torch.bfloat16):
     cpu_indices = torch.arange(in_dim - n_cpu, in_dim, dtype=torch.long)
     gpu_indices = _complement(cpu_indices, in_dim)
     handle = CotsLinearHandle(
-        kind="row", linear=linear, qualified_name="row.test",
+        role=MLP_DOWN_ROLE,
+        linear=linear, qualified_name="row.test",
         in_dim=in_dim, out_dim=out_dim, n_cpu=n_cpu,
         cpu_indices=cpu_indices, gpu_indices=gpu_indices,
         dtype=dtype,
@@ -57,7 +61,8 @@ def _make_handle_col(half, in_dim, n_cpu_per_half, dtype=torch.bfloat16):
     cpu_indices = torch.cat([base, base + half])
     gpu_indices = _complement(cpu_indices, out_dim)
     handle = CotsLinearHandle(
-        kind="col", linear=linear, qualified_name="col.test",
+        role=MLP_GATE_UP_ROLE,
+        linear=linear, qualified_name="col.test",
         in_dim=in_dim, out_dim=out_dim, n_cpu=n_cpu,
         cpu_indices=cpu_indices, gpu_indices=gpu_indices,
         dtype=dtype, merged_partition_sizes=(half, half),
@@ -75,7 +80,8 @@ def _make_handle_qkv(q_size, kv_size, n_cpu, head_dim, in_dim,
     )
     gpu_indices = _complement(cpu_indices, out_dim)
     handle = CotsLinearHandle(
-        kind="qkv", linear=linear, qualified_name="qkv.test",
+        role=QKV_ROLE,
+        linear=linear, qualified_name="qkv.test",
         in_dim=in_dim, out_dim=out_dim, n_cpu=n_cpu,
         cpu_indices=cpu_indices, gpu_indices=gpu_indices,
         dtype=dtype, q_size=q_size, kv_size=kv_size, head_dim=head_dim,

@@ -37,7 +37,7 @@ Outputs:
   - Recommended default given the measured regime.
 
 Usage:
-    python bench_wo_offload_tradeoff.py --model qwen7b
+    python bench_wo_offload_tradeoff.py --model qwen7b --threads 24
     python bench_wo_offload_tradeoff.py --model qwen7b --output-json out.json
 """
 
@@ -263,13 +263,23 @@ def main():
     p.add_argument("--model", choices=list(MODEL_CONFIGS.keys()), default="qwen7b")
     p.add_argument("--num-tokens", type=int, nargs="+", default=NUM_TOKENS)
     p.add_argument("--slice-fracs", type=float, nargs="+", default=SLICE_FRACS)
+    p.add_argument(
+        "--threads",
+        type=int,
+        default=24,
+        help="CPU threads for the WO CPU GEMM timing.",
+    )
     p.add_argument("--output-json", type=str, default=None)
     args = p.parse_args()
+    torch.set_num_threads(args.threads)
 
     cfg = MODEL_CONFIGS[args.model]
     print(f"Phase 0.4.2 — WO Offload Alt A vs Alt B  ({cfg['display_name']})")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"num_tokens={args.num_tokens}  slice_fracs={args.slice_fracs}")
+    print(
+        f"num_tokens={args.num_tokens}  slice_fracs={args.slice_fracs} "
+        f"threads={args.threads}"
+    )
 
     results: list[Primitives] = []
     for N in args.num_tokens:
@@ -286,6 +296,7 @@ def main():
             "config": {
                 "num_tokens": args.num_tokens,
                 "slice_fracs": args.slice_fracs,
+                "threads": args.threads,
                 "warmup": WARMUP, "iters": ITERS,
             },
             "primitives": [p.__dict__ for p in results],

@@ -290,7 +290,7 @@ def _make_dryrun_runner() -> cots.NativeCotsWeightRunner:
     test only cares about the FX graph structure, not the slab's
     actual GEMM behavior — dry_run avoids any worker-thread state."""
     r = cots.NativeCotsWeightRunner(dry_run=True)
-    slab = cots._NativeWeightSlabSpecQkv(
+    slab = cots._NativeWeightSlabSpecLinear(
         op_descriptor=(0, 0, "qkv"),
         n_threads=1,
         x_pinned_ptr=0,

@@ -127,6 +127,8 @@ def _engine_kwargs(args: argparse.Namespace, *, hybrid: bool) -> dict[str, Any]:
         "cots_f_cpu_store": args.cots_f_cpu_store,
         "cots_f_prefetch": args.cots_f_prefetch,
     }
+    if args.cots_weight_modules is not None:
+        kwargs["cots_weight_modules"] = args.cots_weight_modules
     if hybrid:
         kwargs.update(
             cots_kv_split_blocks=args.split_tokens // 16,
@@ -192,6 +194,12 @@ def main() -> None:
     parser.add_argument("--cpu-pool-gb", type=float, default=4.0)
     parser.add_argument("--cots-f-cpu-store", type=float, default=0.02)
     parser.add_argument("--cots-f-prefetch", type=float, default=0.02)
+    parser.add_argument(
+        "--cots-weight-modules",
+        nargs="+",
+        default=None,
+        help="COTS weight modules to offload, e.g. qkv mlp or qkv mlp wo.",
+    )
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--second-weight-control", action="store_true")
     parser.add_argument("--output", default="/tmp/phase2_task_quality.json")

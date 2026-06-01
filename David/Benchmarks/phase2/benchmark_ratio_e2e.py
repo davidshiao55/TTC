@@ -86,6 +86,12 @@ def main() -> None:
     parser.add_argument("--cots-f-cpu-store", type=float, default=0.0)
     parser.add_argument("--cots-f-prefetch", type=float, default=0.0)
     parser.add_argument(
+        "--cots-weight-modules",
+        nargs="+",
+        default=None,
+        help="COTS weight modules to offload, e.g. qkv mlp or qkv mlp wo.",
+    )
+    parser.add_argument(
         "--cots-auto-graph-split",
         choices=["auto", "true", "false"],
         default="auto",
@@ -145,6 +151,8 @@ def main() -> None:
             cots_f_cpu_store=args.cots_f_cpu_store,
             cots_f_prefetch=args.cots_f_prefetch,
         )
+        if args.cots_weight_modules is not None:
+            engine_kwargs["cots_weight_modules"] = args.cots_weight_modules
     if args.cots_auto_graph_split != "auto":
         engine_kwargs["cots_auto_graph_split"] = (
             args.cots_auto_graph_split == "true"

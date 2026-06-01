@@ -1,7 +1,8 @@
 """Phase 1b §2 — Per-bucket prefetch geometry on `CotsLinearHandle`.
 
-Validates `apply_prefetch_split_per_bucket` for the three kinds (qkv / col /
-row). Maps to `weight_offload_design.md §Tensor Granularity` and
+Validates `apply_prefetch_split_per_bucket` for the COTS linear roles
+(qkv / mlp_gate_up / mlp_down). Maps to
+`weight_offload_design.md §Tensor Granularity` and
 `planner_design.md §4.2`.
 
 Per-bucket geometry must satisfy:
@@ -10,9 +11,10 @@ Per-bucket geometry must satisfy:
   * Disjoint subsets — no double-routing of any output column.
   * For `qkv`: prefetch is the contiguous prefix of cpu_indices in
     `[Q_tail | K | V]` order; spills into K/V at high f_prefetch.
-  * For `col`: prefetch picks the FIRST `n_prefetch_per_half` of each half's
-    CPU range — preserves the matched-index invariant with paired row.
-  * For matched col↔row pair under uniform `f_prefetch`:
+  * For `mlp_gate_up`: prefetch picks the FIRST `n_prefetch_per_half` of each
+    half's CPU range — preserves the matched-index invariant with paired
+    `mlp_down`.
+  * For matched MLP output-split/input-split pair under uniform `f_prefetch`:
     `gu.n_prefetch_by_bucket[b] // 2 == dn.n_prefetch_by_bucket[b]`.
 """
 
@@ -22,6 +24,9 @@ import torch.nn as nn
 
 from vllm.model_executor.offloader.cots import (
     CotsLinearHandle,
+    MLP_DOWN_ROLE,
+    MLP_GATE_UP_ROLE,
+    QKV_ROLE,
     _complement,
     _qkv_kv_biased_counts,
     _qkv_kv_biased_indices,
@@ -60,7 +65,8 @@ def _make_qkv(n_cpu_raw, q_size=Q_SIZE_7B, kv_size=KV_SIZE_7B,
     linear = _fake_linear(out_dim, in_dim)
     cpu_indices = _qkv_kv_biased_indices(q_size, kv_size, n_cpu, head_dim=head_dim)
     handle = CotsLinearHandle(
-        kind="qkv", linear=linear, qualified_name="qkv.test",
+        role=QKV_ROLE,
+        linear=linear, qualified_name="qkv.test",
         in_dim=in_dim, out_dim=out_dim, n_cpu=n_cpu,
         cpu_indices=cpu_indices, gpu_indices=_complement(cpu_indices, out_dim),
         dtype=torch.bfloat16, q_size=q_size, kv_size=kv_size, head_dim=head_dim,
@@ -76,7 +82,8 @@ def _make_col(n_cpu_per_half, half=INTERMEDIATE_7B, in_dim=HIDDEN_7B):
     base = torch.arange(half - n_cpu_per_half, half, dtype=torch.long)
     cpu_indices = torch.cat([base, base + half])
     handle = CotsLinearHandle(
-        kind="col", linear=linear, qualified_name="col.test",
+        role=MLP_GATE_UP_ROLE,
+        linear=linear, qualified_name="col.test",
         in_dim=in_dim, out_dim=out_dim, n_cpu=n_cpu,
         cpu_indices=cpu_indices, gpu_indices=_complement(cpu_indices, out_dim),
         dtype=torch.bfloat16, merged_partition_sizes=(half, half),
@@ -89,7 +96,8 @@ def _make_row(n_cpu, in_dim=INTERMEDIATE_7B, out_dim=HIDDEN_7B):
     linear = _fake_linear(out_dim, in_dim)
     cpu_indices = torch.arange(in_dim - n_cpu, in_dim, dtype=torch.long)
     handle = CotsLinearHandle(
-        kind="row", linear=linear, qualified_name="row.test",
+        role=MLP_DOWN_ROLE,
+        linear=linear, qualified_name="row.test",
         in_dim=in_dim, out_dim=out_dim, n_cpu=n_cpu,
         cpu_indices=cpu_indices, gpu_indices=_complement(cpu_indices, in_dim),
         dtype=torch.bfloat16,
@@ -271,13 +279,13 @@ def test_empty_table_yields_zero_max_n_prefetch():
 # ---------------------------------------------------------------------------
 # Phase 1a regression: f_prefetch=0 across all buckets degenerates correctly
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("kind", ["qkv", "col", "row"])
-def test_zero_f_prefetch_yields_no_prefetch(kind):
+@pytest.mark.parametrize("role", [QKV_ROLE, MLP_GATE_UP_ROLE, MLP_DOWN_ROLE])
+def test_zero_f_prefetch_yields_no_prefetch(role):
     """f_prefetch=0 → n_prefetch=0, cpu_compute_indices == cpu_indices.
     Phase 1a regression sentinel."""
-    if kind == "qkv":
+    if role == QKV_ROLE:
         handle = _make_qkv(round(0.10 * QKV_OUT_7B))
-    elif kind == "col":
+    elif role == MLP_GATE_UP_ROLE:
         handle = _make_col(n_cpu_per_half=1024)
     else:
         handle = _make_row(n_cpu=1024)

@@ -20,6 +20,9 @@ import torch.nn as nn
 from vllm.model_executor.offloader.cots import (
     CotsLinearHandle,
     CotsPrefetchBufferPool,
+    INPUT_SPLIT_AXIS,
+    MLP_DOWN_ROLE,
+    MLP_GATE_UP_ROLE,
     WeightPrefetchStreamer,
     _complement,
 )
@@ -48,7 +51,8 @@ def _make_col(layer_idx, n_cpu_per_half=64, half=INTERMEDIATE, in_dim=HIDDEN):
     base = torch.arange(half - n_cpu_per_half, half, dtype=torch.long)
     cpu_indices = torch.cat([base, base + half])
     h = CotsLinearHandle(
-        kind="col", linear=linear, qualified_name=f"layer{layer_idx}.col",
+        role=MLP_GATE_UP_ROLE,
+        linear=linear, qualified_name=f"layer{layer_idx}.col",
         in_dim=in_dim, out_dim=out_dim, n_cpu=n_cpu,
         cpu_indices=cpu_indices, gpu_indices=_complement(cpu_indices, out_dim),
         dtype=DTYPE, merged_partition_sizes=(half, half),
@@ -63,7 +67,8 @@ def _make_row(layer_idx, n_cpu=64, in_dim=INTERMEDIATE, out_dim=HIDDEN):
     linear = _fake_linear(out_dim, in_dim)
     cpu_indices = torch.arange(in_dim - n_cpu, in_dim, dtype=torch.long)
     h = CotsLinearHandle(
-        kind="row", linear=linear, qualified_name=f"layer{layer_idx}.row",
+        role=MLP_DOWN_ROLE,
+        linear=linear, qualified_name=f"layer{layer_idx}.row",
         in_dim=in_dim, out_dim=out_dim, n_cpu=n_cpu,
         cpu_indices=cpu_indices, gpu_indices=_complement(cpu_indices, in_dim),
         dtype=DTYPE,
@@ -102,15 +107,11 @@ def _setup_layers(n_layers=4, table=None):
 
 # ---------------------------------------------------------------------------
 def test_start_h2d_copies_correct_bytes():
-    """`start(layer_idx, handles)` populates the slot per kind:
-      qkv : slot[:n] == w_cpu[:n]                  (contiguous prefix)
-      col : slot[:n//2] == w_cpu[:n//2]            (gate prefix)
-            slot[n//2:n] == w_cpu[n_cpu_per_half_total : n_cpu_per_half_total+n//2]
-                                                   (up prefix — matched-index)
-      row : slot[:n, :] == w_cpu[:n, :]            (Stage 7-C unified
-                                                   transposed source —
-                                                   contiguous narrow on
-                                                   dim 0)
+    """`start(layer_idx, handles)` populates the slot per role:
+      mlp_gate_up : slot[:n//2] == w_cpu[:n//2]
+                    slot[n//2:n] == up-half prefix
+      mlp_down    : slot[:n, :] == w_cpu[:n, :]
+                    (Stage 7-C unified transposed source)
     """
     layers, streamer = _setup_layers(n_layers=4, table={1: (0.20, 0.20)})
 
@@ -125,25 +126,23 @@ def test_start_h2d_copies_correct_bytes():
     for h in layers[0]:
         n = h.n_prefetch_by_bucket[1]
         slot = h.w_prefetch_slots[h.slot_idx]
-        if h.kind == "row":
+        if h.split_axis == INPUT_SPLIT_AXIS:
             # Stage 7-C: row w_cpu is (n_cpu, out_dim) transposed
             # storage. Slot prefix matches w_cpu prefix directly —
             # no `.T` step.
             dst = slot.narrow(0, 0, n).cpu()
             src = h.w_cpu[:n, :].cpu()
             assert torch.equal(dst, src), f"row H2D mismatch on {h.qualified_name}"
-        elif h.kind == "col":
-            # Fixed-max layout: gate at `[0:max_half]`, up at
-            # `[max_half:2*max_half]`. Active bucket consumes the
-            # per-half prefix `[:n_per_half]` of each region.
+        elif h.role == MLP_GATE_UP_ROLE:
+            # Active-adjacent layout: gate at `[0:n_per_half]`, up at
+            # `[n_per_half:2*n_per_half]`.
             n_per_half = n // 2
-            max_half = h.max_n_prefetch // 2
             n_cpu_per_half_total = h.n_cpu // 2
             assert torch.equal(
                 slot[:n_per_half, :].cpu(), h.w_cpu[:n_per_half, :].cpu()
             ), f"col gate prefix mismatch on {h.qualified_name}"
             assert torch.equal(
-                slot[max_half : max_half + n_per_half, :].cpu(),
+                slot[n_per_half:n, :].cpu(),
                 h.w_cpu[
                     n_cpu_per_half_total : n_cpu_per_half_total + n_per_half, :
                 ].cpu(),
@@ -151,7 +150,9 @@ def test_start_h2d_copies_correct_bytes():
         else:
             dst = slot.narrow(0, 0, n).cpu()
             src = h.w_cpu.narrow(0, 0, n).cpu()
-            assert torch.equal(dst, src), f"qkv H2D mismatch on {h.qualified_name}"
+            assert torch.equal(dst, src), (
+                f"output-split H2D mismatch on {h.qualified_name}"
+            )
 
 
 def test_start_records_copy_done_event():
@@ -242,11 +243,12 @@ def test_set_current_bucket_drives_h2d_size():
 
 def test_available_rows_records_active_bucket():
     """After start() H2Ds, prefetch_available_rows_in_slot[slot_idx] equals
-    the per-half row count for col handles or the total prefix row count
-    for qkv/row. Initialized to 0; only the targeted slot is touched."""
+    the per-half row count for MLP gate/up handles or the total prefix row
+    count for input/output-split handles. Initialized to 0; only the targeted
+    slot is touched."""
     table = {1: (0.05, 0.05), 64: (0.20, 0.20)}
     layers, streamer = _setup_layers(n_layers=4, table=table)
-    h = layers[0][0]  # col handle (gate_up)
+    h = layers[0][0]  # MLP gate/up handle
     # Slots initialize with available_rows == 0 for all K slots.
     assert h.prefetch_available_rows_in_slot == [0, 0]
 
@@ -254,7 +256,7 @@ def test_available_rows_records_active_bucket():
     streamer.start(0, layers[0])
     streamer.copy_stream.synchronize()
     n_64 = h.n_prefetch_by_bucket[64]
-    expected = n_64 // 2 if h.kind == "col" else n_64
+    expected = n_64 // 2 if h.role == MLP_GATE_UP_ROLE else n_64
     assert h.prefetch_available_rows_in_slot[h.slot_idx] == expected
     assert h.prefetch_owner_in_slot[h.slot_idx] is h
     # The OTHER slot is still empty.
@@ -278,7 +280,7 @@ def test_available_rows_preserved_across_no_op_start():
     streamer.start(0, layers[0])
     streamer.copy_stream.synchronize()
     expected_64 = (
-        h.n_prefetch_by_bucket[64] // 2 if h.kind == "col"
+        h.n_prefetch_by_bucket[64] // 2 if h.role == MLP_GATE_UP_ROLE
         else h.n_prefetch_by_bucket[64]
     )
     assert h.prefetch_available_rows_in_slot[h.slot_idx] == expected_64

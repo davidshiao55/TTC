@@ -17,6 +17,7 @@ from config import FastTTSConfig, SearchConfig
 
 
 EngineRole = Literal["generator", "verifier"]
+VALID_WEIGHT_MODULES = frozenset({"qkv", "mlp", "wo"})
 
 
 def _bytes_to_gib(value: int | float) -> float:
@@ -69,6 +70,25 @@ def _normalize_thread_table(raw: Mapping[Any, Any] | None) -> dict[int, int] | N
     return table
 
 
+def _normalize_weight_modules(raw: Any) -> set[str] | None:
+    if raw is None:
+        return None
+    entries = (raw,) if isinstance(raw, str) else raw
+    modules: set[str] = set()
+    for entry in entries:
+        for module in str(entry).split(","):
+            module = module.strip().lower()
+            if module:
+                modules.add(module)
+    unknown = modules - VALID_WEIGHT_MODULES
+    if unknown:
+        raise ValueError(
+            f"weight.modules contains unsupported entries {sorted(unknown)}; "
+            f"expected subset of {sorted(VALID_WEIGHT_MODULES)}"
+        )
+    return modules
+
+
 def weight_thread_count_for_score(score: float) -> int:
     """Map bucket × CPU-compute fraction to the CPU GEMM thread count.
 
@@ -98,6 +118,7 @@ class WeightPlacementPlan:
     f_cpu_store: float = 0.0
     f_prefetch: float = 0.0
     dispatch_table: dict[int, tuple[float, float]] | None = None
+    modules: set[str] | None = None
     cpu_num_threads: int | None = None
     cpu_num_threads_by_bucket: dict[int, int] | None = None
     backend: Literal["auto", "cots"] = "auto"
@@ -126,6 +147,12 @@ class WeightPlacementPlan:
         dispatch_table = _normalize_dispatch_table(
             raw.get("dispatch_table", defaults.get("cots_dispatch_table"))
         )
+        modules = _normalize_weight_modules(
+            raw.get(
+                "modules",
+                raw.get("weight_modules", defaults.get("cots_weight_modules")),
+            )
+        )
         cpu_num_threads_raw = raw.get(
             "cpu_num_threads", defaults.get("cots_cpu_num_threads")
         )
@@ -149,6 +176,7 @@ class WeightPlacementPlan:
             f_cpu_store=f_cpu_store,
             f_prefetch=f_prefetch,
             dispatch_table=dispatch_table,
+            modules=modules,
             cpu_num_threads=cpu_num_threads,
             cpu_num_threads_by_bucket=cpu_num_threads_by_bucket,
             backend=backend,
@@ -182,6 +210,13 @@ class WeightPlacementPlan:
                         "cpu_num_threads_by_bucket values must be positive, "
                         f"got {n_threads} for bucket {bucket}"
                     )
+        if self.modules is not None:
+            unknown = self.modules - VALID_WEIGHT_MODULES
+            if unknown:
+                raise ValueError(
+                    f"weight.modules contains unsupported entries "
+                    f"{sorted(unknown)}"
+                )
         if self.dispatch_table is None:
             return
         for bucket, (f_cpu_compute, f_prefetch) in self.dispatch_table.items():
@@ -322,6 +357,8 @@ class EnginePlan:
             overrides["cots_f_prefetch"] = self.weight.f_prefetch
             if self.weight.dispatch_table is not None:
                 overrides["cots_dispatch_table"] = self.weight.dispatch_table
+            if self.weight.modules is not None:
+                overrides["cots_weight_modules"] = self.weight.modules
             if self.weight.cpu_num_threads is not None:
                 overrides["cots_cpu_num_threads"] = self.weight.cpu_num_threads
             if self.weight.cpu_num_threads_by_bucket is not None:

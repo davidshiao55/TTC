@@ -63,8 +63,10 @@ for Qwen/Qwen2.5-7B-Instruct BF16 on the RTX 4090 target.
 
 The production path is:
 
-- Store a static CPU slice of QKV, MLP gate/up, and MLP down weights.
-- Leave `o_proj` GPU-resident.
+- Store a static CPU slice of QKV, MLP gate/up, and MLP down weights by
+  default.
+- Leave `o_proj` GPU-resident by default; expose it only as an opt-in
+  `cots_weight_modules={"wo"}` forced-fit/experiment path.
 - Dispatch each bucket across three paths:
   GPU-resident compute, layer-ahead prefetched GPU compute, and CPU compute.
 - Use native C++ CPU tasks, not the old Python `ThreadPoolExecutor`, as the
@@ -87,6 +89,15 @@ Final outcome:
   neutral, not a win.
 - Larger offload fractions still lose throughput because the recurring per-token
   split-path cost rises faster than the useful KV admission gain.
+- A post-cleanup E2E WO-inclusion check confirmed `o_proj` should stay
+  GPU-resident: adding WO to graph-mode `prefetch_defer` cost about 5% latency
+  while saving only 0.024 GiB at one offloaded layer and 0.167 GiB at seven
+  offloaded layers.
+- The implemented COTS WO CPU-compute path is also unfavorable as a default:
+  with the current head-aligned WO snap, `f=0.01` selects zero WO rows and
+  behaves like no-WO, while `f=0.05` selects 128 WO rows and costs +7.24% at
+  B=1 and +33.25% at B=16 while adding only 0.024 GiB of extra CPU-stored WO
+  relief.
 
 ## Production Path
 
@@ -122,14 +133,15 @@ Removed or rejected from the supported surface:
 
 ### Storage And Placement
 
-COTS offloads only the Phase 1 target tensors:
+COTS offloads the default Phase 1 target tensors, with WO exposed only as an
+opt-in experiment path:
 
 | Module | Split axis | Production behavior |
 |---|---|---|
 | `qkv_proj` | output columns | K/V-biased, head-aligned CPU slice |
 | `gate_up_proj` | output columns | matched gate/up half-channel slice, snapped to 64 |
 | `down_proj` | input columns | matched MLP intermediate slice, snapped to 64 |
-| `o_proj` | none | fully GPU-resident |
+| `o_proj` | output columns, opt-in | GPU-resident by default; head-aligned dense split when enabled |
 
 The storage split is TP-style at load time: each wrapped parameter's
 `param.data` is replaced with the GPU-resident slice before weight loading, and
@@ -186,8 +198,8 @@ Properties:
 
 - K=2 slot rotation is the minimum safe slot count for overlapping layer `i+1`
   H2D with layer `i` compute.
-- Slots are allocated per unique shape, not per layer, so the pool is shared
-  across all layers with the same kind/shape.
+- Slots are allocated per unique role/shape, not per layer, so the pool is
+  shared across all layers with the same role and storage shape.
 - Wraparound is implicit: layer `N-1` starts layer `0` for the next iteration.
 - The old COTS-specific deferred-wraparound machinery is not used.
 - Layer-0 priming is lazy and active-bucket aware. We do not post-init max-fill
@@ -499,7 +511,8 @@ rejected Phase 1 probe paths forward:
 - pure-prefetch and CPU-compute paths both have clean zero-work fast paths;
 - diagnostics are explicit and env-gated.
 
-The open Planner work is to emit module-specific dispatch rather than uniform
-fractions when needed: MLP-first CPU compute at low batch, prefetch-heavy or
-pure-prefetch at high batch, and QKV CPU compute only when a future profile
-proves the first head pair is no longer exposed.
+The open Planner work is to emit the production module set and per-bucket
+dispatch from profile data: default `qkv,mlp`, WO only when memory pressure
+justifies its measured latency/parity cost, MLP-first CPU compute at low batch,
+prefetch-heavy or pure-prefetch at high batch, and QKV CPU compute only when a
+future profile proves the first head pair is no longer exposed.

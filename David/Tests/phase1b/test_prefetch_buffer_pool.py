@@ -1,12 +1,12 @@
 """Phase 1b §3 — `CotsPrefetchBufferPool` slot allocation.
 
 Validates K=2 slot rotation and per-handle slot shape matching `w_cpu`'s
-prefetched-portion layout. Per-kind shape:
-  col / qkv : `(max_n_prefetch, in_dim)`     — narrow(0, ...) contiguous
-  row       : `(max_n_prefetch, out_dim)`    — narrow(0, ...) contiguous
-                                               (Phase 1b row-prefetch fix:
-                                                transposed vs `w_cpu` to
-                                                avoid pitched H2D)
+prefetched-portion layout. Per split shape:
+  output split : `(max_n_prefetch, in_dim)`   — narrow(0, ...) contiguous
+  input split  : `(max_n_prefetch, out_dim)`  — narrow(0, ...) contiguous
+                                                 (Phase 1b row-prefetch fix:
+                                                  transposed vs `w_cpu` to
+                                                  avoid pitched H2D)
 """
 
 import pytest
@@ -16,6 +16,9 @@ import torch.nn as nn
 from vllm.model_executor.offloader.cots import (
     CotsLinearHandle,
     CotsPrefetchBufferPool,
+    MLP_DOWN_ROLE,
+    MLP_GATE_UP_ROLE,
+    QKV_ROLE,
     _complement,
     _qkv_kv_biased_counts,
     _qkv_kv_biased_indices,
@@ -50,7 +53,8 @@ def _qkv_handle(n_cpu_raw=round(0.30 * QKV_OUT)):
     linear = _fake_linear(QKV_OUT, HIDDEN)
     cpu_indices = _qkv_kv_biased_indices(Q_SIZE, KV_SIZE, n_cpu, head_dim=HEAD_DIM)
     h = CotsLinearHandle(
-        kind="qkv", linear=linear, qualified_name="qkv",
+        role=QKV_ROLE,
+        linear=linear, qualified_name="qkv",
         in_dim=HIDDEN, out_dim=QKV_OUT, n_cpu=n_cpu,
         cpu_indices=cpu_indices, gpu_indices=_complement(cpu_indices, QKV_OUT),
         dtype=DTYPE, q_size=Q_SIZE, kv_size=KV_SIZE, head_dim=HEAD_DIM,
@@ -66,7 +70,8 @@ def _col_handle(n_cpu_per_half=1024, half=INTERMEDIATE):
     base = torch.arange(half - n_cpu_per_half, half, dtype=torch.long)
     cpu_indices = torch.cat([base, base + half])
     h = CotsLinearHandle(
-        kind="col", linear=linear, qualified_name="col",
+        role=MLP_GATE_UP_ROLE,
+        linear=linear, qualified_name="col",
         in_dim=HIDDEN, out_dim=out_dim, n_cpu=n_cpu,
         cpu_indices=cpu_indices, gpu_indices=_complement(cpu_indices, out_dim),
         dtype=DTYPE, merged_partition_sizes=(half, half),
@@ -80,7 +85,8 @@ def _row_handle(n_cpu=1024, in_dim=INTERMEDIATE):
     linear = _fake_linear(out_dim, in_dim)
     cpu_indices = torch.arange(in_dim - n_cpu, in_dim, dtype=torch.long)
     h = CotsLinearHandle(
-        kind="row", linear=linear, qualified_name="row",
+        role=MLP_DOWN_ROLE,
+        linear=linear, qualified_name="row",
         in_dim=in_dim, out_dim=out_dim, n_cpu=n_cpu,
         cpu_indices=cpu_indices, gpu_indices=_complement(cpu_indices, in_dim),
         dtype=DTYPE,
@@ -104,8 +110,8 @@ def test_pool_allocates_k2_slots_per_handle():
         assert len(h.w_prefetch_slots) == CotsPrefetchBufferPool.K == 2
 
 
-def test_slot_shape_matches_kind_layout():
-    """col/qkv slot is `(max_n_prefetch, in_dim)`; row slot is
+def test_slot_shape_matches_split_layout():
+    """Output-split slot is `(max_n_prefetch, in_dim)`; input-split slot is
     `(max_n_prefetch, out_dim)` — matches Stage 7-C's unified
     transposed `w_cpu` layout so the H2D source `w_cpu.narrow(0, 0,
     n_pref)` and the slot destination both narrow on dim 0 and are
@@ -142,8 +148,9 @@ def test_slots_are_distinct_buffers():
 
 def test_total_bytes_matches_layout():
     """K * Σ_unique_shape (slot_numel) * dtype_bytes — slots are shared
-    across handles with the same (kind, slot_shape). Three distinct shapes
-    here (qkv / col / row) → three groups, each contributing K=2 slots."""
+    across handles with the same (role, slot_shape). Three distinct shapes
+    here (qkv / mlp_gate_up / mlp_down) → three groups, each contributing K=2
+    slots."""
     qkv = _qkv_handle()
     col = _col_handle()
     row = _row_handle()
@@ -163,7 +170,7 @@ def test_total_bytes_matches_layout():
 
 
 def test_slots_are_shared_across_layers_with_same_shape():
-    """Two handles of the same (kind, slot_shape) — e.g., qkv handles from
+    """Two handles of the same (role, slot_shape) — e.g., qkv handles from
     different decoder layers — must SHARE the K slot views. Slot rotation
     happens at the handle level via `slot_idx = layer_idx % K`. This is
     the load-bearing shape-grouping behavior that mirrors native
@@ -174,8 +181,8 @@ def test_slots_are_shared_across_layers_with_same_shape():
     table = {1: (0.10, 0.10)}
     qkv0.apply_prefetch_split_per_bucket(table)
     qkv1.apply_prefetch_split_per_bucket(table)
-    # Same (kind, max_n_prefetch, in_dim) → must share slots.
-    assert qkv0.kind == qkv1.kind
+    # Same (role, max_n_prefetch, in_dim) → must share slots.
+    assert qkv0.role == qkv1.role
     assert qkv0.max_n_prefetch == qkv1.max_n_prefetch
     assert qkv0.in_dim == qkv1.in_dim
 
@@ -254,7 +261,7 @@ def test_empty_pool_is_legal():
 def test_runtime_narrow_works_at_smaller_buckets():
     """Phase 1b runtime path narrows the slot view to the active bucket's
     `n_prefetch_by_bucket[b]`. Smoke-test that narrow returns a view of the
-    expected shape for both kinds of layout."""
+    expected shape for both split-axis layouts."""
     qkv = _qkv_handle()
     row = _row_handle()
     # Build a table with one large bucket and one small bucket — qkv guard
@@ -265,26 +272,31 @@ def test_runtime_narrow_works_at_smaller_buckets():
 
     CotsPrefetchBufferPool([qkv, row], torch.device("cuda"))
 
-    # Narrow at smaller bucket (1) for col/qkv → narrow on dim 0.
+    # Output split → narrow on dim 0.
     n_pref_64 = qkv.n_prefetch_by_bucket[64]
     narrowed = qkv.w_prefetch_slots[0].narrow(0, 0, n_pref_64)
     assert tuple(narrowed.shape) == (n_pref_64, qkv.in_dim)
 
-    # Row → narrow on dim 0 (Phase 1b row-prefetch fix: transposed slot).
+    # Input split → narrow on dim 0 (Phase 1b row-prefetch fix:
+    # transposed slot).
     n_pref_64_row = row.n_prefetch_by_bucket[64]
     narrowed_row = row.w_prefetch_slots[0].narrow(0, 0, n_pref_64_row)
     assert tuple(narrowed_row.shape) == (n_pref_64_row, row.out_dim)
 
 
 def test_h2d_copy_into_slot_smoke():
-    """End-to-end smoke: pinned CPU source → GPU slot via copy_. col/qkv
-    use the contiguous narrow(0, ...) on `w_cpu`. Row also uses
-    `w_cpu.narrow(0, ...)` — Stage 7-C flipped row-handle storage
-    to transposed `(n_cpu, out_dim)` so the prefetch source is the
-    same buffer as the CPU-compute source (no duplicate)."""
+    """End-to-end smoke: pinned CPU source → GPU slot via copy_.
+
+    Output-split handles use contiguous narrow(0, ...) on `w_cpu`. Input-split
+    handles also use `w_cpu.narrow(0, ...)` because Stage 7-C flipped
+    row-handle storage to transposed `(n_cpu, out_dim)`, so the prefetch source
+    is the same buffer as the CPU-compute source.
+    """
     col = _col_handle(n_cpu_per_half=64, half=128)  # small for fast test
     row = _row_handle(n_cpu=64, in_dim=128)
-    table = {1: (0.20, 0.10)}
+    # Synthetic dims are small; use a fraction that crosses the 64-channel
+    # snap grid so this remains an actual H2D slot smoke.
+    table = {1: (0.0, 0.50)}
     for h in (col, row):
         h.apply_prefetch_split_per_bucket(table)
 

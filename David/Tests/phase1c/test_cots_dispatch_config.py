@@ -4,6 +4,34 @@ from vllm.config import CotsOffloadConfig, OffloadConfig
 from vllm.model_executor.offloader.base import create_offloader
 
 
+def test_cots_weight_modules_default_to_qkv_mlp():
+    assert CotsOffloadConfig().weight_modules == {"qkv", "mlp"}
+
+
+def test_cots_weight_modules_accept_list_and_comma_separated_forms():
+    assert CotsOffloadConfig(weight_modules="qkv,wo").weight_modules == {
+        "qkv",
+        "wo",
+    }
+    assert CotsOffloadConfig(weight_modules={"qkv,wo"}).weight_modules == {
+        "qkv",
+        "wo",
+    }
+    assert CotsOffloadConfig(weight_modules=["qkv", "wo"]).weight_modules == {
+        "qkv",
+        "wo",
+    }
+    assert CotsOffloadConfig(weight_modules={"QKV", "mlp"}).weight_modules == {
+        "qkv",
+        "mlp",
+    }
+
+
+def test_cots_weight_modules_reject_unknown_entries():
+    with pytest.raises(ValueError, match="unsupported entries"):
+        CotsOffloadConfig(weight_modules={"qkv", "attn"})
+
+
 def test_cots_dispatch_table_config_accepts_valid_entries():
     cots = CotsOffloadConfig(
         f_cpu_store=0.10,

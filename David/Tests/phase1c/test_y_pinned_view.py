@@ -49,7 +49,7 @@ def _populate_qkv_slab_directly(
 ) -> None:
     """Reach into the registry and populate task_id directly. Used for
     the test fixtures here so we don't need to go through
-    `_NativeWeightSlabSpecQkv` machinery."""
+    `_NativeWeightSlabSpecLinear` machinery."""
     from vllm.model_executor.offloader import cots_ops
 
     infer = cots_ops.lookup_weight_runner(runner_id, "test_y_pinned_view")

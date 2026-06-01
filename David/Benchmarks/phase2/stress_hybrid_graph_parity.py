@@ -47,6 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpu-pool-gb", type=float, default=1.0)
     parser.add_argument("--cots-f-cpu-store", type=float, default=0.0)
     parser.add_argument("--cots-f-prefetch", type=float, default=0.0)
+    parser.add_argument(
+        "--cots-weight-modules",
+        nargs="+",
+        default=None,
+        help="COTS weight modules to pass to the single-run parity probe.",
+    )
     parser.add_argument("--hybrid-enforce-eager", choices=["true", "false"], default="false")
     parser.add_argument("--out-dir", default="/tmp/phase2_graph_stress")
     parser.add_argument("--summary-json", default="/tmp/phase2_graph_stress_summary.json")
@@ -105,6 +111,8 @@ def run_one(args: argparse.Namespace, *, batch: int, repeat_idx: int) -> dict[st
         "--summary-json",
         str(summary_json),
     ]
+    if args.cots_weight_modules is not None:
+        cmd.extend(["--cots-weight-modules", *args.cots_weight_modules])
     env = os.environ.copy()
     env["PYTHONPATH"] = str(THIS_DIR) + os.pathsep + env.get("PYTHONPATH", "")
     if args.disable_compile_cache:
