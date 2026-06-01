@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 
 TTC_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(TTC_ROOT / "FastTTS-thesis"))
@@ -8,7 +10,156 @@ sys.path.insert(0, str(TTC_ROOT / "FastTTS-thesis" / "benchmarks"))
 
 from config import FastTTSConfig, SearchConfig  # noqa: E402
 from benchmark_config import build_benchmark_config_from_yaml  # noqa: E402
-from planner import ManualTTCPlanner, apply_ttc_plan_to_config  # noqa: E402
+from planner import (  # noqa: E402
+    DispatchProblem,
+    ManualTTCPlanner,
+    apply_ttc_plan_to_config,
+    derive_weight_thread_policy,
+    solve_per_bucket_dispatch,
+)
+
+
+class SyntheticDispatchProfile:
+    """Tiny profile fixture for exercising the dispatch performance model."""
+
+    def __init__(
+        self,
+        *,
+        gpu_full_ms_by_bucket,
+        cpu_full_ms_by_bucket,
+        h2d_ms_per_byte,
+        attention_gpu_ms_by_bucket=None,
+        attention_cpu_ms_by_bucket=None,
+        overhead_ms=0.0,
+    ):
+        self.gpu_full_ms_by_bucket = gpu_full_ms_by_bucket
+        self.cpu_full_ms_by_bucket = cpu_full_ms_by_bucket
+        self.h2d_ms_per_byte = h2d_ms_per_byte
+        self.attention_gpu_ms_by_bucket = attention_gpu_ms_by_bucket or {}
+        self.attention_cpu_ms_by_bucket = attention_cpu_ms_by_bucket or {}
+        self._overhead_ms = overhead_ms
+
+    def gpu_op_ms(self, op, bucket, gpu_fraction):
+        if op == "attention":
+            return self.attention_gpu_ms_by_bucket.get(bucket, 0.0) * gpu_fraction
+        return self.gpu_full_ms_by_bucket[bucket] * gpu_fraction
+
+    def cpu_op_ms(self, op, bucket, cpu_fraction):
+        if op == "attention":
+            return self.attention_cpu_ms_by_bucket.get(bucket, 0.0) * cpu_fraction
+        return self.cpu_full_ms_by_bucket[bucket] * cpu_fraction
+
+    def h2d_ms(self, transfer_bytes):
+        return transfer_bytes * self.h2d_ms_per_byte
+
+    def overhead_ms(self, bucket, f_cpu, f_prefetch):
+        return self._overhead_ms
+
+
+def _two_weight_op_problem(*, buckets=(1, 64), f_cpu_store=0.2):
+    return DispatchProblem(
+        buckets=buckets,
+        f_cpu_store=f_cpu_store,
+        num_layers=1,
+        layer_ops=("qkv", "mlp1"),
+        weight_bytes_per_layer={"qkv": 1000, "mlp1": 1000},
+        candidate_f_cpu=(0.0, 0.1, 0.2),
+    )
+
+
+def test_dispatch_solver_chooses_cpu_for_small_and_prefetch_for_large_bucket():
+    problem = _two_weight_op_problem()
+    profile = SyntheticDispatchProfile(
+        gpu_full_ms_by_bucket={1: 10.0, 64: 20.0},
+        cpu_full_ms_by_bucket={1: 20.0, 64: 300.0},
+        h2d_ms_per_byte=0.02,
+    )
+
+    result = solve_per_bucket_dispatch(problem, profile)
+
+    assert result.dispatch_table == {
+        1: (0.2, 0.0),
+        64: (0.0, 0.2),
+    }
+    assert result.entries[1].predicted_ms == 16.0
+    assert result.entries[64].predicted_ms == 40.0
+    assert result.entries[1].bottleneck == "compute"
+    assert result.entries[64].bottleneck == "compute"
+    assert len(result.candidate_scores[1]) == 3
+    assert derive_weight_thread_policy(result.dispatch_table) == {
+        1: 16,
+        64: 4,
+    }
+
+
+def test_dispatch_solver_slow_pcie_moves_solution_toward_cpu_compute():
+    problem = _two_weight_op_problem(buckets=(64,))
+    profile = SyntheticDispatchProfile(
+        gpu_full_ms_by_bucket={64: 20.0},
+        cpu_full_ms_by_bucket={64: 300.0},
+        h2d_ms_per_byte=0.20,
+    )
+
+    result = solve_per_bucket_dispatch(problem, profile)
+    entry = result.entries[64]
+
+    assert entry.f_cpu == 0.1
+    assert entry.f_prefetch == 0.1
+    assert entry.predicted_ms == 60.0
+    assert entry.f_cpu + entry.f_prefetch == problem.f_cpu_store
+
+
+def test_dispatch_solver_attention_window_can_shift_weight_dispatch_to_prefetch():
+    no_attention = DispatchProblem(
+        buckets=(8,),
+        f_cpu_store=0.2,
+        num_layers=1,
+        layer_ops=("qkv",),
+        weight_bytes_per_layer={"qkv": 1000},
+        candidate_f_cpu=(0.0, 0.1, 0.2),
+    )
+    with_attention = DispatchProblem(
+        buckets=(8,),
+        f_cpu_store=0.2,
+        num_layers=1,
+        layer_ops=("qkv", "attention"),
+        weight_bytes_per_layer={"qkv": 1000},
+        candidate_f_cpu=(0.0, 0.1, 0.2),
+    )
+    profile = SyntheticDispatchProfile(
+        gpu_full_ms_by_bucket={8: 1.0},
+        cpu_full_ms_by_bucket={8: 50.0},
+        h2d_ms_per_byte=0.05,
+        attention_gpu_ms_by_bucket={8: 10.0},
+    )
+
+    no_attention_result = solve_per_bucket_dispatch(no_attention, profile)
+    with_attention_result = solve_per_bucket_dispatch(with_attention, profile)
+
+    assert no_attention_result.dispatch_table[8] == (0.1, 0.1)
+    assert with_attention_result.dispatch_table[8] == (0.0, 0.2)
+    assert (
+        with_attention_result.entries[8].f_prefetch
+        > no_attention_result.entries[8].f_prefetch
+    )
+
+
+def test_dispatch_solver_rejects_invalid_problem():
+    problem = DispatchProblem(
+        buckets=(1,),
+        f_cpu_store=1.2,
+        num_layers=1,
+        layer_ops=("qkv",),
+        weight_bytes_per_layer={"qkv": 1000},
+    )
+    profile = SyntheticDispatchProfile(
+        gpu_full_ms_by_bucket={1: 1.0},
+        cpu_full_ms_by_bucket={1: 1.0},
+        h2d_ms_per_byte=0.01,
+    )
+
+    with pytest.raises(ValueError, match="f_cpu_store"):
+        solve_per_bucket_dispatch(problem, profile)
 
 
 def test_manual_planner_applies_generator_and_verifier_overrides():

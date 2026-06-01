@@ -189,7 +189,7 @@ sources of variation contribute:
 Arithmetic intensity varies materially across these buckets:
 
 - Small `num_tokens` (pure decode, memory-BW-bound): GPU has idle time that CPU compute can hide in.
-- Large `num_tokens` (mixed prefill-decode, trending compute-bound): GPU saturates, no idle time — CPU compute adds to the critical path.
+- Large prefill or mixed prefill-decode calls (trending compute-bound): GPU saturates, no idle time — CPU compute often adds to the critical path.
 
 All three axes are visible to the runtime as a forward call's `num_tokens`.
 vLLM already captures one CUDA graph per `BatchDescriptor`, and the Planner
@@ -198,6 +198,18 @@ can lean more on CPU compute; a larger verifier step-scoring bucket may need to
 lean more on prefetch. A single fixed offloading strategy would waste one end
 of this range. The dispatch table is computed once at launch and consumed at
 O(1) per forward call — no runtime planning overhead.
+
+**Validation caveat: bucket is a shape proxy, not a semantic phase label.**
+The first dispatch-validation sweep forced one split across every captured
+bucket and made CPU compute look much worse than it is for decode: prefill
+buckets also used the CPU path, and prefill is where CPU work most easily
+becomes the bottleneck. A follow-up "decode-only" validation kept all non-decode
+buckets pure prefetch and varied only the measured decode bucket; that exposed
+a much larger CPU-compute regime. The Planner should therefore treat bucket
+profiles as phase-composition dependent. For v1, this can be approximated by
+setting prefill-heavy buckets prefetch-heavy and decode buckets independently.
+If prefill and decode routinely collide in the same captured bucket, extend the
+dispatch key from `BatchDescriptor` to `(BatchDescriptor, phase_class)`.
 
 ### Why per-model
 
@@ -552,8 +564,11 @@ Under layer-ahead prefetch and uniform `(f_cpu, f_prefetch)` across WQKV/MLP1/ML
 
 Per bucket:
 
-- **Small `num_tokens` (memory-BW-bound GPU)**: GPU has substantial idle time during weight fetches. CPU compute hides in that idle → maximize `f_cpu` up to the amount that fits the idle window.
-- **Large `num_tokens` (compute-bound GPU)**: GPU is saturated, no idle time → CPU compute adds to critical path. Shift to `f_prefetch` to keep weights on GPU at compute time.
+- **Decode-dominated buckets**: CPU compute can hide in the GPU decode window.
+  The solve may legitimately choose high `f_cpu`, even at moderate batch.
+- **Prefill-heavy or mixed buckets**: GPU compute is denser and CPU work is
+  more likely to become critical-path. Bias toward prefetch unless measured
+  profiles show a CPU slice still fits.
 
 For the first implementation, use a small snapped dispatch search:
 
@@ -580,6 +595,30 @@ slice that does not extend `C_layer` beyond the work that would already be on
 the critical path. Because CPU μs/MB is uniform across WQKV/MLP1/MLP2
 (`phase0_findings.md §0.3.4`), the CPU-fit approximation can use a single
 throughput constant once validated, not per-sub-module lookups.
+
+**Validation checkpoint (2026-06-01, Qwen2.5-7B-Instruct, graph mode,
+`input_len=8`, `output_len=32`).** The validation harness now supports
+`dispatch_layout=decode-only`: every non-decode bucket is fixed to pure
+prefetch, and only the measured decode bucket varies. This isolates the decode
+policy from prefill contamination. Under this isolation, pure CPU decode won
+through `f_cpu_store=0.40` for both B=16 and B=64:
+
+| decode B | `f_cpu_store` | pure prefetch | best hybrid | pure CPU decode | best |
+|---:|---:|---:|---:|---:|---|
+| 16 | 0.25 | 4.6601 s | 1.0027 s | 0.8751 s | pure CPU |
+| 16 | 0.30 | 5.5098 s | 1.1521 s | 0.9181 s | pure CPU |
+| 16 | 0.40 | 7.2146 s | 1.4892 s | 1.2517 s | pure CPU |
+| 64 | 0.25 | 4.6613 s | 1.1382 s | 0.9285 s | pure CPU |
+| 64 | 0.30 | 5.5381 s | 1.2236 s | 1.0127 s | pure CPU |
+| 64 | 0.40 | 7.3241 s | 1.5847 s | 1.1869 s | pure CPU |
+
+The same harness at `f_cpu_store=0.15` showed pure CPU decode at 0.7288 s
+(B=16) and 0.7921 s (B=64), while pure prefetch was ~2.8 s in both cases.
+A dry-run control made near-CPU hybrid and pure CPU essentially identical, so
+the remaining hybrid penalty comes from real H2D/prefetched-slice GPU work, not
+from dispatch-table or CUDA-graph control overhead. The immediate Planner rule
+is: do not infer "CPU is bad" from uniform prefill+decode sweeps; solve decode
+and prefill-heavy buckets separately from profiled phase-specific costs.
 
 **Layer-ahead prefetch feasibility check**: the total prefetch per layer is `f_prefetch × Σ_m W_m` (sum over {WQKV, MLP1, MLP2}). Cap `f_prefetch` if it exceeds `layer_time × pcie_h2d_bw`; excess falls back to `f_cpu`.
 

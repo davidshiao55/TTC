@@ -1,23 +1,25 @@
 #!/usr/bin/env python
 """Thin TTC planner interface for FastTTS.
 
-This module intentionally implements only the launch-time contract, not the
-final performance-model optimizer. FastTTS owns the two-engine memory decision
-and emits one engine-local plan per model. vLLM consumes each engine-local plan
-through normal engine kwargs and still owns tensor geometry, snapping, and
-runtime dispatch mechanics.
+This module implements the launch-time contract plus the first reference
+performance-model primitive: a per-bucket dispatch solver for fixed placement.
+FastTTS owns the two-engine memory decision and emits one engine-local plan per
+model. vLLM consumes each engine-local plan through normal engine kwargs and
+still owns tensor geometry, snapping, and runtime dispatch mechanics.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal, Mapping, Optional
+from typing import Any, Dict, Literal, Mapping, Optional, Protocol, Sequence
 
 from config import FastTTSConfig, SearchConfig
 
 
 EngineRole = Literal["generator", "verifier"]
 VALID_WEIGHT_MODULES = frozenset({"qkv", "mlp", "wo"})
+DEFAULT_DISPATCH_LAYER_OPS = ("qkv", "attention", "wo", "mlp1", "mlp2")
+DispatchBottleneck = Literal["compute", "prefetch"]
 
 
 def _bytes_to_gib(value: int | float) -> float:
@@ -109,6 +111,262 @@ def derive_weight_thread_policy(
         int(bucket): weight_thread_count_for_score(int(bucket) * f_cpu_compute)
         for bucket, (f_cpu_compute, _) in dispatch_table.items()
     }
+
+
+class DispatchProfileView(Protocol):
+    """Profile lookup interface consumed by the reference dispatch solver.
+
+    Real profiler JSON and synthetic unit-test fixtures can both implement this
+    shape. The solver deliberately asks for operation-level costs instead of
+    knowing how a table is stored on disk.
+    """
+
+    def gpu_op_ms(self, op: str, bucket: int, gpu_fraction: float) -> float:
+        """GPU-side current-layer time for one operation."""
+        ...
+
+    def cpu_op_ms(self, op: str, bucket: int, cpu_fraction: float) -> float:
+        """CPU-side current-layer time for one operation."""
+        ...
+
+    def h2d_ms(self, transfer_bytes: int) -> float:
+        """Layer-ahead H2D time for a prefetched weight bundle."""
+        ...
+
+
+@dataclass(frozen=True)
+class DispatchProblem:
+    """Fixed-placement per-bucket dispatch problem.
+
+    `f_cpu_store` is already chosen by the placement layer. This solver decides
+    how those CPU-resident bytes are used in each bucket:
+
+    * `f_cpu` is computed on CPU in the current layer.
+    * `f_prefetch = f_cpu_store - f_cpu` is streamed layer-ahead and computed on
+      GPU.
+
+    Weight operations use the dispatch variable. Non-weight operations such as
+    attention use `fixed_cpu_fractions_by_op`, because their split is controlled
+    by KV placement rather than by the weight-dispatch table.
+    """
+
+    buckets: Sequence[int]
+    f_cpu_store: float
+    num_layers: int
+    weight_bytes_per_layer: Mapping[str, int]
+    layer_ops: Sequence[str] = DEFAULT_DISPATCH_LAYER_OPS
+    candidate_f_cpu: Sequence[float] | None = None
+    candidate_step: float = 0.01
+    fixed_cpu_fractions_by_op: Mapping[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DispatchEntry:
+    """Selected or candidate dispatch score for one bucket."""
+
+    bucket: int
+    f_cpu: float
+    f_prefetch: float
+    predicted_ms: float
+    layer_ms: float
+    c_layer_ms: float
+    p_layer_ms: float
+    bottleneck: DispatchBottleneck
+
+
+@dataclass(frozen=True)
+class DispatchSolveResult:
+    """Reference dispatch-solver output plus scoring diagnostics."""
+
+    entries: dict[int, DispatchEntry]
+    candidate_scores: dict[int, tuple[DispatchEntry, ...]]
+
+    @property
+    def dispatch_table(self) -> dict[int, tuple[float, float]]:
+        return {
+            bucket: (entry.f_cpu, entry.f_prefetch)
+            for bucket, entry in self.entries.items()
+        }
+
+
+def _validate_fraction(name: str, value: float) -> float:
+    value = float(value)
+    if value < -1e-12 or value > 1.0 + 1e-12:
+        raise ValueError(f"{name} must be in [0, 1], got {value}")
+    return min(1.0, max(0.0, value))
+
+
+def _round_fraction(value: float) -> float:
+    value = round(float(value), 12)
+    return 0.0 if abs(value) <= 1e-12 else value
+
+
+def _default_fraction_grid(max_fraction: float, step: float) -> tuple[float, ...]:
+    values = [0.0]
+    i = 1
+    while i * step < max_fraction - 1e-12:
+        values.append(i * step)
+        i += 1
+    values.append(max_fraction)
+    return tuple(values)
+
+
+def _candidate_f_cpu_values(problem: DispatchProblem) -> tuple[float, ...]:
+    f_cpu_store = _validate_fraction("f_cpu_store", problem.f_cpu_store)
+    if problem.candidate_step <= 0:
+        raise ValueError(
+            f"candidate_step must be positive, got {problem.candidate_step}"
+        )
+
+    raw_candidates = (
+        _default_fraction_grid(f_cpu_store, problem.candidate_step)
+        if problem.candidate_f_cpu is None
+        else tuple(float(value) for value in problem.candidate_f_cpu)
+    )
+    candidates = [0.0, f_cpu_store, *raw_candidates]
+    legal: dict[float, float] = {}
+    for candidate in candidates:
+        if candidate < -1e-12 or candidate > f_cpu_store + 1e-12:
+            continue
+        clipped = min(f_cpu_store, max(0.0, float(candidate)))
+        rounded = _round_fraction(clipped)
+        legal[rounded] = rounded
+    if not legal:
+        raise ValueError("no legal f_cpu candidates remain after snapping")
+    return tuple(sorted(legal))
+
+
+def _validate_dispatch_problem(problem: DispatchProblem) -> None:
+    _validate_fraction("f_cpu_store", problem.f_cpu_store)
+    if problem.num_layers <= 0:
+        raise ValueError(f"num_layers must be positive, got {problem.num_layers}")
+    if not problem.buckets:
+        raise ValueError("buckets must not be empty")
+    for bucket in problem.buckets:
+        if int(bucket) <= 0:
+            raise ValueError(f"bucket values must be positive, got {bucket}")
+    for op, weight_bytes in problem.weight_bytes_per_layer.items():
+        if int(weight_bytes) < 0:
+            raise ValueError(
+                f"weight_bytes_per_layer[{op!r}] must be non-negative, "
+                f"got {weight_bytes}"
+            )
+    for op, fraction in problem.fixed_cpu_fractions_by_op.items():
+        _validate_fraction(f"fixed_cpu_fractions_by_op[{op!r}]", float(fraction))
+    _candidate_f_cpu_values(problem)
+
+
+def _op_split_fractions(
+    problem: DispatchProblem,
+    op: str,
+    f_cpu: float,
+) -> tuple[float, float]:
+    if op in problem.weight_bytes_per_layer:
+        cpu_fraction = f_cpu
+    else:
+        cpu_fraction = float(problem.fixed_cpu_fractions_by_op.get(op, 0.0))
+    cpu_fraction = _validate_fraction(f"cpu_fraction[{op}]", cpu_fraction)
+    return 1.0 - cpu_fraction, cpu_fraction
+
+
+def _profile_overhead_ms(
+    profile: DispatchProfileView,
+    bucket: int,
+    f_cpu: float,
+    f_prefetch: float,
+) -> float:
+    overhead_fn = getattr(profile, "overhead_ms", None)
+    if overhead_fn is None:
+        return 0.0
+    return float(overhead_fn(bucket, f_cpu, f_prefetch))
+
+
+def _score_dispatch_candidate(
+    problem: DispatchProblem,
+    profile: DispatchProfileView,
+    bucket: int,
+    f_cpu: float,
+) -> DispatchEntry:
+    f_cpu_store = _validate_fraction("f_cpu_store", problem.f_cpu_store)
+    f_cpu = _round_fraction(f_cpu)
+    f_prefetch = _round_fraction(f_cpu_store - f_cpu)
+    c_layer_ms = 0.0
+
+    for op in problem.layer_ops:
+        gpu_fraction, cpu_fraction = _op_split_fractions(problem, op, f_cpu)
+        gpu_ms = float(profile.gpu_op_ms(op, bucket, gpu_fraction))
+        cpu_ms = float(profile.cpu_op_ms(op, bucket, cpu_fraction))
+        c_layer_ms += max(gpu_ms, cpu_ms)
+
+    c_layer_ms += _profile_overhead_ms(profile, bucket, f_cpu, f_prefetch)
+    prefetch_bytes_per_layer = sum(
+        int(problem.weight_bytes_per_layer.get(op, 0)) for op in problem.layer_ops
+    )
+    p_layer_ms = float(
+        profile.h2d_ms(int(round(f_prefetch * prefetch_bytes_per_layer)))
+    )
+    layer_ms = max(c_layer_ms, p_layer_ms)
+    predicted_ms = float(problem.num_layers) * layer_ms
+    bottleneck: DispatchBottleneck = (
+        "compute" if c_layer_ms >= p_layer_ms else "prefetch"
+    )
+    return DispatchEntry(
+        bucket=int(bucket),
+        f_cpu=f_cpu,
+        f_prefetch=f_prefetch,
+        predicted_ms=predicted_ms,
+        layer_ms=layer_ms,
+        c_layer_ms=c_layer_ms,
+        p_layer_ms=p_layer_ms,
+        bottleneck=bottleneck,
+    )
+
+
+def _better_dispatch_entry(
+    candidate: DispatchEntry,
+    incumbent: DispatchEntry | None,
+) -> bool:
+    if incumbent is None:
+        return True
+    if candidate.predicted_ms < incumbent.predicted_ms - 1e-9:
+        return True
+    if abs(candidate.predicted_ms - incumbent.predicted_ms) <= 1e-9:
+        return candidate.f_cpu < incumbent.f_cpu - 1e-12
+    return False
+
+
+def solve_per_bucket_dispatch(
+    problem: DispatchProblem,
+    profile: DispatchProfileView,
+) -> DispatchSolveResult:
+    """Reference minimizer for the thesis per-bucket layer model.
+
+    The solver does a bounded snapped search over `f_cpu` for each bucket. It
+    is intentionally simple and deterministic: this is the validation target
+    that future closed-form dispatch heuristics must match before becoming a
+    fast path.
+    """
+
+    _validate_dispatch_problem(problem)
+    candidates = _candidate_f_cpu_values(problem)
+    entries: dict[int, DispatchEntry] = {}
+    candidate_scores: dict[int, tuple[DispatchEntry, ...]] = {}
+
+    for raw_bucket in problem.buckets:
+        bucket = int(raw_bucket)
+        scores = tuple(
+            _score_dispatch_candidate(problem, profile, bucket, f_cpu)
+            for f_cpu in candidates
+        )
+        best: DispatchEntry | None = None
+        for score in scores:
+            if _better_dispatch_entry(score, best):
+                best = score
+        assert best is not None
+        entries[bucket] = best
+        candidate_scores[bucket] = scores
+
+    return DispatchSolveResult(entries=entries, candidate_scores=candidate_scores)
 
 
 @dataclass(frozen=True)
