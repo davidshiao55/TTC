@@ -16,7 +16,7 @@ FastTTS assumes model weights stay GPU-resident, which limits max model size to 
 Three components on three timescales (see `David/Docs/thesis_proposal.md`):
 
 - **Profiler** (offline) — measures HW/model behavior; produces cached tables. See `David/Docs/profiler_design.md`.
-- **Planner** (load-time) — at engine launch, solves for placement + per-`BatchDescriptor` dispatch table from profile + budgets + workload target. **Primary contribution.** See `David/Docs/planner_design.md`.
+- **Planner** (load-time) — at engine launch, solves for placement + per-`BatchDescriptor` dispatch table from profile + budgets + workload contract. **Primary contribution.** See `David/Docs/planner_design.md`.
 - **Scheduler** (runtime) — executes the plan: tier-aware KV admission, KV migration, dispatch lookup. See `David/Docs/scheduler_design.md`.
 
 Three fundamental partitions the components orchestrate:

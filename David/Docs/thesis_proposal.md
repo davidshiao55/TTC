@@ -99,7 +99,7 @@ Computing pattern are already diverse in standard inference; TTC amplifies this 
 Three components, each on a different timescale:
 
 - **Profiler** (offline) — measures hardware and model behavior; produces cached tables. See `profiler_design.md`.
-- **Planner** (load-time) — at engine launch, consumes the profile + budgets + workload target (`n`, search strategy, `max_context`) and emits a placement plan (per-model scalars) and a per-bucket dispatch table. **Primary thesis contribution.** See `planner_design.md`.
+- **Planner** (load-time) — at engine launch, consumes the profile + budgets + workload contract (`n`, search strategy, `max_context`) and emits a placement plan (per-model scalars) and a per-bucket dispatch table. **Primary thesis contribution.** See `planner_design.md`.
 - **Scheduler** (runtime) — executes the plan per step: tier-aware KV admission, KV migration, dispatch lookup. Thin extension over vLLM's existing scheduler. See `scheduler_design.md`.
 
 ```
@@ -161,7 +161,7 @@ See `profiler_design.md` for schema, methodology, and caching.
 
 ## 5. Planner
 
-The Planner is the primary technical contribution. At engine launch, it consumes the Profiler's tables, the VRAM/RAM budgets, and the workload target (`n`, search strategy, `max_context`) and emits two kinds of output: load-time placement scalars and a per-bucket compute dispatch table.
+The Planner is the primary technical contribution. At engine launch, it consumes the Profiler's tables, the VRAM/RAM budgets, and the workload contract (`n`, search strategy, `max_context`) and emits two kinds of output: load-time placement scalars and a per-bucket compute dispatch table.
 
 ### 5.1 Why a per-bucket dispatch table
 
@@ -173,7 +173,13 @@ TTC serving produces forward calls spanning a wide range of shapes. Three source
 
 Each produces calls with different arithmetic intensity: small calls have GPU idle time that CPU compute can hide in, while large calls are GPU compute-bound and must lean on prefetch. A single static offloading strategy wastes resources on one end of the spectrum.
 
-All three axes collapse into a single scalar — the forward call's `num_tokens`. Arithmetic intensity, GPU idle time, and therefore the optimal compute split all depend on `num_tokens` alone. vLLM already captures one CUDA graph per `BatchDescriptor` (keyed on `num_tokens`), and the Planner emits one dispatch entry per captured bucket. Variation from batching, prefill/decode, and gen/ver becomes variation along the same `num_tokens` axis — handled uniformly by indexing the dispatch table.
+The v0 Planner uses the forward call's `num_tokens` as the dispatch key. vLLM
+already captures one CUDA graph per `BatchDescriptor` keyed on this bucket, and
+the Planner emits one dispatch entry per captured bucket. Variation from
+batching, prefill/decode, and gen/ver therefore becomes variation along the
+same bucket axis. If profiling shows that prefill/decode mix still matters at
+fixed `num_tokens`, the dispatch key can grow; the first design keeps the
+runtime surface minimal.
 
 ### 5.2 Load-time vs Runtime Decisions
 
@@ -200,27 +206,49 @@ Plus a derived dispatch table: one `(f_cpu_compute, f_prefetch_compute)` pair pe
 Σ_m (W_gpu_m + KV_gpu_m + |B_prefetch_m|) ≤ VRAM_budget
 Σ_m (W_cpu_m + KV_cpu_m)                  ≤ Host_RAM_budget
 f_cpu_compute + f_prefetch_compute = f_cpu_store_m     (per bucket)
-KV_gpu_m + KV_cpu_m ≥ n × max_context × kv_bytes_per_token_m
+KV_gpu_m + KV_cpu_m ≥ KV_needed_m(strategy, n, max_context)
 ```
 
 ### 5.5 Performance model
 
-Per step, per sub-module (WQKV, WO, MLP1, MLP2), three paths run concurrently:
+Per scheduled round, the Planner estimates one layer's critical path from two
+overlapping terms:
 
-- **GPU path**: GPU compute on `(1 − f_cpu_compute − f_prefetch_compute)` of the weight, from `gpu_layer_timing`.
-- **Prefetch path**: PCIe H2D of `f_prefetch_compute × weight_bytes` (from `pcie_h2d_bw`), then GPU compute on the prefetched slice.
-- **CPU path**: CPU GEMM on `f_cpu_compute × weight_bytes` (from `cpu_gemm_curve`), plus activation round-trip.
+- **Current-layer compute**: a sequential sum over `{WQKV, attention, WO,
+  MLP1, MLP2}`. Within each operation, CPU and GPU paths run concurrently and
+  the slower path gates the operation.
+- **Layer-ahead prefetch**: PCIe H2D of the next layer's prefetched weight
+  bundle, using `pcie_h2d_bw`.
 
-Per-sub-module critical path: `t = max(t_gpu, t_prefetch, t_cpu_compute)`. Plus attention-path cost when attention offload is active (GPU prefix attention + CPU suffix attention + merge via online softmax). Layer time is the sum over sub-modules; decode wall-clock is layer time × num_layers × num_decode_tokens.
+```text
+t_m,b = num_layers_m × max(C_layer_m,b, P_layer_m,b)
+C_layer_m,b = Σ_{op ∈ layer_ops} max(T_gpu_op,m,b, T_cpu_op,m,b) + O_layer_m,b
+```
+
+Weight terms come from `gpu_layer_timing` and `cpu_gemm_curve`, attention terms
+come from GPU prefix timing plus `cpu_attn_curve`, and `O_layer` captures
+partial-result merges, CPU/GPU sync, task submission, and runtime bookkeeping.
 
 ### 5.6 Objective and solution method
 
-**Two-stage optimization**:
+The Planner optimizes single-request TTC latency to `n` completed paths for the
+given workload contract:
 
-1. *Placement stage* — per model, minimize representative-bucket decode wall-clock subject to constraints. Representative bucket for generator is small `num_tokens` (≈ `n`); for verifier is medium (≈ `n × tokens_per_step`).
-2. *Dispatch stage* — for each captured bucket, closed-form single-scalar solve over `f_cpu` (with `f_prefetch = f_cpu_store − f_cpu`). Small `num_tokens` lean on CPU-compute (hides in GPU idle); medium/large shift toward prefetch (GPU compute-bound). The dispatch is uniform across WQKV/MLP1/MLP2, enabled empirically by uniform CPU μs/MB at decode (`phase0_findings.md §0.3.4`).
+```text
+T_TTC(plan) ≈ Σ_m N_rounds_m(plan, workload) × L_round_m(plan)
+```
 
-Grid search over the 3–4 placement scalars is tractable (sub-second). See `planner_design.md` for the full formulation.
+Weight residency mostly changes per-round latency. KV capacity mostly changes
+the number of scheduler/admission rounds needed by the TTC workload. A plan
+wins only when the scheduling gain from freed VRAM outweighs the per-round
+latency cost of CPU compute, prefetch, and CPU suffix attention.
+
+The implementation uses deterministic bounded search over snapped placement
+candidates and a small snapped per-bucket dispatch search. The thesis
+contribution is the constrained performance model, not a particular continuous
+optimizer. A closed-form idle-budget dispatch heuristic can become a fast path
+after it matches the snapped reference search on the profiled bucket set. See
+`planner_design.md` for the full formulation.
 
 ---
 
@@ -302,7 +330,36 @@ See `implementation_roadmap.md`.
 
 ## 9. Evaluation Plan
 
-### 9.1 Ablations
+### 9.1 Target model matrix
+
+Use pure instruction-tuned generators for the main evaluation matrix. Math
+variants and QwQ-style reasoning models are excluded from the primary Planner
+evaluation because they change the workload semantics and would blur the
+systems claim.
+
+| Tier | Generator | Verifier | Purpose |
+|---|---|---|---|
+| Smoke only | `Qwen/Qwen2.5-1.5B-Instruct` | `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B` | Fast correctness/debug run; not part of the main size claim. |
+| Main throughput | `Qwen/Qwen2.5-7B-Instruct` | `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B` | Tests whether offloading increases usable batch/KV enough to reduce TTC latency even when the models fit in VRAM. |
+| KV-pressure fallback | `meta-llama/Llama-3.1-8B-Instruct` | `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B` | Same broad size class as Qwen 7B, but higher KV pressure; use if Qwen 7B leaves too much VRAM headroom to show the throughput claim. |
+| Main capacity | `Qwen/Qwen2.5-14B-Instruct` | `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B` | First clear forced-fit / enlarged-KV regime on a 24 GB GPU. |
+| Upper stress | `Qwen/Qwen2.5-32B-Instruct` | `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B` | Stretch run for the largest-generator claim if memory, load time, and experiment budget allow it. |
+| Large-verifier secondary | `Qwen/Qwen2.5-7B-Instruct` or `Qwen/Qwen2.5-14B-Instruct` | `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-7B` | Isolates whether the Planner still behaves well when the verifier also becomes a meaningful memory consumer. |
+
+The default verifier should be the 1.5B PRM because it keeps the main story
+focused on generator scaling and TTC batch/KV pressure. The 7B PRM is a
+secondary axis, not a full cross product with every generator. Similarly,
+`1.5B + 1.5B` is a smoke/debug tier only; it is too small to support the thesis'
+larger-model offloading claim.
+
+For the throughput claim, run Qwen 7B first. If it shows little or no benefit,
+keep that result and then run Llama 8B as the higher-KV-pressure comparison.
+The claim should be framed as conditional on the measured pressure regime:
+offloading helps when the saved VRAM converts into fewer scheduler/admission
+rounds or larger effective TTC batches, and it can lose when the workload is
+not memory-constrained enough.
+
+### 9.2 Ablations
 
 Attribute gains by enabling one component at a time:
 
@@ -311,20 +368,20 @@ Attribute gains by enabling one component at a time:
 3. **+ Planner** — Planner sets placement and dispatch. Expected: matches or beats manual tuning.
 4. **+ Scheduler (tiered KV admission + migration)** — full system.
 
-### 9.2 Workload sweeps
+### 9.3 Workload sweeps
 
 - **`n` sweep**: `n ∈ {1, 4, 16, 64, 256}`. Report throughput, latency, Planner output (`f_cpu_store`, `KV_*_bytes`) per `n`.
-- **Model size sweep**: 7B generator (fits), 14B generator (mandatory offload). Verifier (1.5B) fixed.
+- **Model size sweep**: Qwen 7B generator (fits), Llama 8B fallback for higher KV pressure, Qwen 14B generator (mandatory offload), and Qwen 32B stretch. Verifier is 1.5B by default, with one 7B-verifier secondary run.
 - **Search strategy**: beam search vs best-of-N, to exercise the prefix-sharing asymmetry.
 
-### 9.3 System-paper specifics
+### 9.4 System-paper specifics
 
 - **Planner runtime**: measured wall-clock at launch; target ≤ 1 s.
-- **Dispatch-heuristic vs exhaustive**: on a small bucket set, exhaustive per-bucket optimization vs closed-form heuristic. Verify near-optimality.
+- **Dispatch heuristic vs snapped per-bucket search**: compare the closed-form idle-budget rule against the snapped reference search before using it as a fast path.
 - **What we did NOT make dynamic**: explicit statement (placement + dispatch table are static; runtime scheduling is vLLM's scheduler + our tiered KV policy).
 - **VRAM accounting**: breakdown per ablation — weights, KV pools, prefetch buffer, vLLM overhead.
 
-### 9.4 Accuracy
+### 9.5 Accuracy
 
 MATH-500 accuracy across all configurations. Expected: unchanged (mathematical exactness of col-parallel and row-parallel splits, and of the online-softmax merge).
 
@@ -338,7 +395,7 @@ MATH-500 accuracy across all configurations. Expected: unchanged (mathematical e
 | CPU attention bottleneck at long contexts | Batch size clamping via Scheduler; Planner can reduce `KV_cpu_bytes` to force shorter effective suffix. |
 | Column-parallel numerical differences | Mathematically exact; unit tests assert bit-identical. |
 | CUDA Graph incompatibility with CPU compute | `cudaLaunchHostFunc` (KTransformers pattern) is graph-capturable. Prototype Phase 1a/1b with `enforce_eager=True`, retrofit in Phase 1c. |
-| Planner solver runtime dominates launch | Closed-form dispatch + small grid outer loop; measured runtime reported. |
+| Planner solver runtime dominates launch | Bounded snapped candidate search; measured runtime reported. |
 
 ---
 
