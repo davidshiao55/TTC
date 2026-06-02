@@ -122,7 +122,7 @@ def test_cpu_num_threads_by_bucket_drives_slab_n_threads() -> None:
     """Smoke that the offloader's `_build_native_slab_specs` reads
     `config.cpu_num_threads_by_bucket` per-bucket. Doesn't need a real
     model — exercise the helper directly with a stubbed
-    `_capture_buckets`."""
+    `_dispatch_buckets`."""
     from vllm.config.offload import CotsOffloadConfig
 
     cfg = CotsOffloadConfig(
@@ -132,9 +132,9 @@ def test_cpu_num_threads_by_bucket_drives_slab_n_threads() -> None:
         cpu_num_threads_by_bucket={1: 4, 4: 8, 16: 16},
     )
     off = cots.CotsOffloader(config=cfg)
-    # Stub _capture_buckets so the resolver / validator have inputs
+    # Stub _dispatch_buckets so the resolver / validator have inputs
     # without going through wrap_modules.
-    off._capture_buckets = [1, 4, 16]
+    off._dispatch_buckets = (1, 4, 16)
 
     assert off._n_threads_for(1) == 4
     assert off._n_threads_for(4) == 8
@@ -143,7 +143,7 @@ def test_cpu_num_threads_by_bucket_drives_slab_n_threads() -> None:
     # allowed to specify only profiled buckets).
     assert off._n_threads_for(64) == 16
 
-    # Validation: a key not in _capture_buckets is a hard error.
+    # Validation: a key not in _dispatch_buckets is a hard error.
     cfg_bad = CotsOffloadConfig(
         f_cpu_store=0.10,
         cpu_runner="native",
@@ -151,8 +151,8 @@ def test_cpu_num_threads_by_bucket_drives_slab_n_threads() -> None:
         cpu_num_threads_by_bucket={1: 4, 99: 8},
     )
     off_bad = cots.CotsOffloader(config=cfg_bad)
-    off_bad._capture_buckets = [1, 4, 16]
-    with pytest.raises(ValueError, match="not in cudagraph_capture_sizes"):
+    off_bad._dispatch_buckets = (1, 4, 16)
+    with pytest.raises(ValueError, match="not in COTS dispatch buckets"):
         off_bad._validate_thread_policy()
 
     if off._runner is not None:
@@ -173,7 +173,7 @@ def test_cpu_num_threads_by_bucket_default_falls_back_to_scalar() -> None:
         cpu_num_threads_by_bucket=None,
     )
     off = cots.CotsOffloader(config=cfg)
-    off._capture_buckets = [1, 4, 16]
+    off._dispatch_buckets = (1, 4, 16)
     for b in [1, 4, 16, 64]:
         assert off._n_threads_for(b) == 12
     if off._runner is not None:
@@ -192,38 +192,103 @@ def test_cpu_num_threads_by_bucket_rejects_bad_value() -> None:
         cpu_num_threads_by_bucket={1: 0},
     )
     off = cots.CotsOffloader(config=cfg)
-    off._capture_buckets = [1]
+    off._dispatch_buckets = (1,)
     with pytest.raises(ValueError, match="must be >= 1"):
         off._validate_thread_policy()
     if off._runner is not None:
         off._runner.close()
 
 
-def test_native_full_graph_routing_guard_detects_nonuniform_geometry() -> None:
-    """§1c.35: task-id dispatch is now OOG, but routing geometry is not.
-
-    FULL graph + native can proceed only when Python-side COTS routing
-    geometry is uniform across buckets. Non-uniform Planner routing must
-    fail loudly until that geometry moves behind the same dispatch boundary.
-    """
+def test_native_route_signature_detects_nonuniform_geometry() -> None:
+    """Nonuniform Python-visible geometry becomes a route signature, not a
+    graph-mode hard fail."""
     from vllm.config.offload import CotsOffloadConfig
 
     cfg = CotsOffloadConfig(f_cpu_store=0.0)
     off = cots.CotsOffloader(config=cfg)
-    off._capture_buckets = (1, 4)
+    off._dispatch_buckets = (1, 4, 8)
 
     class Handle:
         n_cpu = 10
-        n_prefetch_by_bucket = {1: 0, 4: 0}
-        n_cpu_compute_by_bucket = {1: 10, 4: 10}
+        role = cots.QKV_ROLE
+        n_prefetch_by_bucket = {1: 0, 4: 0, 8: 0}
+        n_cpu_compute_by_bucket = {1: 10, 4: 10, 8: 10}
 
     h = Handle()
     off._handles = [h]  # type: ignore[list-item]
     assert off._native_routing_uniform_across_buckets()
 
-    h.n_prefetch_by_bucket = {1: 0, 4: 2}
-    h.n_cpu_compute_by_bucket = {1: 10, 4: 8}
+    h.n_prefetch_by_bucket = {1: 0, 4: 0, 8: 2}
+    h.n_cpu_compute_by_bucket = {1: 10, 4: 10, 8: 8}
     assert not off._native_routing_uniform_across_buckets()
+    off._build_route_signatures()
+    assert off._route_signature_by_bucket[1] == off._route_signature_by_bucket[4]
+    assert off._route_signature_by_bucket[8] != off._route_signature_by_bucket[1]
+
+
+def test_descriptor_bucket_drives_native_dispatch_state() -> None:
+    """Graph variants publish their explicit COTS dispatch bucket instead of
+    deriving routing from the graph tensor shape."""
+    from vllm.forward_context import BatchDescriptor
+    from vllm.config.offload import CotsOffloadConfig
+    from vllm.model_executor.offloader.base import ForwardDispatchInfo
+
+    cfg = CotsOffloadConfig(f_cpu_store=0.0, cpu_runner="python")
+    off = cots.CotsOffloader(config=cfg)
+    off._dispatch_buckets = (64, 2048)
+    off._has_cpu_compute_work = False
+    off._streamer = None
+    info = ForwardDispatchInfo(
+        batch_descriptor=BatchDescriptor(
+            num_tokens=2048,
+            cots_dispatch_bucket=64,
+            cots_route_signature=1,
+        ),
+        num_tokens_unpadded=64,
+    )
+
+    off.on_dispatch(info)
+    assert off._current_bucket == 64
+
+
+def test_native_graph_allows_uniform_dispatch_geometry(monkeypatch) -> None:
+    """Uniform route geometry is capture-safe even when dispatch buckets are
+    conceptually separate from graph buckets."""
+    from types import SimpleNamespace
+
+    from vllm.config import CUDAGraphMode
+    from vllm.config.offload import CotsOffloadConfig
+
+    cfg = CotsOffloadConfig(f_cpu_store=0.0, cpu_runner="native")
+    off = cots.CotsOffloader(config=cfg)
+    off._dispatch_buckets = (1, 4)
+    off._dispatch_table = {1: (0.0, 0.0), 4: (0.0, 0.0)}
+    off._has_cpu_compute_work = False
+
+    class Handle:
+        n_cpu = 10
+        w_cpu = None
+        dtype = torch.bfloat16
+        role = cots.QKV_ROLE
+        in_dim = 16
+        out_dim = 16
+        split_axis = cots.OUTPUT_SPLIT_AXIS
+        n_prefetch_by_bucket = {1: 2, 4: 2}
+        n_cpu_compute_by_bucket = {1: 8, 4: 8}
+
+    off._handles = [Handle()]  # type: ignore[list-item]
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=False),
+        parallel_config=SimpleNamespace(use_ubatching=False),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE),
+    )
+    monkeypatch.setattr(
+        "vllm.config.get_current_vllm_config",
+        lambda: vllm_config,
+    )
+
+    off.post_init()
+    assert off._eager_fallback_entry == (0.0, 0.0)
 
 
 def test_native_operator_bucket_requires_dispatch_state() -> None:
@@ -232,7 +297,7 @@ def test_native_operator_bucket_requires_dispatch_state() -> None:
 
     cfg = CotsOffloadConfig(f_cpu_store=0.0)
     off = cots.CotsOffloader(config=cfg)
-    off._capture_buckets = (1, 4)
+    off._dispatch_buckets = (1, 4)
     runner = cots.NativeCotsWeightRunner(dry_run=True)
     try:
         off._runner = runner

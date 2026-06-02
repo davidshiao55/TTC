@@ -64,7 +64,7 @@ def test_native_runner_with_ubatching_hard_fails(monkeypatch) -> None:
     # post_init prerequisites without a real model.
     o._handles = [object()]  # type: ignore[list-item]
     o._dispatch_table = {1: (0.05, 0.0)}
-    o._capture_buckets = (1,)
+    o._dispatch_buckets = (1,)
     o._has_cpu_compute_work = True
 
     with pytest.raises(RuntimeError, match="ubatching|§1c.23"):
@@ -87,7 +87,7 @@ def test_native_runner_without_ubatching_passes_guard(monkeypatch) -> None:
     o = cots.CotsOffloader(cfg)
     o._handles = [object()]  # type: ignore[list-item]
     o._dispatch_table = {1: (0.05, 0.0)}
-    o._capture_buckets = (1,)
+    o._dispatch_buckets = (1,)
     o._has_cpu_compute_work = True
 
     # post_init may fail at the install step (the stub handles aren't

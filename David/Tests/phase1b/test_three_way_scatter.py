@@ -203,7 +203,7 @@ def test_mlp_counts_snap_to_64_channel_grid():
         pytest.skip("CUDA required")
 
     _, offloader, _, _, _ = _build_mlp(f_cpu_store=0.20, f_prefetch=0.10)
-    bucket = offloader._capture_buckets[0]
+    bucket = offloader._dispatch_buckets[0]
     handles = {h.role: h for h in offloader._handles}
 
     col = handles[MLP_GATE_UP_ROLE]
@@ -324,7 +324,7 @@ def test_pure_prefetch_zero_cpu_compute_no_residual_qkv():
         offloader.post_init()
 
     qkv_h = offloader._handles[0]
-    bucket = offloader._capture_buckets[0]
+    bucket = offloader._dispatch_buckets[0]
     # The fix: n_cpu_compute must be exactly zero — every CPU-stored byte
     # is prefetched, no residual.
     assert qkv_h.n_cpu_compute_by_bucket[bucket] == 0
@@ -361,7 +361,7 @@ def test_pure_prefetch_qkv_forward_parity():
 
     # Confirm fast path will trigger.
     qkv_h = offloader._handles[0]
-    assert qkv_h.n_cpu_compute_by_bucket[offloader._capture_buckets[0]] == 0
+    assert qkv_h.n_cpu_compute_by_bucket[offloader._dispatch_buckets[0]] == 0
 
     # Manually populate slot 0 (in real runs the streamer's hooks do this).
     if offloader._streamer is not None:
@@ -385,7 +385,7 @@ def test_pure_prefetch_mlp_forward_parity():
         f_cpu_store=0.20, f_prefetch=0.20
     )
     # Confirm both handles have zero CPU compute.
-    bucket = offloader._capture_buckets[0]
+    bucket = offloader._dispatch_buckets[0]
     for h in offloader._handles:
         assert h.n_cpu_compute_by_bucket[bucket] == 0, (
             f"{h.role} {h.qualified_name}: expected n_cpu_compute=0, "
@@ -416,7 +416,7 @@ def test_dry_run_pure_prefetch_mlp_skips_prefetched_compute():
         f_cpu_store=0.20, f_prefetch=0.20, dry_run=True
     )
     assert offloader.dry_run is True
-    bucket = offloader._capture_buckets[0]
+    bucket = offloader._dispatch_buckets[0]
     for h in offloader._handles:
         assert h.n_cpu_compute_by_bucket[bucket] == 0
 
@@ -567,7 +567,7 @@ def test_factory_prefetch_installs_machinery_even_with_config_zero():
     # Streamer + pool MUST be installed even though config f_prefetch=0.
     assert offloader._streamer is not None, "streamer should install when factory emits prefetch"
     assert offloader._prefetch_buffer_pool is not None
-    bucket = offloader._capture_buckets[0]
+    bucket = offloader._dispatch_buckets[0]
     assert any(h.n_prefetch_by_bucket[bucket] > 0 for h in offloader._handles)
 
     # Forward output must match unsplit reference — the prefetched bytes

@@ -5,6 +5,13 @@ Date: 2026-06-01
 Status: Planner implementation is paused. This report is a handoff note for a
 separate investigation of COTS weight-offloading performance.
 
+Update: the follow-up investigation in
+`dispatch_validation_investigation_report.md` found that the graph-mode
+decode-only pure-CPU endpoint in this report is invalid. Native COTS CPU custom
+ops were absent from the compiled graph for the nonuniform dispatch table, so
+the reported "pure CPU decode" latency did not execute CPU work. Keep this file
+as the historical surprise/handoff note, not as Planner ground truth.
+
 ## Executive Summary
 
 The initial dispatch-validation runs suggested that hybrid CPU plus prefetch

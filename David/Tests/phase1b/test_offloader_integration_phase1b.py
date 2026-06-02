@@ -273,5 +273,5 @@ def test_phase1b_post_init_fallback_entry_matches_largest_bucket():
     _, offloader = _build_phase1b(f_cpu_store=0.20, f_prefetch=0.05)
     assert (
         offloader._eager_fallback_entry
-        == offloader._dispatch_table[offloader._capture_buckets[-1]]
+        == offloader._dispatch_table[offloader._dispatch_buckets[-1]]
     )

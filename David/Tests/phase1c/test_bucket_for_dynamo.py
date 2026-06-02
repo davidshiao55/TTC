@@ -103,12 +103,12 @@ def test_parity_above_largest(buckets: tuple[int, ...]) -> None:
 def test_parity_offloader_method_matches_oracle() -> None:
     """The actual `CotsOffloader._bucket_for` method (not just a copy
     of the implementation) matches the bisect oracle. Reaches into
-    the class to bind `_capture_buckets` directly so we don't have to
+    the class to bind `_dispatch_buckets` directly so we don't have to
     construct a full offloader for a pure-Python lookup test."""
     from vllm.model_executor.offloader.cots import CotsOffloader
 
     class _Stub:
-        _capture_buckets = (1, 4, 16, 64)
+        _dispatch_buckets = (1, 4, 16, 64)
 
     bound = CotsOffloader._bucket_for.__get__(_Stub())
     for n in [0, 1, 2, 3, 4, 5, 7, 16, 17, 64, 100]:
