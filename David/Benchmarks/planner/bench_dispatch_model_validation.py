@@ -5,7 +5,7 @@ This harness measures the inner Planner primitive before we trust it inside the
 global placement search. For a fixed `f_cpu_store`, it sweeps
 `f_cpu_compute`, sets `f_prefetch_compute = f_cpu_store - f_cpu_compute`, emits
 a forced `cots_dispatch_table`, and records real vLLM latency. The default
-layout applies the same split across all captured buckets; `decode-only` keeps
+layout applies the same split across all dispatch buckets; `decode-only` keeps
 non-decode buckets pure prefetch and varies only the measured decode bucket.
 
 The first validation question is qualitative ranking:
@@ -60,7 +60,7 @@ FASTTTS_ROOT = TTC_ROOT / "FastTTS-thesis"
 if str(FASTTTS_ROOT) not in sys.path:
     sys.path.insert(0, str(FASTTTS_ROOT))
 
-from planner import derive_weight_thread_policy, weight_thread_count_for_score  # noqa: E402
+from planner import derive_weight_thread_policy  # noqa: E402
 
 
 MODEL = "Qwen/Qwen2.5-7B-Instruct"
@@ -77,10 +77,10 @@ DEFAULT_BATCHES = (1, 4, 16, 64)
 DEFAULT_F_CPU_STORE_VALUES = (0.02, 0.05, 0.09)
 DEFAULT_F_CPU_RATIOS = (0.0, 0.25, 0.5, 0.75, 1.0)
 
-# Default graph capture buckets observed in the current vLLM V1 configuration.
-# The runtime lookup rounds to these buckets, so every forced dispatch table
-# should cover the whole set even when the benchmark only targets a few batches.
-CAPTURE_BUCKETS = (
+# Default COTS dispatch buckets. This intentionally mirrors the current vLLM V1
+# graph bucket grid plus larger fallback buckets, but the harness uses it as the
+# dispatch-table key set, not as CUDA graph capture policy.
+DISPATCH_BUCKETS = (
     1,
     2,
     4,
@@ -139,7 +139,7 @@ CAPTURE_BUCKETS = (
     4096,
     8192,
 )
-THREAD_POLICY_BUCKETS = tuple(bucket for bucket in CAPTURE_BUCKETS if bucket <= 512)
+THREAD_POLICY_BUCKETS = tuple(bucket for bucket in DISPATCH_BUCKETS if bucket <= 512)
 
 
 @dataclass(frozen=True)
@@ -185,7 +185,7 @@ def parse_float_list(values: list[str]) -> list[float]:
 
 def make_dispatch_table(
     *,
-    capture_buckets: list[int],
+    dispatch_buckets: list[int],
     f_cpu: float,
     f_prefetch: float,
     f_cpu_store: float | None = None,
@@ -195,7 +195,7 @@ def make_dispatch_table(
     if layout == "uniform":
         return {
             int(bucket): (float(f_cpu), float(f_prefetch))
-            for bucket in capture_buckets
+            for bucket in dispatch_buckets
         }
     if layout == "decode-only":
         if f_cpu_store is None:
@@ -204,9 +204,9 @@ def make_dispatch_table(
             raise ValueError("decode-only dispatch requires batch")
         table = {
             int(bucket): (0.0, float(f_cpu_store))
-            for bucket in capture_buckets
+            for bucket in dispatch_buckets
         }
-        table[bucket_for(batch, capture_buckets)] = (
+        table[bucket_for(batch, dispatch_buckets)] = (
             float(f_cpu),
             float(f_prefetch),
         )
@@ -216,7 +216,7 @@ def make_dispatch_table(
 
 def make_module_dispatch_table(
     *,
-    capture_buckets: list[int],
+    dispatch_buckets: list[int],
     f_cpu_store: float,
     batch: int,
     policy: str,
@@ -225,7 +225,7 @@ def make_module_dispatch_table(
         return {}
     if policy == "qkv-prefetch-mlp-cpu":
         qkv_table = make_dispatch_table(
-            capture_buckets=capture_buckets,
+            dispatch_buckets=dispatch_buckets,
             f_cpu=0.0,
             f_prefetch=f_cpu_store,
             f_cpu_store=f_cpu_store,
@@ -233,23 +233,23 @@ def make_module_dispatch_table(
             layout="decode-only",
         )
         mlp_table = make_dispatch_table(
-            capture_buckets=capture_buckets,
+            dispatch_buckets=dispatch_buckets,
             f_cpu=0.0,
             f_prefetch=f_cpu_store,
             f_cpu_store=f_cpu_store,
             batch=batch,
             layout="decode-only",
         )
-        mlp_table[bucket_for(batch, capture_buckets)] = (f_cpu_store, 0.0)
+        mlp_table[bucket_for(batch, dispatch_buckets)] = (f_cpu_store, 0.0)
         return {"qkv": qkv_table, "mlp": mlp_table}
     raise ValueError(f"unknown module dispatch policy: {policy}")
 
 
-def bucket_for(num_tokens: int, capture_buckets: list[int]) -> int:
-    for bucket in sorted(capture_buckets):
+def bucket_for(num_tokens: int, dispatch_buckets: list[int]) -> int:
+    for bucket in sorted(dispatch_buckets):
         if int(num_tokens) <= int(bucket):
             return int(bucket)
-    return int(max(capture_buckets))
+    return int(max(dispatch_buckets))
 
 
 def jsonable_dispatch_table(
@@ -267,13 +267,13 @@ def jsonable_module_dispatch_table(
     }
 
 
-def cots_flags(args: argparse.Namespace, mode: str, cell: Cell) -> list[str]:
+def cots_flags(args: argparse.Namespace, cell: Cell) -> list[str]:
     assert cell.f_cpu_store is not None
     assert cell.f_cpu is not None
     assert cell.f_prefetch is not None
 
     dispatch_table = make_dispatch_table(
-        capture_buckets=args.capture_buckets,
+        dispatch_buckets=args.dispatch_buckets,
         f_cpu=cell.f_cpu,
         f_prefetch=cell.f_prefetch,
         f_cpu_store=cell.f_cpu_store,
@@ -294,7 +294,7 @@ def cots_flags(args: argparse.Namespace, mode: str, cell: Cell) -> list[str]:
     ]
     if args.module_dispatch_policy != "none":
         module_table = make_module_dispatch_table(
-            capture_buckets=args.capture_buckets,
+            dispatch_buckets=args.dispatch_buckets,
             f_cpu_store=cell.f_cpu_store,
             batch=cell.batch,
             policy=args.module_dispatch_policy,
@@ -308,10 +308,10 @@ def cots_flags(args: argparse.Namespace, mode: str, cell: Cell) -> list[str]:
         ]
     if args.cots_weight_modules:
         flags += ["--cots-weight-modules", *args.cots_weight_modules]
-    if args.thread_policy == "workscore" and mode == "graph":
+    if args.thread_policy == "workscore":
         thread_map = derive_weight_thread_policy(
             make_dispatch_table(
-                capture_buckets=args.thread_buckets,
+                dispatch_buckets=args.thread_buckets,
                 f_cpu=cell.f_cpu,
                 f_prefetch=cell.f_prefetch,
                 f_cpu_store=cell.f_cpu_store,
@@ -325,12 +325,6 @@ def cots_flags(args: argparse.Namespace, mode: str, cell: Cell) -> list[str]:
             "--cots-cpu-num-threads-by-bucket",
             json.dumps({str(k): v for k, v in thread_map.items()}, separators=(",", ":")),
         ]
-    elif args.thread_policy == "workscore":
-        # Eager mode exposes only the max dynamic bucket to COTS, so vLLM
-        # rejects a full per-bucket thread table. Use the same work-score rule
-        # for this benchmark cell's requested batch as a scalar fallback.
-        threads = weight_thread_count_for_score(cell.batch * cell.f_cpu)
-        flags += ["--cots-cpu-num-threads", str(threads)]
     elif args.thread_policy == "scalar":
         flags += ["--cots-cpu-num-threads", str(args.cots_cpu_num_threads)]
     else:
@@ -380,7 +374,7 @@ def build_command(args: argparse.Namespace, mode: str, cell: Cell, out_json: Pat
     if mode == "eager":
         cmd.append("--enforce-eager")
     if not cell.is_baseline:
-        cmd += cots_flags(args, mode, cell)
+        cmd += cots_flags(args, cell)
     cmd += args.extra_vllm_args
     return cmd
 
@@ -577,7 +571,7 @@ def summarize(args: argparse.Namespace, modes: list[str], cells: list[Cell]) -> 
             "batches": args.batches,
             "f_cpu_store_values": args.f_cpu_store_values,
             "f_cpu_ratios": args.f_cpu_ratios,
-            "capture_buckets": args.capture_buckets,
+            "dispatch_buckets": args.dispatch_buckets,
             "thread_buckets": args.thread_buckets,
             "thread_policy": args.thread_policy,
             "cots_cpu_num_threads": args.cots_cpu_num_threads,
@@ -777,10 +771,17 @@ def parse_args() -> argparse.Namespace:
         help="Candidate f_cpu values as ratios of f_cpu_store.",
     )
     parser.add_argument(
-        "--capture-buckets",
+        "--dispatch-buckets",
         type=int,
         nargs="+",
-        default=list(CAPTURE_BUCKETS),
+        default=list(DISPATCH_BUCKETS),
+    )
+    parser.add_argument(
+        "--capture-buckets",
+        dest="dispatch_buckets",
+        type=int,
+        nargs="+",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--thread-buckets",
@@ -789,7 +790,7 @@ def parse_args() -> argparse.Namespace:
         default=list(THREAD_POLICY_BUCKETS),
         help=(
             "Buckets covered by cots_cpu_num_threads_by_bucket in graph mode. "
-            "Must be a subset of vLLM cudagraph_capture_sizes."
+            "Must be a subset of the COTS dispatch buckets."
         ),
     )
     parser.add_argument(
@@ -802,7 +803,7 @@ def parse_args() -> argparse.Namespace:
         choices=("uniform", "decode-only"),
         default="uniform",
         help=(
-            "uniform applies each candidate split to every captured bucket. "
+            "uniform applies each candidate split to every dispatch bucket. "
             "decode-only keeps all buckets pure prefetch and overrides only "
             "the benchmark batch's decode bucket with the candidate split."
         ),

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""§1c.18 fix verification — `_bucket_for` is Dynamo-traceable.
+"""§1c.18 fix verification — `_dispatch_bucket_for` is Dynamo-traceable.
 
 Two parts:
 
-1. **Parity** — the Dynamo-friendly linear-scan `_bucket_for`
+1. **Parity** — the Dynamo-friendly linear-scan `_dispatch_bucket_for`
    produces identical results to the original `bisect_left`-based
    implementation for all interesting boundary classes (below first,
    exact match, between buckets, equal to largest, above largest).
@@ -33,7 +33,7 @@ import torch
 # --- 1. Parity ---
 
 
-def _bucket_for_old(buckets: tuple[int, ...], num_tokens: int) -> int:
+def _dispatch_bucket_for_old(buckets: tuple[int, ...], num_tokens: int) -> int:
     """The original `bisect_left`-based implementation. Used here as
     the parity oracle — kept locally so this test does not depend on
     the old method living anywhere in the tree."""
@@ -43,9 +43,9 @@ def _bucket_for_old(buckets: tuple[int, ...], num_tokens: int) -> int:
     return buckets[i]
 
 
-def _bucket_for_new(buckets: tuple[int, ...], num_tokens: int) -> int:
+def _dispatch_bucket_for_new(buckets: tuple[int, ...], num_tokens: int) -> int:
     """The Dynamo-friendly linear scan. Matches the implementation in
-    `cots.py:CotsOffloader._bucket_for`. Repeated locally so the test
+    `CotsOffloader._dispatch_bucket_for`. Repeated locally so the test
     is self-contained and survives renames."""
     for bucket in buckets:
         if num_tokens <= bucket:
@@ -65,16 +65,20 @@ _BUCKET_TUPLES = [
 def test_parity_below_first_bucket(buckets: tuple[int, ...]) -> None:
     """Below the smallest bucket → smallest bucket."""
     n = max(0, buckets[0] - 1)
-    assert _bucket_for_new(buckets, n) == _bucket_for_old(buckets, n)
-    assert _bucket_for_new(buckets, n) == buckets[0]
+    assert _dispatch_bucket_for_new(buckets, n) == _dispatch_bucket_for_old(
+        buckets, n
+    )
+    assert _dispatch_bucket_for_new(buckets, n) == buckets[0]
 
 
 @pytest.mark.parametrize("buckets", _BUCKET_TUPLES)
 def test_parity_exact_bucket_match(buckets: tuple[int, ...]) -> None:
     """num_tokens == bucket value → that bucket."""
     for b in buckets:
-        assert _bucket_for_new(buckets, b) == _bucket_for_old(buckets, b)
-        assert _bucket_for_new(buckets, b) == b
+        assert _dispatch_bucket_for_new(buckets, b) == _dispatch_bucket_for_old(
+            buckets, b
+        )
+        assert _dispatch_bucket_for_new(buckets, b) == b
 
 
 @pytest.mark.parametrize("buckets", _BUCKET_TUPLES)
@@ -86,22 +90,26 @@ def test_parity_between_buckets(buckets: tuple[int, ...]) -> None:
         if hi - lo < 2:
             continue
         n = lo + 1
-        assert _bucket_for_new(buckets, n) == _bucket_for_old(buckets, n)
-        assert _bucket_for_new(buckets, n) == hi
+        assert _dispatch_bucket_for_new(buckets, n) == _dispatch_bucket_for_old(
+            buckets, n
+        )
+        assert _dispatch_bucket_for_new(buckets, n) == hi
 
 
 @pytest.mark.parametrize("buckets", _BUCKET_TUPLES)
 def test_parity_above_largest(buckets: tuple[int, ...]) -> None:
     """Above largest bucket → clamps to largest bucket
-    (`_bucket_for` semantics; `lookup_dispatch` falls back to
+    (`_dispatch_bucket_for` semantics; `lookup_dispatch` falls back to
     eager_fallback_entry separately, see §1c.13)."""
     n = buckets[-1] + 1
-    assert _bucket_for_new(buckets, n) == _bucket_for_old(buckets, n)
-    assert _bucket_for_new(buckets, n) == buckets[-1]
+    assert _dispatch_bucket_for_new(buckets, n) == _dispatch_bucket_for_old(
+        buckets, n
+    )
+    assert _dispatch_bucket_for_new(buckets, n) == buckets[-1]
 
 
 def test_parity_offloader_method_matches_oracle() -> None:
-    """The actual `CotsOffloader._bucket_for` method (not just a copy
+    """The actual `CotsOffloader._dispatch_bucket_for` method (not just a copy
     of the implementation) matches the bisect oracle. Reaches into
     the class to bind `_dispatch_buckets` directly so we don't have to
     construct a full offloader for a pure-Python lookup test."""
@@ -110,9 +118,9 @@ def test_parity_offloader_method_matches_oracle() -> None:
     class _Stub:
         _dispatch_buckets = (1, 4, 16, 64)
 
-    bound = CotsOffloader._bucket_for.__get__(_Stub())
+    bound = CotsOffloader._dispatch_bucket_for.__get__(_Stub())
     for n in [0, 1, 2, 3, 4, 5, 7, 16, 17, 64, 100]:
-        assert bound(n) == _bucket_for_old((1, 4, 16, 64), n), (
+        assert bound(n) == _dispatch_bucket_for_old((1, 4, 16, 64), n), (
             f"mismatch at num_tokens={n}"
         )
 
@@ -128,26 +136,26 @@ class _PreHookModule(torch.nn.Module):
     bucket on `self.current_bucket` (mirroring `_current_bucket` on
     the offloader)."""
 
-    def __init__(self, capture_buckets: tuple[int, ...]) -> None:
+    def __init__(self, dispatch_buckets: tuple[int, ...]) -> None:
         super().__init__()
-        self.capture_buckets = capture_buckets
+        self.dispatch_buckets = dispatch_buckets
         self.current_bucket: int | None = None
         self.linear = torch.nn.Linear(4, 4)
         # Match the offloader's pre-hook registration shape: positional
-        # `(module, args)`, no kwargs. See `cots.py:_install_bucket_prehook`.
+        # `(module, args)`, no kwargs.
         self.register_forward_pre_hook(_PreHookModule._pre_hook)
 
     @staticmethod
     def _pre_hook(self, args):  # noqa: ANN001 — torch hook signature
         x = args[0]
-        self.current_bucket = self._bucket_for(int(x.shape[0]))
+        self.current_bucket = self._dispatch_bucket_for(int(x.shape[0]))
         return None
 
-    def _bucket_for(self, num_tokens: int) -> int:
-        for bucket in self.capture_buckets:
+    def _dispatch_bucket_for(self, num_tokens: int) -> int:
+        for bucket in self.dispatch_buckets:
             if num_tokens <= bucket:
                 return bucket
-        return self.capture_buckets[-1]
+        return self.dispatch_buckets[-1]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(x)
@@ -184,9 +192,9 @@ def test_dynamo_compile_regresses_old_bisect_left() -> None:
     device = "cuda"
 
     class _OldStyleModule(torch.nn.Module):
-        def __init__(self, capture_buckets: tuple[int, ...]) -> None:
+        def __init__(self, dispatch_buckets: tuple[int, ...]) -> None:
             super().__init__()
-            self.capture_buckets = capture_buckets
+            self.dispatch_buckets = dispatch_buckets
             self.current_bucket: int | None = None
             self.linear = torch.nn.Linear(4, 4)
             self.register_forward_pre_hook(_OldStyleModule._pre_hook)
@@ -197,11 +205,11 @@ def test_dynamo_compile_regresses_old_bisect_left() -> None:
 
             x = args[0]
             n = int(x.shape[0])
-            i = bisect_left(self.capture_buckets, n)
-            if i >= len(self.capture_buckets):
-                self.current_bucket = self.capture_buckets[-1]
+            i = bisect_left(self.dispatch_buckets, n)
+            if i >= len(self.dispatch_buckets):
+                self.current_bucket = self.dispatch_buckets[-1]
             else:
-                self.current_bucket = self.capture_buckets[i]
+                self.current_bucket = self.dispatch_buckets[i]
             return None
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:

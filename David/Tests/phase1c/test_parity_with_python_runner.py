@@ -545,6 +545,6 @@ def test_prepare_before_forward_sets_current_bucket() -> None:
     assert off._current_bucket is None
     # Simulate what the pre-hook (or graph-boundary) calls.
     off.prepare_before_forward(MAX_NUM_TOKENS)
-    assert off._current_bucket == off._bucket_for(MAX_NUM_TOKENS)
+    assert off._current_bucket == off._dispatch_bucket_for(MAX_NUM_TOKENS)
     if off._runner is not None:
         off._runner.close()

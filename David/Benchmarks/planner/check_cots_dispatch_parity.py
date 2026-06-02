@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Greedy parity check for Planner COTS dispatch cells.
+"""Legacy greedy parity smoke check for Planner COTS dispatch cells.
+
+Free generation can amplify tiny COTS numeric drift into different continuations.
+Use ``check_cots_forced_context_parity.py`` as the logprob oracle; keep this
+script only as a quick end-to-end smoke probe.
 
 Run from /TTC/FastTTS-thesis in the thesis environment.
 """
@@ -21,7 +25,7 @@ import torch
 
 MODEL = "Qwen/Qwen2.5-7B-Instruct"
 DTYPE = "bfloat16"
-CAPTURE_BUCKETS = (
+DISPATCH_BUCKETS = (
     1,
     2,
     4,
@@ -88,10 +92,10 @@ def default_results_dir() -> Path:
 
 
 def bucket_for(n: int) -> int:
-    for bucket in CAPTURE_BUCKETS:
+    for bucket in DISPATCH_BUCKETS:
         if n <= bucket:
             return bucket
-    return CAPTURE_BUCKETS[-1]
+    return DISPATCH_BUCKETS[-1]
 
 
 def decode_only_dispatch_table(
@@ -101,15 +105,15 @@ def decode_only_dispatch_table(
     f_cpu: float,
     f_prefetch: float,
 ) -> dict[int, tuple[float, float]]:
-    table = {int(bucket): (0.0, float(f_cpu_store)) for bucket in CAPTURE_BUCKETS}
+    table = {int(bucket): (0.0, float(f_cpu_store)) for bucket in DISPATCH_BUCKETS}
     table[bucket_for(batch)] = (float(f_cpu), float(f_prefetch))
     return table
 
 
 def thread_table(batch: int, cpu_threads: int) -> dict[int, int]:
-    # vLLM's graph capture buckets top out at 512 for these Qwen latency cells.
-    # Extra thread-table keys are rejected, so keep this to the known graph set.
-    return {int(bucket): 4 for bucket in CAPTURE_BUCKETS if bucket <= 512} | {
+    # Thread-table keys must be dispatch buckets. The <=512 subset mirrors the
+    # decode grid used by these Qwen parity cells.
+    return {int(bucket): 4 for bucket in DISPATCH_BUCKETS if bucket <= 512} | {
         bucket_for(batch): int(cpu_threads)
     }
 

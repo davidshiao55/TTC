@@ -5,7 +5,7 @@ This is a thin orchestrator around ``bench_dispatch_model_validation.py``.
 It keeps the experiment knobs identical while crossing:
 
 * runtime family: eager, current piecewise graph, legacy/full graph;
-* sync mode: host_callback, wait_kernel;
+* sync mode: eager host_callback, graph host_callback, graph wait_kernel;
 * workload cell: B=64 short decode and B=1 long decode.
 """
 
@@ -126,13 +126,6 @@ def arms() -> tuple[Arm, ...]:
     )
     return (
         Arm("eager_host", "eager", "eager", "host_callback", ()),
-        Arm(
-            "eager_wait",
-            "eager",
-            "eager",
-            "wait_kernel",
-            ("--cots-weight-capture-sync-mode", "wait_kernel"),
-        ),
         Arm("piecewise_wait", "graph", "piecewise", "wait_kernel", ()),
         Arm("piecewise_host", "graph", "piecewise", "host_callback", piecewise_host),
         Arm("full_host", "graph", "full", "host_callback", full_host),

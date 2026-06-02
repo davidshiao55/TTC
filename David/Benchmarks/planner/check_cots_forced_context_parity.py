@@ -37,7 +37,7 @@ os.environ["PYTHONPATH"] = (
 
 MODEL = "Qwen/Qwen2.5-7B-Instruct"
 DTYPE = "bfloat16"
-CAPTURE_BUCKETS = (
+DISPATCH_BUCKETS = (
     1,
     2,
     4,
@@ -104,10 +104,10 @@ def default_results_dir() -> Path:
 
 
 def bucket_for(n: int) -> int:
-    for bucket in CAPTURE_BUCKETS:
+    for bucket in DISPATCH_BUCKETS:
         if n <= bucket:
             return int(bucket)
-    return int(CAPTURE_BUCKETS[-1])
+    return int(DISPATCH_BUCKETS[-1])
 
 
 def make_prompts(batch: int, prompt_tokens: int):
@@ -133,12 +133,12 @@ def dispatch_table(
     if layout == "uniform":
         return {
             int(bucket): (float(f_cpu), float(f_prefetch))
-            for bucket in CAPTURE_BUCKETS
+            for bucket in DISPATCH_BUCKETS
         }
     if layout == "decode-only":
         table = {
             int(bucket): (0.0, float(f_cpu_store))
-            for bucket in CAPTURE_BUCKETS
+            for bucket in DISPATCH_BUCKETS
         }
         table[bucket_for(batch)] = (float(f_cpu), float(f_prefetch))
         return table
@@ -146,7 +146,7 @@ def dispatch_table(
 
 
 def thread_table(batch: int, cpu_threads: int) -> dict[int, int]:
-    return {int(bucket): 4 for bucket in CAPTURE_BUCKETS if bucket <= 512} | {
+    return {int(bucket): 4 for bucket in DISPATCH_BUCKETS if bucket <= 512} | {
         bucket_for(batch): int(cpu_threads)
     }
 
