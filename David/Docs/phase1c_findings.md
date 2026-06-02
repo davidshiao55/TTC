@@ -5,6 +5,24 @@ Date: 2026-05-15 cleanup
 Status: production runtime appendix. The top-level Phase 1 source of truth is
 `phase1_findings.md`; this file keeps the final Phase 1c runtime details.
 
+Update 2026-06-02: the Phase 1c graph win remains valid in the measured
+B=1 long-decode regime. Later Planner validation found COTS graph mode could
+lose to eager for B=64 short-decode routes, and full graph could replay without
+COTS CPU work. A follow-up COTS piecewise patch restored graph/eager parity for
+B=64 pure prefetch. A short counter-enabled matrix initially showed a B=64
+pure-CPU eager edge, but a longer no-counter production-path rerun reduced
+that to within-noise parity. The route-specialized full-graph fix makes native
+COTS CPU replay counter-valid again, but valid full-graph COTS rows are slower
+than the current piecewise/eager results. A current host/wait matrix rerun
+shows piecewise wait-kernel beats piecewise host-callback on the tested CPU
+routes, while eager wait-kernel is invalid because eager has no captured sync
+node to replace. The current decision is in
+`graph_eager_sync_mode_investigation_report.md`: full graph is restored as a
+route-specialized A/B candidate but is not the default; piecewise graph remains
+the graph-correct COTS CPU path; wait-kernel remains the graph-sync default;
+host-callback remains the eager sync mechanism; profile-gated eager fallback is
+future Planner safety work, not a per-bucket default matrix.
+
 ## Outcome
 
 Phase 1c made COTS production-faithful:

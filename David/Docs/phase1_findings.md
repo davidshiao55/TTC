@@ -13,6 +13,22 @@ The older milestone files are now appendices:
 
 `phase1_cleanup_triage.md` was merged into this document and removed.
 
+Update 2026-06-02: later Planner validation refined the Phase 1c graph claim.
+Piecewise graph plus wait-kernel remains the best measured graph path in the
+original B=1 long-decode regime. A follow-up patch restored graph/eager parity
+for the B=64 pure-prefetch route. A short counter-enabled matrix initially
+showed a B=64 pure-CPU eager edge, but a longer no-counter production-path
+rerun reduced that to within-noise parity. A current host/wait matrix rerun
+shows piecewise wait-kernel beats piecewise host-callback on the tested CPU
+routes, but eager wait-kernel is invalid by design because eager has no
+captured sync node to replace. The route-specialized full-graph fix makes
+native COTS CPU replay counter-valid again, but valid full-graph COTS rows are
+slower than the current piecewise/eager results. See
+`graph_eager_sync_mode_investigation_report.md`. The default stays piecewise
+graph plus wait-kernel for graph mode and host-callback for eager mode, with
+full graph restored as an A/B candidate and profile-gated eager fallback left
+as Planner safety work rather than a per-bucket default matrix.
+
 ## Freeze Record
 
 Phase 1 freeze pass was run on 2026-05-15.
