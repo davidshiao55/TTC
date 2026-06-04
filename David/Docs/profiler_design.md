@@ -57,6 +57,38 @@ Effective PCIe H2D bandwidth as a function of transfer size, using pinned memory
 
 CPU attention kernel latency as a 2D grid over `(batch_size, suffix_context_len)`. Used only when attention offloading is enabled. Extends the `num_tokens`-bucket abstraction with a context dimension because attention cost scales with KV length, not just batch.
 
+### 1.5 `cots_snap`
+
+Weight offload profiles also include a compact runtime-realization section:
+
+```json
+{
+  "cots_snap": {
+    "schema_version": 1,
+    "snap_model": "cots_snap_v1",
+    "storage_by_store_fraction": {
+      "0.15": {
+        "cpu_weight_bytes": 1849700000,
+        "gpu_buffer_bytes": 224400000
+      }
+    }
+  }
+}
+```
+
+This is not a new planner decision. It records how the vLLM COTS runtime
+realized requested storage fractions after tensor snapping. vLLM owns the snap
+rules because they depend on model handles and runtime layout: QKV head groups,
+MLP 64-channel granularity, optional WO rows, and buffer slot shapes. The
+Profiler captures the realized bytes and gives the Planner exact resource facts
+for the calibrated storage grid. The Planner may fall back to linear
+coefficients when a profile lacks this section, but validation should use
+`cots_snap` whenever it is available.
+
+At runtime, vLLM emits the same schema as a `[CotsOffloader] cots_snap:` JSON
+log line after weight loading. The profiler can ingest that line directly when
+building the planner-facing `weight_dispatch_profile.json`.
+
 ---
 
 ## 2. Methodology

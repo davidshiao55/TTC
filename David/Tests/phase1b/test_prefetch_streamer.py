@@ -170,7 +170,8 @@ def test_start_skips_when_no_prefetch():
     layers, streamer = _setup_layers(
         n_layers=4, table={1: (0.20, 0.0)}
     )  # f_prefetch=0
-    assert all(h.max_n_prefetch == 0 for h in layers[0])
+    assert all(h.max_n_prefetch == h.n_cpu for h in layers[0])
+    assert all(h.n_prefetch_by_bucket[1] == 0 for h in layers[0])
     streamer.start(0, layers[0])
     assert not streamer._event_valid_for_eager[0]
 

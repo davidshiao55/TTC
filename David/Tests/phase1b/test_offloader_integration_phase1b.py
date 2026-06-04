@@ -200,18 +200,21 @@ def test_phase1b_lifecycle_allocates_streamer_and_pool():
     assert all(not v for v in offloader._streamer._prefetch_in_capture)
 
 
-def test_phase1b_lifecycle_at_zero_prefetch_skips_streamer():
-    """f_prefetch=0 → no prefetch infrastructure (Phase 1a behavior)."""
+def test_phase1b_lifecycle_at_zero_prefetch_reserves_option_a_streamer():
+    """Option-A buffer accounting reserves prefetch infrastructure from
+    f_cpu_store even when this uniform table copies zero prefetch rows."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
     _, offloader = _build_phase1b(f_cpu_store=0.20, f_prefetch=0.0)
-    assert offloader._streamer is None
-    assert offloader._prefetch_buffer_pool is None
-    # Layer modules still tracked, but no slot binding.
+    assert offloader._streamer is not None
+    assert offloader._prefetch_buffer_pool is not None
     for handles in offloader._layer_handles:
         for h in handles:
-            assert h.w_prefetch_slots == []
+            assert h.n_prefetch_by_bucket
+            assert all(n == 0 for n in h.n_prefetch_by_bucket.values())
+            assert h.max_n_prefetch == h.n_cpu
+            assert len(h.w_prefetch_slots) == CotsPrefetchBufferPool.K
 
 
 def test_phase1b_layer_forward_hooks_wired():
@@ -259,9 +262,9 @@ def test_phase1b_dispatch_boundary_prepares_layer0():
     layers, offloader = _build_phase1b(f_cpu_store=0.20, f_prefetch=0.05)
     assert offloader._streamer is not None
     _dispatch(offloader)
-    assert offloader._current_bucket == offloader._bucket_for(MAX_NUM_TOKENS)
+    assert offloader._current_bucket == offloader._dispatch_bucket_for(MAX_NUM_TOKENS)
     for h in offloader._layer_handles[0]:
-        if h.max_n_prefetch == 0:
+        if h.n_prefetch_by_bucket.get(offloader._current_bucket, 0) == 0:
             continue
         assert h.prefetch_owner_in_slot[h.slot_idx] is h
 

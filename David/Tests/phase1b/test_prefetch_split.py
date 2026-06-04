@@ -261,12 +261,12 @@ def test_matched_index_col_row_under_uniform_dispatch():
 # ---------------------------------------------------------------------------
 # max_n_prefetch
 # ---------------------------------------------------------------------------
-def test_max_n_prefetch_tracks_largest_bucket():
+def test_max_n_prefetch_tracks_full_cpu_stored_capacity():
     handle = _make_row(1024)
-    table = {1: (0.10, 0.02), 16: (0.05, 0.05), 64: (0.0, 0.10)}
+    table = {1: (0.10, 0.01), 16: (0.05, 0.02), 64: (0.0, 0.04)}
     handle.apply_prefetch_split_per_bucket(table)
-    expected = max(handle.n_prefetch_by_bucket.values())
-    assert handle.max_n_prefetch == expected
+    assert max(handle.n_prefetch_by_bucket.values()) < handle.n_cpu
+    assert handle.max_n_prefetch == handle.n_cpu
 
 
 def test_empty_table_yields_zero_max_n_prefetch():

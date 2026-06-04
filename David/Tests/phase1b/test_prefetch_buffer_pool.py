@@ -226,36 +226,40 @@ def test_pool_size_independent_of_layer_count():
     )
 
 
-def test_pool_skips_handles_with_zero_prefetch():
-    """Handle with `max_n_prefetch == 0` gets an empty slot list and
-    contributes 0 bytes."""
+def test_pool_reserves_option_a_slots_for_zero_prefetch_handle():
+    """Option-A accounting reserves full-store slots even if this table entry
+    copies zero rows at runtime."""
     qkv_offload = _qkv_handle()
     col_no_prefetch = _col_handle()
 
     qkv_offload.apply_prefetch_split_per_bucket({1: (0.10, 0.10)})
     col_no_prefetch.apply_prefetch_split_per_bucket({1: (0.10, 0.0)})  # f_pref=0
-    assert col_no_prefetch.max_n_prefetch == 0
+    assert col_no_prefetch.n_prefetch_by_bucket[1] == 0
+    assert col_no_prefetch.max_n_prefetch == col_no_prefetch.n_cpu
 
     pool = CotsPrefetchBufferPool(
         [qkv_offload, col_no_prefetch], torch.device("cuda")
     )
 
-    assert col_no_prefetch.w_prefetch_slots == []
+    assert len(col_no_prefetch.w_prefetch_slots) == 2
     assert len(qkv_offload.w_prefetch_slots) == 2
-    # Pool's bytes account only for qkv_offload.
+    # Pool's bytes account for both handles' reserved option-A capacity.
     elem_bytes = torch.empty(0, dtype=DTYPE).element_size()
-    expected = 2 * qkv_offload.max_n_prefetch * qkv_offload.in_dim * elem_bytes
+    expected = 2 * (
+        qkv_offload.max_n_prefetch * qkv_offload.in_dim
+        + col_no_prefetch.max_n_prefetch * col_no_prefetch.in_dim
+    ) * elem_bytes
     assert pool.total_bytes == expected
 
 
-def test_empty_pool_is_legal():
-    """If every handle has max_n_prefetch == 0, the pool allocates nothing
-    and binds no slots."""
+def test_zero_prefetch_table_still_reserves_option_a_pool():
+    """A zero-prefetch table still reserves option-A full-store capacity."""
     col = _col_handle()
     col.apply_prefetch_split_per_bucket({1: (0.10, 0.0)})  # all-cpu, no prefetch
     pool = CotsPrefetchBufferPool([col], torch.device("cuda"))
-    assert pool.total_bytes == 0
-    assert col.w_prefetch_slots == []
+    elem_bytes = torch.empty(0, dtype=DTYPE).element_size()
+    assert pool.total_bytes == 2 * col.max_n_prefetch * col.in_dim * elem_bytes
+    assert len(col.w_prefetch_slots) == 2
 
 
 def test_runtime_narrow_works_at_smaller_buckets():

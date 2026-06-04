@@ -71,6 +71,135 @@ shows a better abstraction, a missing term, or a simpler equivalent model,
 update the design and implementation together rather than preserving an
 equation that no longer predicts the system.
 
+### 0.2 Abstraction boundary
+
+The Planner should be framed as three cooperating abstractions, not as a single
+"dispatch solver":
+
+- **Static placement**: load-time choices that allocate memory across the two
+  engines, weights, and KV pools. This includes `f_cpu_store`, enabled weight
+  modules, `gpu_kv_bytes`, `cpu_kv_bytes`, and engine GPU budgets.
+- **Resource-lane cost model**: a per-bucket evaluator that predicts the GPU,
+  CPU, and PCIe lanes under a static placement and a candidate runtime policy.
+  Today the calibrated lane model covers weight dispatch:
+  `max(G_B(1-u), C_B u, H_B(s-u))`; future KV terms should enter this layer as
+  additional GPU/CPU/PCIe lane costs from the fixed KV placement.
+- **Runtime policy compiler**: bounded, deterministic solvers that emit tables
+  consumed at runtime. For v1, the only runtime-varying policy is weight
+  dispatch, so the implemented `DispatchCompiler` maps
+  `(bucket B, f_cpu_store s)` to `(f_cpu_compute u, f_prefetch_compute s-u)`.
+
+This boundary keeps the current implementation honest: the weight solver is a
+component of the Planner, not the Planner itself. KV placement can influence
+runtime latency through the resource-lane model without becoming another
+per-forward dispatch decision.
+
+The planned implementation follows a three-stage load-time decomposition:
+
+```text
+Stage 0: ModelMemoryPartitioner
+  split shared GPU/CPU memory budgets between generator and verifier
+
+Stage 1: WeightKVPartitioner
+  choose feasible per-engine weight/KV placement under an assigned budget
+  score each candidate with the placement cost model
+
+Stage 2: DispatchCompiler
+  materialize runtime lookup tables for the chosen placement
+```
+
+The current prototype implements Stage 0 as exact enumeration over
+generator/verifier engine-budget splits, Stage 1's weight-only subset, and
+Stage 2.
+
+For the current prototype, the Placement Cost Model scores a candidate CPU
+weight storage fraction `s` by optimizing dispatch internally:
+
+```text
+Score_weight(s) =
+    Σ_B q_B [
+        K(B,s)
+      + min_u max(G_B(1-u), C_B u, H_B(s-u))
+    ]
+```
+
+`q_B` is the bucket distribution for the model/workload. After the per-engine
+partitioner chooses `s`, `DispatchCompiler` reuses the same per-bucket
+`argmin` to emit:
+
+```text
+dispatch[B] = (u*_B, s - u*_B)
+```
+
+This keeps the thesis-level problem as static memory placement under a
+resource-lane cost model, while preserving the runtime invariant that execution
+does only a table lookup. Later KV terms extend `Score_weight` into a full
+placement score by adding GPU/CPU/PCIe KV costs and KV-capacity effects on
+`N_rounds`; they do not require changing the dispatch table abstraction.
+
+The code mirrors this split with visible facades:
+
+```text
+ModelMemoryPartitioner  # choose gen/ver engine budget splits
+WeightKVPartitioner     # Stage 1: choose per-engine weight/KV placement
+DispatchCompiler        # Stage 2: compile dispatch[B] for chosen placement
+```
+
+`WeightKVPartitioner` currently implements the weight-only subset of the full
+per-engine problem: it scores feasible `f_cpu_store` candidates with
+`K(B,s) + min_u lane_cost(B,s,u)`. Given an assigned engine GPU budget, it
+derives the current v1 residual:
+
+```text
+gpu_kv_bytes
+  = engine_gpu_budget_bytes
+  - gpu_weight_bytes(s)
+  - gpu_buffer_bytes(s)
+```
+
+KV memory and KV compute terms will extend that score once the KV profile is
+calibrated.
+
+### 0.3 Development strategy
+
+Planner development should proceed **bottom-up**, while the thesis presents the
+final system **top-down**.
+
+Bottom-up development is the practical path:
+
+1. Calibrate and validate `DispatchCompiler` first. It solves one local
+   variable, `u = f_cpu_compute`, for a fixed bucket and storage fraction.
+2. Use that validated dispatch result inside `WeightKVPartitioner`, which
+   scores per-engine memory-placement candidates.
+3. Let `WeightKVPartitioner` expose engine-local budget breakpoints and solve
+   frontiers under assigned budgets, rather than exposing raw dispatch details.
+4. Use `ModelMemoryPartitioner` to enumerate generator/verifier budget splits
+   under shared memory budgets.
+
+Top-down presentation is still the right thesis story: TTC creates a global
+memory-allocation problem, which decomposes into per-engine weight/KV placement,
+which in turn compiles into per-bucket dispatch tables.
+
+This also clarifies the role of brute-force experiments. Exhaustive sweeps are
+profiling and validation tools: they reveal patterns, fit coefficients, and
+check residuals. The final Planner should be described as a
+**frontier-based hierarchical optimizer**, not as blind brute force. Each layer
+solves or summarizes its local subproblem and passes a compact frontier upward.
+
+For the current two-model FastTTS setting, combining generator and verifier
+frontiers by exact pairwise enumeration is sufficient and easier to debug than
+a full DP/ILP solver. The same formulation generalizes naturally:
+
+- pairwise frontier enumeration for the current generator/verifier system;
+- dynamic programming / multiple-choice knapsack if there are many engines,
+  many independent placement groups, or fine memory-budget bins;
+- ILP only if the final constraints become irregular enough that a tabular DP
+  is awkward.
+
+The dispatch layer should not use DP: after fixing `B` and `s`, it is a
+one-variable solve. The DP-like structure belongs at the memory-placement layer,
+where candidates compete for shared GPU and CPU budgets.
+
 ---
 
 ## 1. Inputs
@@ -96,9 +225,10 @@ Host_RAM_budget = total_RAM − OS_overhead
 ```
 
 - `|B_prefetch|` is the layer-ahead weight-prefetch buffer reservation per
-  model. The engine-local resolver computes the exact bytes for a candidate
-  dispatch plan; the Planner may use a conservative upper bound during early
-  candidate pruning.
+  model. vLLM's runtime pool is sized from the maximum effective prefetch rows
+  across dispatch buckets, but the Planner uses an option-A conservative
+  full-store reservation so buffer capacity depends on `f_cpu_store`, not on
+  the chosen dispatch table.
 - `vLLM_overhead` ≈ 1–2 GB from engine process state (see `vllm_v1_migration.md`)
 
 FastTTS runs two engines (generator + verifier) sharing the GPU. The
@@ -241,11 +371,11 @@ Per model `m ∈ {generator, verifier}`:
   policy should keep it disabled unless memory pressure makes the measured
   latency cost worthwhile (see `weight_offload_design.md §WO Split Axis
   Decision`).
-- `KV_gpu_bytes_m` — GPU KV pool size
-- `KV_cpu_bytes_m` — CPU KV pool size (the "extension")
+- `gpu_kv_bytes_m` — GPU KV pool size
+- `cpu_kv_bytes_m` — CPU KV pool size (the "extension")
 
 The verifier often degenerates to `f_cpu_store_ver = 0` and
-`KV_cpu_bytes_ver = 0` on a 24 GB RTX 4090 with a 1.5B PRM — the Planner
+`cpu_kv_bytes_ver = 0` on a 24 GB RTX 4090 with a 1.5B PRM — the Planner
 discovers this rather than assuming it.
 
 ### 4.2 Engine-Local Resolved Plan
@@ -375,28 +505,28 @@ Planner's eager-fallback entry.
 ### 5.1 VRAM
 
 ```
-Σ_{m ∈ {gen, ver}} (W_gpu_m + KV_gpu_m + |B_prefetch_m|) ≤ VRAM_budget
+Σ_{m ∈ {gen, ver}} (gpu_weight_bytes_m + gpu_kv_bytes_m + gpu_buffer_bytes_m) ≤ VRAM_budget
 ```
 
-Where `W_gpu_m = (1 − f_cpu_store_m) × total_weight_bytes_m`.
+Where `gpu_weight_bytes_m = (1 − f_cpu_store_m) × total_weight_bytes_m`.
 
 ### 5.2 Host RAM
 
 ```
-Σ_{m ∈ {gen, ver}} (W_cpu_m + KV_cpu_m) ≤ Host_RAM_budget
+Σ_{m ∈ {gen, ver}} (cpu_weight_bytes_m + cpu_kv_bytes_m) ≤ Host_RAM_budget
 ```
 
-Where `W_cpu_m = f_cpu_store_m × total_weight_bytes_m`.
+Where `cpu_weight_bytes_m = f_cpu_store_m × total_weight_bytes_m`.
 
 ### 5.3 KV pool sizing floor
 
 The combined KV capacity must cover the target workload's logical KV need:
 
 ```
-KV_gpu_m + KV_cpu_m ≥ KV_needed_m(strategy, n, max_context)
+gpu_kv_bytes_m + cpu_kv_bytes_m ≥ kv_needed_bytes_m(strategy, n, max_context)
 ```
 
-For best-of-N, `KV_needed_m` is close to `n × max_context ×
+For best-of-N, `kv_needed_bytes_m` is close to `n × max_context ×
 kv_bytes_per_token_m` because rollouts share little beyond the prompt. For beam
 search, shared prefixes reduce the logical-to-physical KV ratio, so
 `KV_needed_m` is derived from the workload contract's prefix-sharing model.
@@ -521,26 +651,54 @@ traced `q_m,b` without changing the Planner interface.
 
 ## 7. Solution Method
 
-### 7.1 Model first, solver second
+### 7.1 Frontier-based hierarchy
 
 The thesis should present the Planner as the constrained performance model in
 §5-§6. The implementation solver is an engineering choice. Because legal tensor
 splits and KV allocations are snapped to runtime geometry, the practical
 problem is discrete even though the equations are written in fractional form.
 
-The first implementation uses a deterministic bounded search over the feasible
-snapped plan space:
+The implementation should use a frontier-based hierarchy:
 
-1. Generate legal placement candidates after snapping weight fractions and KV
-   bytes to the engine's alignment constraints.
-2. Reject candidates that violate VRAM, host RAM, or KV floor constraints.
-3. For each remaining placement, derive the best per-bucket dispatch table
-   allowed by that placement.
-4. Score the full candidate with the TTC objective.
-5. Emit the lowest-latency feasible plan plus diagnostics.
+1. `DispatchCompiler` solves the local per-bucket dispatch problem for fixed
+   placement, returning the best `u`, predicted latency, and bottleneck.
+2. `WeightKVPartitioner` exposes snapped per-engine minimum-budget
+   breakpoints, then solves placement candidates under an assigned engine
+   budget. This is where residual `gpu_kv_bytes` is derived.
+3. `ModelMemoryPartitioner` enumerates generator/verifier engine-budget splits
+   under shared GPU/CPU budgets and selects the lowest predicted TTC objective.
 
-The contribution is the modeled objective and constraints; deterministic
-candidate search is just the robust solver for a small snapped space.
+This is not blind brute force. The candidate generation is bounded by real
+runtime breakpoints, and each layer passes only nondominated candidates upward.
+The contribution is the modeled objective, constraints, and decomposition;
+deterministic frontier enumeration is the robust solver for the current small
+snapped space.
+
+For two engines, exact pairwise frontier enumeration is enough:
+
+```text
+best = None
+for split in candidate_budget_splits:
+    gen_frontier = generator_weight_kv.solve(split.generator_budget)
+    ver_frontier = verifier_weight_kv.solve(split.verifier_budget)
+    for g in gen_frontier:
+        for v in ver_frontier:
+            if fits_global_budgets(g, v):
+                score = TTC_objective(g, v, workload)
+                best = min(best, (score, g, v))
+```
+
+If the system later adds more engines or many independent memory-placement
+groups, this same abstraction becomes a dynamic program over memory budgets:
+
+```text
+dp[i][gpu_used][cpu_used] =
+    best objective after choosing candidates for the first i groups
+```
+
+An ILP formulation is also possible, but it should be treated as a presentation
+or future generalization unless the constraints become irregular enough to make
+frontier enumeration or DP awkward.
 
 ### 7.2 Placement candidate generation
 
@@ -554,9 +712,62 @@ arbitrary dense grid:
 - small prefetch-fraction breakpoints around the measured throughput crossover
   region
 
+In the current implementation, `WeightKVPartitioner` first exposes exact
+weight+buffer feasibility breakpoints:
+
+```text
+min_engine_gpu_budget(s)
+  = gpu_weight_bytes(s) + gpu_buffer_bytes(s)
+```
+
+`ModelMemoryPartitioner` combines those breakpoints with a coarse
+`global.engine_gpu_budget_step_bytes` grid to enumerate generator/verifier
+engine-budget splits. Then `WeightKVPartitioner` solves each assigned engine
+budget; any budget above `min_engine_gpu_budget(s)` becomes that engine's
+derived `gpu_kv_bytes`.
+
+The current conservative buffer model is:
+
+```text
+gpu_buffer_bytes(s)
+  = round(s * gpu_buffer_bytes_per_store_fraction)
+```
+
+where `gpu_buffer_bytes_per_store_fraction` is the full-store COTS GPU
+workspace estimate: full prefetch pool plus GPU output scratch. The normal
+planner path derives that coefficient from model geometry:
+
+```text
+prefetch_pool_full_store_bytes
+  = K_slots × dtype_bytes × Σ_unique_enabled_slot_shapes slot_numel
+
+output_scratch_full_store_bytes
+  = max_num_batched_tokens × max_enabled_cpu_output_dim × dtype_bytes
+```
+
+The prefetch term is intentionally based on unique slot shapes, not total layer
+count, because vLLM shares `K=2` prefetch slots across layers with the same
+role/shape. A profiler may also emit the already-combined
+`gpu_buffer_bytes_per_store_fraction`; a fixed `gpu_buffer_bytes` remains
+available as a debug/override path.
+
 This keeps the solver explainable: each candidate corresponds to a real runtime
-geometry change. If the candidate set grows later, use coordinate descent or
-dynamic programming over memory budgets, but keep the same objective.
+geometry change. After scoring, prune candidates that are worse in both
+resources and objective than another candidate:
+
+```text
+drop a if exists b such that:
+    b.gpu_bytes <= a.gpu_bytes
+    b.cpu_bytes <= a.cpu_bytes
+    b.predicted_objective <= a.predicted_objective
+    b.gpu_kv_bytes >= a.gpu_kv_bytes
+    and at least one comparison is strict
+```
+
+For the current weight-only subset, the frontier axes are `gpu_bytes`,
+`cpu_bytes`, `gpu_kv_bytes`, and predicted bucket-weighted latency. Once KV is
+added, the frontier can convert KV capacity into admitted batch, expected
+rounds, or a direct `N_rounds` multiplier.
 
 ### 7.3 Dispatch solve per bucket
 
@@ -596,29 +807,213 @@ the critical path. Because CPU μs/MB is uniform across WQKV/MLP1/MLP2
 (`phase0_findings.md §0.3.4`), the CPU-fit approximation can use a single
 throughput constant once validated, not per-sub-module lookups.
 
-**Validation checkpoint (2026-06-01, Qwen2.5-7B-Instruct, graph mode,
-`input_len=8`, `output_len=32`).** The validation harness now supports
-`dispatch_layout=decode-only`: every non-decode bucket is fixed to pure
-prefetch, and only the measured decode bucket varies. This isolates the decode
-policy from prefill contamination. Under this isolation, pure CPU decode won
-through `f_cpu_store=0.40` for both B=16 and B=64:
+**Validation checkpoint (2026-06-03, Qwen2.5-7B-Instruct, graph mode,
+`input_len=8`, `output_len=32`).** After separating CUDA graph capture buckets
+from COTS dispatch buckets, the validation harness supports non-uniform routing:
+every non-decode bucket is fixed to pure prefetch and only the measured decode
+bucket varies. This isolates decode policy from prefill contamination and
+supports the three-lane overlap model:
 
-| decode B | `f_cpu_store` | pure prefetch | best hybrid | pure CPU decode | best |
-|---:|---:|---:|---:|---:|---|
-| 16 | 0.25 | 4.6601 s | 1.0027 s | 0.8751 s | pure CPU |
-| 16 | 0.30 | 5.5098 s | 1.1521 s | 0.9181 s | pure CPU |
-| 16 | 0.40 | 7.2146 s | 1.4892 s | 1.2517 s | pure CPU |
-| 64 | 0.25 | 4.6613 s | 1.1382 s | 0.9285 s | pure CPU |
-| 64 | 0.30 | 5.5381 s | 1.2236 s | 1.0127 s | pure CPU |
-| 64 | 0.40 | 7.3241 s | 1.5847 s | 1.1869 s | pure CPU |
+```text
+T_decode(B, s, u) =
+    K(B,s) + max(
+        G_B * (1 - u),
+        C_B * u,
+        H_B * (s - u),
+    )
+```
 
-The same harness at `f_cpu_store=0.15` showed pure CPU decode at 0.7288 s
-(B=16) and 0.7921 s (B=64), while pure prefetch was ~2.8 s in both cases.
-A dry-run control made near-CPU hybrid and pure CPU essentially identical, so
-the remaining hybrid penalty comes from real H2D/prefetched-slice GPU work, not
-from dispatch-table or CUDA-graph control overhead. The immediate Planner rule
-is: do not infer "CPU is bad" from uniform prefill+decode sweeps; solve decode
-and prefill-heavy buckets separately from profiled phase-specific costs.
+where `s = f_cpu_store`, `u = f_cpu_compute`, and `s - u` is the prefetched
+CPU-resident weight fraction. `G_B` is measured with the `--cots-dry-run`
+control, while `K(B,s)` is the split-invariant cost for that bucket and storage
+fraction: it may change with `B` or `s`, but not with the CPU-vs-prefetch split
+`u`. A snapped-grid fit over B=8/16/32/64 matched the measured best split for
+every store fraction except one B=8 near-tie, where the predicted cell was one
+grid step away and only 5 us slower:
+
+| decode B | G s/frac | C s/frac | H s/frac | C/H | continuous u*/s | rank check |
+|---:|---:|---:|---:|---:|---:|---|
+| 8 | 0.4440 | 8.3320 | 13.0612 | 0.638 | 0.611 | 4/5 exact, 5/5 +/-1 |
+| 16 | 0.4454 | 13.0482 | 13.4518 | 0.970 | 0.508 | 4/4 exact |
+| 32 | 0.4675 | 25.5703 | 14.6419 | 1.746 | 0.364 | 5/5 exact |
+| 64 | 0.4698 | 49.4604 | 15.0140 | 3.294 | 0.233 | 4/4 exact |
+
+The measured optima move smoothly with batch: roughly 61% of the CPU-resident
+slice should compute on CPU at B=8, 51% at B=16, 36% at B=32, and 23% at B=64.
+In this decode grid, the GPU lane is measured and included but is not the active
+bottleneck; the best split is set by balancing CPU compute against H2D prefetch.
+The Planner rule is therefore: keep the three-lane model, solve per bucket, and
+profile prefill-heavy buckets separately before applying the same rule there.
+
+**Planner hook (2026-06-03).** `fit_dispatch_cost_model.py` now exports a
+`weight_dispatch_profile.json` artifact with schema
+`weight_three_lane_v1`, containing `G_B`, `C_B`, `H_B`, optional `K(B,s)`
+values per calibrated bucket, and a minimal `weight_resource_model`. This JSON
+is the Profiler output and Planner input:
+
+```json
+{
+  "schema_version": 1,
+  "dispatch_model": "weight_three_lane_v1",
+  "weight_resource_model": {
+    "total_weight_bytes": 123456789,
+    "gpu_buffer_bytes_per_store_fraction": 987654321,
+    "buffer_model": "cots_option_a_v1"
+  },
+  "cots_snap": {
+    "schema_version": 1,
+    "snap_model": "cots_snap_v1",
+    "storage_by_store_fraction": {
+      "0.15": {
+        "cpu_weight_bytes": 1849700000,
+        "gpu_buffer_bytes": 224400000
+      }
+    }
+  },
+  "buckets": {
+    "8": {
+      "G_s_per_fraction": 0.444,
+      "C_s_per_fraction": 8.332,
+      "H_s_per_fraction": 13.061,
+      "K_by_store_s": {
+        "0.15": 0.592
+      }
+    }
+  }
+}
+```
+
+`weight_resource_model` is the compact resource model: total weight bytes plus
+the option-A full-store GPU-buffer coefficient used for linear fallback. The
+`cots_snap` block is the runtime realization profile. It records what vLLM COTS
+actually produced after projecting requested fractions onto legal tensor
+geometry:
+
+```text
+requested placement policy -> COTS snapping -> realized placement geometry
+```
+
+vLLM remains the source of truth for snapping because it owns the actual tensor
+handles, QKV head grouping, MLP 64-channel granularity, WO opt-in behavior, and
+prefetch-slot layout. The Planner consumes the realized consequences as
+calibrated facts. When `cots_snap.storage_by_store_fraction[s]` contains exact
+`cpu_weight_bytes` or `gpu_buffer_bytes`, those values override the linear
+estimate for that `s`; otherwise the planner falls back to
+`total_weight_bytes * s` and `gpu_buffer_bytes_per_store_fraction * s`.
+
+The older direct maps under `weight_resource_model` remain accepted for
+compatibility:
+
+```json
+{
+  "weight_resource_model": {
+    "total_weight_bytes": 123456789,
+    "gpu_buffer_bytes_per_store_fraction": 987654321,
+    "cpu_weight_bytes_by_store_fraction": {
+      "0.15": 1849700000
+    },
+    "gpu_buffer_bytes_by_store_fraction": {
+      "0.15": 224400000
+    }
+  }
+}
+```
+
+The planner does not need raw model geometry in the normal path; geometry and
+slot-shape breakdowns belong in profiler debug artifacts unless a later planner
+variable uses them.
+The current fit helper accepts `--total-weight-bytes` and
+`--gpu-buffer-bytes-per-store-fraction` (or prefetch/scratch component split
+flags) to attach the compact resource model. When snapped byte maps are supplied
+with `--cpu-weight-bytes-by-store-fraction-json` and
+`--gpu-buffer-bytes-by-store-fraction-json`, the helper also emits
+`cots_snap_v1`.
+The FastTTS manual planner can consume this via
+`weight.dispatch_cost_profile_path` plus explicit `weight.dispatch_buckets`.
+With a fixed `weight.f_cpu_store`, it derives the runtime
+`cots_dispatch_table`; with global model-memory planning, it derives the
+candidate storage grid from the common `K(B,s)` support in the profiler artifact
+unless `weight.f_cpu_store_candidates` is supplied as an explicit experiment
+constraint. It then runs `WeightKVPartitioner` over those feasible storage
+candidates and compiles the dispatch table for the selected storage fraction.
+The current exact-bucket solver does not interpolate unprofiled buckets; production configs
+must either provide a coefficient row for each dispatch bucket or intentionally
+restrict the dispatch bucket grid to the calibrated set. The measured-grid
+regression is `validate_weight_dispatch_solver.py`: the current B=8/16/32/64
+decode profile matches 17/18 best cells exactly and 18/18 within one grid step.
+
+The planner also has a first config-facing Stage-0 path: if `planner_config`
+contains a `global` block with shared `gpu_budget_bytes` and `cpu_budget_bytes`,
+both generator and verifier provide dispatch cost profiles with
+`weight_resource_model` and calibrated dispatch buckets. `ModelMemoryPartitioner`
+derives per-engine GPU-budget candidates from the global GPU budget, Stage-1
+weight+buffer feasibility breakpoints, and optional
+`global.engine_gpu_budget_step_bytes`. Explicit `weight.f_cpu_store_candidates`
+and `weight.engine_gpu_budget_candidates` remain debug/override paths. The planner
+uses `ModelMemoryPartitioner` to enumerate engine budget splits, asks each
+`WeightKVPartitioner` to solve placement under its assigned budget, and then
+emits ordinary engine-local vLLM overrides:
+
+Resource-field naming follows the placement perspective and uses device-first
+byte fields: `gpu_weight_bytes`, `cpu_weight_bytes`, `gpu_kv_bytes`,
+`cpu_kv_bytes`, and `gpu_buffer_bytes`. The last field is reserved COTS GPU
+workspace: conservative full-store prefetch slots plus GPU output scratch. In
+the full model, both `gpu_buffer_bytes` and `gpu_kv_bytes` are derived:
+`gpu_buffer_bytes` from `f_cpu_store`, and `gpu_kv_bytes` inside
+`WeightKVPartitioner` from the chosen engine GPU budget after
+`gpu_weight_bytes` and `gpu_buffer_bytes` are reserved.
+Until the full KV-capacity objective lands, equal-latency model-memory
+candidates are tie-broken by maximizing the smaller per-engine `gpu_kv_bytes`
+before maximizing total assigned GPU bytes. This keeps the current two-engine
+plans from assigning all residual KV to one role merely because weight latency
+is identical.
+
+```yaml
+planner_config:
+  global:
+    gpu_budget_bytes: ...
+    cpu_budget_bytes: ...
+    engine_gpu_budget_step_bytes: ...  # optional
+    engine_weights:
+      generator: 1.0
+      verifier: 1.0
+  generator:
+    weight:
+      dispatch_cost_profile_path: ...
+      dispatch_buckets: [8, 16, 32, 64]
+  verifier:
+    weight:
+      dispatch_cost_profile_path: ...
+      dispatch_buckets: [8, 16, 32, 64]
+```
+
+For planner-only checks, use:
+
+```bash
+python David/Benchmarks/planner/plan_from_profiles.py \
+  --generator-profile gen_weight_profile.json \
+  --verifier-profile ver_weight_profile.json \
+  --gpu-budget-gb 22 \
+  --cpu-budget-gb 96 \
+  --dispatch-buckets 8,16,32,64
+```
+
+After launching vLLM/FastTTS with the emitted plan, validate that the runtime
+reserved the same resources:
+
+```bash
+python David/Benchmarks/planner/validate_runtime_memory_accounting.py \
+  --plan-json planner_plan.json \
+  --runtime-log run.log \
+  --role-order generator,verifier
+```
+
+This compares planner `cpu_weight_bytes` against COTS `weights_saved`,
+`gpu_buffer_bytes` against runtime `gpu_uva + prefetch_pool`,
+`gpu_kv_bytes` against `kv_cache_memory_bytes`, and the dispatch table against
+the one-time COTS dispatch policy log. These checks are intentionally about
+accounting and route application, not throughput; performance validation still
+uses the measured grid and end-to-end benchmark runs.
 
 **Layer-ahead prefetch feasibility check**: the total prefetch per layer is `f_prefetch × Σ_m W_m` (sum over {WQKV, MLP1, MLP2}). Cap `f_prefetch` if it exceeds `layer_time × pcie_h2d_bw`; excess falls back to `f_cpu`.
 
@@ -660,7 +1055,7 @@ Restated informally:
 
 Two separate reasons the verifier's plan can degenerate:
 
-**Small verifier** (size-driven): with FastTTS defaults (Qwen2.5-Math-1.5B generator + Skywork-PRM-1.5B verifier on RTX 4090), the verifier is 1.5B × 2 bytes ≈ 3 GB and fits easily alongside the generator. Planner typically finds `f_cpu_store_ver = 0`, `KV_cpu_bytes_ver = 0`.
+**Small verifier** (size-driven): with FastTTS defaults (Qwen2.5-Math-1.5B generator + Skywork-PRM-1.5B verifier on RTX 4090), the verifier is 1.5B × 2 bytes ≈ 3 GB and fits easily alongside the generator. Planner typically finds `f_cpu_store_ver = 0`, `cpu_kv_bytes_ver = 0`.
 
 **Different bucket pattern** (pattern-driven, §3): the verifier's medium-`num_tokens` buckets have less GPU idle time than the generator's, so even when offloading the verifier is feasible, `f_cpu_compute` is typically smaller and `f_prefetch_compute` is preferred. This is expected — the Planner's bucket-indexed dispatch handles it automatically.
 
@@ -672,8 +1067,8 @@ Both are emergent properties of the optimization, not hardcoded assumptions. Whe
 
 The Planner can report infeasibility for three reasons:
 
-1. **VRAM infeasible**: even at `f_cpu_store_m = 1`, weights + KV_gpu + overhead exceeds VRAM. Caller must reduce `n` or `max_context`.
-2. **RAM infeasible**: even at `f_cpu_store_m = 0` for both models, `KV_cpu` exceeds host RAM. Same remedy.
+1. **VRAM infeasible**: even at `f_cpu_store_m = 1`, weights + `gpu_kv_bytes` + overhead exceeds VRAM. Caller must reduce `n` or `max_context`.
+2. **RAM infeasible**: even at `f_cpu_store_m = 0` for both models, `cpu_kv_bytes` exceeds host RAM. Same remedy.
 3. **PCIe infeasible at all dispatch splits**: cannot hide any `f_prefetch_compute`, and `f_cpu_compute` slows decode beyond a user-specified threshold. Caller must reduce `n` or accept slower decode.
 
 The Planner returns a structured error identifying which constraint is tight. The Scheduler never runs without a feasible plan.
@@ -699,7 +1094,7 @@ describes how to validate the Planner itself once an evaluation target is
 chosen:
 
 - **Ablation**: mechanism-only (manual constant placement) vs Planner-chosen. Expected: Planner matches or beats manual tuning without human effort.
-- **`n` sweep**: for each `n ∈ {1, 4, 16, 64, 256}`, run Planner, measure throughput/latency. Expected: `f_cpu_store` and `KV_cpu_bytes` scale monotonically with `n`; throughput improvement is bucket-dependent.
+- **`n` sweep**: for each `n ∈ {1, 4, 16, 64, 256}`, run Planner, measure throughput/latency. Expected: `f_cpu_store` and `cpu_kv_bytes` scale monotonically with `n`; throughput improvement is bucket-dependent.
 - **Model prediction accuracy**: compare predicted `T_TTC`, per-model forward
   latency, and KV admission rounds against measured FastTTS runs.
 - **Workload contract ablation**: analytic `q_m,b` vs short traced `q_m,b`.
