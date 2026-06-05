@@ -100,7 +100,6 @@ def _drive_post_init(
                 f_cpu_store=0.10,
                 cpu_runner=cpu_runner,
                 weight_capture_sync_mode=("wait_kernel" if wait_kernel else "host_callback"),
-                kv_biased=True,
             )
         )
         set_offloader(offloader)
@@ -196,7 +195,6 @@ def test_wait_kernel_install_marks_every_slab() -> None:
                 f_cpu_store=0.10,
                 cpu_runner="native",
                 weight_capture_sync_mode="wait_kernel",
-                kv_biased=True,
             )
         )
         set_offloader(offloader)

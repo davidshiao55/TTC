@@ -4,8 +4,8 @@ from vllm.config import CotsOffloadConfig, OffloadConfig
 from vllm.model_executor.offloader.base import create_offloader
 
 
-def test_cots_weight_modules_default_to_qkv_mlp():
-    assert CotsOffloadConfig().weight_modules == {"qkv", "mlp"}
+def test_cots_weight_modules_default_to_production_modules():
+    assert CotsOffloadConfig().weight_modules == {"qkv", "mlp", "wo"}
 
 
 def test_cots_weight_modules_accept_list_and_comma_separated_forms():
@@ -61,49 +61,6 @@ def test_cots_dispatch_table_factory_requires_all_dispatch_buckets():
     with pytest.raises(ValueError, match="missing dispatch buckets"):
         offloader._dispatch_table_factory([64, 128])
     assert offloader._dispatch_table_factory([64]) == {64: (0.04, 0.06)}
-
-
-def test_cots_module_dispatch_table_config_accepts_valid_entries():
-    cots = CotsOffloadConfig(
-        f_cpu_store=0.10,
-        dispatch_table_by_module={
-            "qkv": {64: (0.00, 0.10)},
-            "mlp": {64: (0.10, 0.00)},
-        },
-    )
-    config = OffloadConfig(offload_backend="cots", cots=cots)
-
-    assert config.cots.dispatch_table_by_module == {
-        "qkv": {64: (0.00, 0.10)},
-        "mlp": {64: (0.10, 0.00)},
-    }
-
-
-def test_cots_module_dispatch_table_rejects_disabled_module():
-    with pytest.raises(ValueError, match="but cots.weight_modules"):
-        CotsOffloadConfig(
-            f_cpu_store=0.10,
-            weight_modules={"qkv"},
-            dispatch_table_by_module={
-                "mlp": {64: (0.10, 0.00)},
-            },
-        )
-
-
-def test_cots_module_dispatch_table_factory_requires_all_dispatch_buckets():
-    cots = CotsOffloadConfig(
-        f_cpu_store=0.10,
-        dispatch_table={64: (0.04, 0.06), 128: (0.04, 0.06)},
-        dispatch_table_by_module={"mlp": {64: (0.10, 0.00)}},
-    )
-    offloader = create_offloader(OffloadConfig(offload_backend="cots", cots=cots))
-
-    assert offloader._module_dispatch_table_factory is not None
-    with pytest.raises(ValueError, match="mlp.*missing dispatch buckets"):
-        offloader._module_dispatch_table_factory([64, 128])
-    assert offloader._module_dispatch_table_factory([64]) == {
-        "mlp": {64: (0.10, 0.00)}
-    }
 
 
 def test_cots_eager_dispatch_uses_explicit_dispatch_bucket_grid(monkeypatch):

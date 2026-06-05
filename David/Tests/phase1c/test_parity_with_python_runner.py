@@ -179,7 +179,6 @@ def _build_qkv(
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
                 f_prefetch=f_prefetch,
-                kv_biased=True,
                 cpu_runner=cpu_runner,
             )
         )
@@ -208,7 +207,6 @@ def _build_mlp(
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
                 f_prefetch=f_prefetch,
-                kv_biased=True,
                 cpu_runner=cpu_runner,
             )
         )
@@ -235,7 +233,6 @@ def _build_wo(
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
                 f_prefetch=f_prefetch,
-                kv_biased=True,
                 weight_modules={"wo"},
                 cpu_runner=cpu_runner,
             )

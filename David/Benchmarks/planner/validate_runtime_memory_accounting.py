@@ -42,7 +42,6 @@ COTS_POLICY_RE = re.compile(
     r"\[CotsOffloader\] dispatch policy: "
     rf"f_cpu_store=(?P<f_cpu_store>{FLOAT_RE}), "
     r"dispatch_table=(?P<dispatch_table>\{.*?\})"
-    r"(?:, dispatch_table_by_module=(?P<dispatch_table_by_module>\{.*\}))?$"
 )
 
 KV_RESERVED_RAW_RE = re.compile(
@@ -79,7 +78,6 @@ class CotsPolicyRecord:
     line_number: int
     f_cpu_store: float
     dispatch_table: dict[int, tuple[float, float]]
-    dispatch_table_by_module: dict[str, dict[int, tuple[float, float]]]
 
 
 @dataclass(frozen=True)
@@ -136,23 +134,10 @@ def _parse_policy_record(match: re.Match[str], line_number: int) -> CotsPolicyRe
     raw_table = ast.literal_eval(match.group("dispatch_table"))
     if not isinstance(raw_table, Mapping):
         raise ValueError("runtime dispatch_table must be a mapping")
-    raw_by_module_text = match.group("dispatch_table_by_module")
-    if raw_by_module_text is None:
-        raw_by_module: Mapping[str, Any] = {}
-    else:
-        parsed = ast.literal_eval(raw_by_module_text)
-        if not isinstance(parsed, Mapping):
-            raise ValueError("runtime dispatch_table_by_module must be a mapping")
-        raw_by_module = parsed
-    by_module = {
-        str(module): _normalize_dispatch_table(table)
-        for module, table in raw_by_module.items()
-    }
     return CotsPolicyRecord(
         line_number=line_number,
         f_cpu_store=float(match.group("f_cpu_store")),
         dispatch_table=_normalize_dispatch_table(raw_table),
-        dispatch_table_by_module=by_module,
     )
 
 

@@ -195,7 +195,6 @@ def _build_and_run(f_cpu_store, f_prefetch, x, per_layer_weights):
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
                 f_prefetch=f_prefetch,
-                kv_biased=True,
                 cpu_runner="python",
             )
         )

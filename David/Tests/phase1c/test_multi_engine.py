@@ -97,7 +97,6 @@ def _build_qkv_offloader(
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
                 cpu_runner="native",
-                kv_biased=True,
             )
         )
         # NB: set_offloader is global; the test cycles which offloader

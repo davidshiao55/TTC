@@ -214,37 +214,6 @@ def make_dispatch_table(
     raise ValueError(f"unknown dispatch layout: {layout}")
 
 
-def make_module_dispatch_table(
-    *,
-    dispatch_buckets: list[int],
-    f_cpu_store: float,
-    batch: int,
-    policy: str,
-) -> dict[str, dict[int, tuple[float, float]]]:
-    if policy == "none":
-        return {}
-    if policy == "qkv-prefetch-mlp-cpu":
-        qkv_table = make_dispatch_table(
-            dispatch_buckets=dispatch_buckets,
-            f_cpu=0.0,
-            f_prefetch=f_cpu_store,
-            f_cpu_store=f_cpu_store,
-            batch=batch,
-            layout="decode-only",
-        )
-        mlp_table = make_dispatch_table(
-            dispatch_buckets=dispatch_buckets,
-            f_cpu=0.0,
-            f_prefetch=f_cpu_store,
-            f_cpu_store=f_cpu_store,
-            batch=batch,
-            layout="decode-only",
-        )
-        mlp_table[bucket_for(batch, dispatch_buckets)] = (f_cpu_store, 0.0)
-        return {"qkv": qkv_table, "mlp": mlp_table}
-    raise ValueError(f"unknown module dispatch policy: {policy}")
-
-
 def bucket_for(num_tokens: int, dispatch_buckets: list[int]) -> int:
     for bucket in sorted(dispatch_buckets):
         if int(num_tokens) <= int(bucket):
@@ -256,15 +225,6 @@ def jsonable_dispatch_table(
     table: dict[int, tuple[float, float]],
 ) -> dict[str, list[float]]:
     return {str(bucket): [entry[0], entry[1]] for bucket, entry in table.items()}
-
-
-def jsonable_module_dispatch_table(
-    table: dict[str, dict[int, tuple[float, float]]],
-) -> dict[str, dict[str, list[float]]]:
-    return {
-        module: jsonable_dispatch_table(entries)
-        for module, entries in table.items()
-    }
 
 
 def cots_flags(args: argparse.Namespace, cell: Cell) -> list[str]:
@@ -292,20 +252,6 @@ def cots_flags(args: argparse.Namespace, cell: Cell) -> list[str]:
         "--cots-cpu-runner",
         args.cots_cpu_runner,
     ]
-    if args.module_dispatch_policy != "none":
-        module_table = make_module_dispatch_table(
-            dispatch_buckets=args.dispatch_buckets,
-            f_cpu_store=cell.f_cpu_store,
-            batch=cell.batch,
-            policy=args.module_dispatch_policy,
-        )
-        flags += [
-            "--cots-dispatch-table-by-module",
-            json.dumps(
-                jsonable_module_dispatch_table(module_table),
-                separators=(",", ":"),
-            ),
-        ]
     if args.cots_weight_modules:
         flags += ["--cots-weight-modules", *args.cots_weight_modules]
     if args.thread_policy == "workscore":
@@ -578,7 +524,6 @@ def summarize(args: argparse.Namespace, modes: list[str], cells: list[Cell]) -> 
             "cots_cpu_runner": args.cots_cpu_runner,
             "cots_weight_modules": args.cots_weight_modules,
             "dispatch_layout": args.dispatch_layout,
-            "module_dispatch_policy": args.module_dispatch_policy,
             "cell_timeout_s": args.cell_timeout_s,
             "num_iters_warmup": args.num_iters_warmup,
             "num_iters": args.num_iters,
@@ -725,12 +670,9 @@ def build_cells(args: argparse.Namespace, modes: list[str]) -> list[Cell]:
                 )
             )
             for f_cpu_store in args.f_cpu_store_values:
-                if args.module_dispatch_policy == "none":
-                    splits = unique_splits_for_store(
-                        f_cpu_store, args.f_cpu_ratios
-                    )
-                else:
-                    splits = [(round(f_cpu_store, 12), 0.0)]
+                splits = unique_splits_for_store(
+                    f_cpu_store, args.f_cpu_ratios
+                )
                 for f_cpu, f_prefetch in splits:
                     cells.append(
                         Cell(
@@ -806,16 +748,6 @@ def parse_args() -> argparse.Namespace:
             "uniform applies each candidate split to every dispatch bucket. "
             "decode-only keeps all buckets pure prefetch and overrides only "
             "the benchmark batch's decode bucket with the candidate split."
-        ),
-    )
-    parser.add_argument(
-        "--module-dispatch-policy",
-        choices=("none", "qkv-prefetch-mlp-cpu"),
-        default="none",
-        help=(
-            "Optional module-specific dispatch overlay. "
-            "qkv-prefetch-mlp-cpu keeps non-decode buckets pure prefetch, "
-            "then makes the decode bucket QKV pure prefetch and MLP pure CPU."
         ),
     )
     parser.add_argument("--cots-cpu-num-threads", type=int, default=24)

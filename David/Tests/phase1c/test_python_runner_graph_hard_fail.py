@@ -97,7 +97,6 @@ def _drive_post_init(
             config=CotsOffloadConfig(
                 f_cpu_store=0.10,
                 cpu_runner=cpu_runner,
-                kv_biased=True,
             )
         )
         set_offloader(offloader)

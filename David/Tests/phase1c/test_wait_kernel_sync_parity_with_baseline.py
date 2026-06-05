@@ -134,7 +134,6 @@ def _build_qkv(*, f_cpu_store: float, wait_kernel: bool) -> tuple[_QkvLayer, Cot
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
                 f_prefetch=0.0,
-                kv_biased=True,
                 cpu_runner="native",
                 weight_capture_sync_mode=("wait_kernel" if wait_kernel else "host_callback"),
             )
@@ -162,7 +161,6 @@ def _build_mlp(*, f_cpu_store: float, wait_kernel: bool) -> tuple[_MlpLayer, Cot
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
                 f_prefetch=0.0,
-                kv_biased=True,
                 cpu_runner="native",
                 weight_capture_sync_mode=("wait_kernel" if wait_kernel else "host_callback"),
             )

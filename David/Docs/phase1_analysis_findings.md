@@ -45,6 +45,28 @@ cd /TTC/FastTTS-thesis
   --exp
 
 /opt/conda/envs/thesis/bin/python \
+  /TTC/David/Benchmarks/phase1_analysis/bench_cots_phase_free_regime.py \
+  --exp --keep-going \
+  --workloads decode8x128:8:128 prefill128x1:128:1 mixed128x128:128:128 \
+  --batch-sizes 1 16 64 \
+  --f-values 0.005 0.01 0.02 0.0357 0.05 \
+  --only-strategies none cots_cpu_all cots_prefetch_all \
+    cots_decode_cpu_prefill_prefetch \
+  --repeat 3
+
+/opt/conda/envs/thesis/bin/python \
+  /TTC/David/Benchmarks/phase1_analysis/bench_cots_phase_free_regime.py \
+  --oracle --exp --keep-going \
+  --oracle-decode-buckets 1 16 64 \
+  --oracle-prefill-buckets 128 512 2048 \
+  --f-values 0.005 0.01 0.02 0.0357 0.05 \
+  --oracle-split-ratios 0 0.25 0.5 0.75 1 \
+  --oracle-validate-e2e \
+  --workloads decode8x128:8:128 prefill128x1:128:1 mixed128x128:128:128 \
+  --batch-sizes 1 16 64 \
+  --repeat 3
+
+/opt/conda/envs/thesis/bin/python \
   /TTC/David/Benchmarks/phase1_analysis/bench_cots_kv_throughput.py \
   --exp --focused-grid --only-arms none cots_prefetch_only --repeat 1
 
@@ -112,9 +134,9 @@ Keep `o_proj` GPU-resident in Phase 1/2; do not simplify the Planner/runtime
 strategy by making WO part of the uniform WQKV/MLP weight offload set.
 
 The COTS CPU-compute/communication path is the more important rejection test
-because it includes the activation round trip after attention merge. The runtime
-now exposes WO as an opt-in `cots_weight_modules={"wo"}` module for forced-fit
-experiments, but the default module set remains `qkv,mlp`.
+because it includes the activation round trip after attention merge. This
+one-quantum WO snap data is the failure mode that motivated the later
+production two-quantum WO snap.
 
 Current post-cleanup sources:
 `/TTC/results/phase1_analysis/cots_wo_offload_e2e/20260601_current_graph_qwen7b_f001_b1_b16/summary.md`
@@ -144,11 +166,19 @@ and
 | 1.0% | 16 | 2.2909 | 2.4236 | +5.79% | 0.007 |
 | 5.0% | 1 | 2.2628 | 2.4358 | +7.64% | 0.033 |
 
-Conclusion: the real COTS WO path is not a harmless simplification. With the
-current head-aligned WO snap, `f=1%` selects zero WO rows and is performance
-noise. Once WO crosses the first 128-channel step at `f=5%`, it costs +7.24% at
-B=1 and +33.25% at B=16 while adding only 0.024 GiB of CPU-stored WO relief.
-Keep WO opt-in only; do not include it in the default module set.
+Conclusion at the time: the real COTS WO path was not a harmless
+simplification with a one-quantum WO snap. The later production snap ablation
+kept the transparent all-module story but raised WO to a two-QKVO-quantum dense
+output snap. That suppresses WO in the low-fraction cells that exposed the
+fixed sync/activation-return cost, while still allowing WO to contribute at
+larger `f_cpu_store`.
+
+2026-06-05 production update: default COTS weight placement is now
+`qkv,mlp,wo`, with one uniform dispatch table and fixed floor snapping. WO uses
+`WO_QKVO_GRANULARITY_MULTIPLIER=2`; this removed the low-fraction WO cliff
+observed here, and the remaining high-fraction all-module gap was small enough
+for the simpler thesis story (`+5.7%` around `f=0.15`, `+1.7%` around
+`f=0.18` versus QKV+MLP at similar bytes).
 
 Hybrid-KV compatibility was also checked after WO landed. The combined
 `qkv,mlp,wo` + hybrid KV eager path initialized and generated successfully
@@ -156,9 +186,9 @@ Hybrid-KV compatibility was also checked after WO landed. The combined
 piecewise graph + wait-kernel policy. A forced-context parity probe had no
 forced-output failures, but WO added extra numeric drift versus the no-WO
 hybrid control (`30/32` top-1 positions matched with WO, versus `32/32`
-without WO). This reinforces the policy boundary: WO is mechanically
-compatible with hybrid KV, but remains an opt-in forced-fit module rather than
-a default performance path. Sources:
+without WO). This confirms WO is mechanically compatible with hybrid KV;
+production still relies on regular correctness tests for the combined path.
+Sources:
 `/TTC/results/phase2/wo_hybrid_compat_20260601_summary.json` and
 `/TTC/results/phase2/no_wo_hybrid_compat_20260601_summary.json`.
 
@@ -175,9 +205,9 @@ Source:
 | 5.0% | +0.307 ms | +8.59 ms | 36 MB |
 | 10.0% | +0.569 ms | +15.93 ms | 72 MB |
 
-Conclusion: WO CPU compute adds measurable decode-step latency for very little
-7B memory relief. The implemented path is useful as a forced-fit experiment,
-but the measured default should stay WQKV/MLP only.
+Conclusion: WO CPU compute adds measurable decode-step latency when tiny WO
+slices are allowed. The production fix is not a module-specific planner policy;
+it is a coarser WO snap inside the uniform all-module offload rule.
 
 ## Prefetch Free-Zone Diagnosis
 
@@ -207,6 +237,17 @@ when the bad MLP shape is avoided. It is not yet evidence for a broad
 prefetch-free regime.
 
 ## Free-Regime Sweep
+
+2026-06-04 Planner caveat: the table below is a decode-heavy E2E sweep, not a
+phase-aware free-zone result. It used `input_len=8`, `output_len=128`, so the
+prefill bucket contributed little to whole-request latency. Do not use it to
+claim that one COTS route is free for every inference phase. The redo harness
+is `David/Benchmarks/phase1_analysis/bench_cots_phase_free_regime.py`: fixed-arm
+mode measures prefill-heavy, decode-heavy, and mixed shapes separately, while
+`--oracle` mode sweeps candidate bucket rows, emits
+`oracle_dispatch_tables.json`, and can validate the composed empirical-oracle
+table E2E. Treat these oracle tables as Planner targets, not final Planner
+output.
 
 Source:
 `/TTC/results/phase1_analysis/free_regime/20260513T211352Z_full/summary.md`

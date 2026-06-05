@@ -161,7 +161,6 @@ def _build(f_cpu_store, f_prefetch, n_layers=N_LAYERS, capture_sizes=None):
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
                 f_prefetch=f_prefetch,
-                kv_biased=True,
                 cpu_runner="python",
             )
         )

@@ -362,14 +362,13 @@ Per model `m ∈ {generator, verifier}`:
 - `gpu_memory_utilization_m` or equivalent GPU-byte budget — the global GPU
   budget assigned to this vLLM engine.
 - `weight_modules_m ⊆ {qkv, mlp, wo}` — semantic weight modules eligible for
-  COTS storage/compute. Default is `{qkv, mlp}`; `wo` is an opt-in forced-fit
-  module only.
+  COTS storage/compute. Production default is `{qkv, mlp, wo}`; the selector is
+  a compatibility/ablation hook, not a Planner policy dimension.
 - `f_cpu_store_m ∈ [0, 1]` — single scalar applied uniformly to the enabled
   module set. WQKV's CPU-stored bytes are ordered by the K/V-biased picker
-  (K+V head groups first, then Q tail). WO uses the implemented head-aligned
-  dense output split when, and only when, `wo ∈ weight_modules_m`; planner
-  policy should keep it disabled unless memory pressure makes the measured
-  latency cost worthwhile (see `weight_offload_design.md §WO Split Axis
+  (K+V head groups first, then Q tail). WO uses the implemented QKVO-aligned
+  dense output split with the production coarser snap quantum (see
+  `weight_offload_design.md §WO Split Axis
   Decision`).
 - `gpu_kv_bytes_m` — GPU KV pool size
 - `cpu_kv_bytes_m` — CPU KV pool size (the "extension")
@@ -410,7 +409,12 @@ Per model, a table keyed by `BatchDescriptor`:
 dispatch[model][BatchDescriptor] → (f_cpu_compute, f_prefetch_compute)
 ```
 
-One entry per captured CUDA graph bucket, emitting a **single `(f_cpu, f_prefetch)` pair applied uniformly to the enabled module set** at that bucket. In the default plan this means WQKV, MLP1, and MLP2. If the Planner enables WO for a forced-fit case, WO receives the same dispatch pair rather than its own per-bucket tuning. Constraint per entry:
+One entry per captured CUDA graph bucket, emitting a **single `(f_cpu,
+f_prefetch)` pair applied uniformly to the enabled module set** at that bucket.
+In the production plan this means WQKV, MLP1, MLP2, and WO. WO receives the
+same dispatch pair as the rest of the module set; its coarser snap quantum
+decides when the requested fraction is large enough to create WO CPU/prefetch
+work. Constraint per entry:
 
 ```
 f_cpu_compute + f_prefetch_compute = f_cpu_store_m
@@ -894,8 +898,9 @@ requested placement policy -> COTS snapping -> realized placement geometry
 ```
 
 vLLM remains the source of truth for snapping because it owns the actual tensor
-handles, QKV head grouping, MLP 64-channel granularity, WO opt-in behavior, and
-prefetch-slot layout. The Planner consumes the realized consequences as
+handles, QKV head grouping, MLP 64-channel granularity, WO dense-output
+granularity, and prefetch-slot layout. The Planner consumes the realized
+consequences as
 calibrated facts. When `cots_snap.storage_by_store_fraction[s]` contains exact
 `cpu_weight_bytes` or `gpu_buffer_bytes`, those values override the linear
 estimate for that `s`; otherwise the planner falls back to

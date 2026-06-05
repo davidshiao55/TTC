@@ -79,10 +79,11 @@ for Qwen/Qwen2.5-7B-Instruct BF16 on the RTX 4090 target.
 
 The production path is:
 
-- Store a static CPU slice of QKV, MLP gate/up, and MLP down weights by
+- Store a static CPU slice of QKV, MLP gate/up, MLP down, and WO weights by
   default.
-- Leave `o_proj` GPU-resident by default; expose it only as an opt-in
-  `cots_weight_modules={"wo"}` forced-fit/experiment path.
+- Use the same uniform dispatch table for every enabled module; WO uses a
+  coarser `2 * (2 * head_dim)` dense-output snap so low-fraction cells do not
+  pay the small-WO-slice latency cliff.
 - Dispatch each bucket across three paths:
   GPU-resident compute, layer-ahead prefetched GPU compute, and CPU compute.
 - Use native C++ CPU tasks, not the old Python `ThreadPoolExecutor`, as the
@@ -149,15 +150,15 @@ Removed or rejected from the supported surface:
 
 ### Storage And Placement
 
-COTS offloads the default Phase 1 target tensors, with WO exposed only as an
-opt-in experiment path:
+COTS offloads the production Phase 1 target tensors with one uniform placement
+fraction and one uniform dispatch table:
 
 | Module | Split axis | Production behavior |
 |---|---|---|
 | `qkv_proj` | output columns | K/V-biased, head-aligned CPU slice |
 | `gate_up_proj` | output columns | matched gate/up half-channel slice, snapped to 64 |
 | `down_proj` | input columns | matched MLP intermediate slice, snapped to 64 |
-| `o_proj` | output columns, opt-in | GPU-resident by default; head-aligned dense split when enabled |
+| `o_proj` | output columns | QKVO-aligned dense split, snapped to a coarser two-quantum start |
 
 The storage split is TP-style at load time: each wrapped parameter's
 `param.data` is replaced with the GPU-resident slice before weight loading, and
@@ -527,8 +528,6 @@ rejected Phase 1 probe paths forward:
 - pure-prefetch and CPU-compute paths both have clean zero-work fast paths;
 - diagnostics are explicit and env-gated.
 
-The open Planner work is to emit the production module set and per-bucket
-dispatch from profile data: default `qkv,mlp`, WO only when memory pressure
-justifies its measured latency/parity cost, MLP-first CPU compute at low batch,
-prefetch-heavy or pure-prefetch at high batch, and QKV CPU compute only when a
-future profile proves the first head pair is no longer exposed.
+The open Planner work is to emit the production per-bucket dispatch from
+profile data: one uniform row per batch bucket, with snapping determining when
+QKV/MLP/WO have enough work to enter the CPU or prefetch paths.

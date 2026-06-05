@@ -145,7 +145,6 @@ def _build_qkv(
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
                 f_prefetch=0.0,
-                kv_biased=True,
                 cpu_runner=cpu_runner,
             )
         )
@@ -174,7 +173,6 @@ def _build_mlp(
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
                 f_prefetch=0.0,
-                kv_biased=True,
                 cpu_runner=cpu_runner,
             )
         )
@@ -326,7 +324,7 @@ def test_default_config_supports_graph_capture() -> None:
         layer = _QkvLayer().cuda()
         # NB: deliberately NO cpu_runner kwarg — relies on the default.
         offloader = CotsOffloader(
-            config=CotsOffloadConfig(f_cpu_store=0.20, kv_biased=True)
+            config=CotsOffloadConfig(f_cpu_store=0.20)
         )
         from vllm.model_executor.offloader.cots import NativeCotsWeightRunner
 

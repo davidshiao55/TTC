@@ -130,7 +130,6 @@ def _build_mlp(
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
                 f_prefetch=f_prefetch,
-                kv_biased=True,
                 cpu_runner="python",
                 dry_run=dry_run,
             )
@@ -158,7 +157,6 @@ def _build_qkv(f_cpu_store, f_prefetch, *, dry_run=False):
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
                 f_prefetch=f_prefetch,
-                kv_biased=True,
                 cpu_runner="python",
                 dry_run=dry_run,
             )
@@ -297,8 +295,8 @@ def test_qkv_three_way_matches_unsplit(f_cpu_store, f_prefetch):
 def test_pure_prefetch_zero_cpu_compute_no_residual_qkv():
     """At `f_cpu_store == f_prefetch`, QKV's `n_cpu_compute` must be exactly
     0 — no residual rows from head-aligned snapping. Repro for Codex
-    Finding 1: `round(f_prefetch * out_dim)` < snapped `n_cpu` left a few
-    rows on the CPU compute path."""
+    Finding 1: raw prefetch count < snapped `n_cpu` left a few rows on the CPU
+    compute path."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
@@ -307,7 +305,7 @@ def test_pure_prefetch_zero_cpu_compute_no_residual_qkv():
         layer = _QkvLayer().cuda()
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
-                f_cpu_store=0.20, f_prefetch=0.20, kv_biased=True,
+                f_cpu_store=0.20, f_prefetch=0.20,
                 cpu_runner="python",
             )
         )
@@ -343,7 +341,7 @@ def test_pure_prefetch_qkv_forward_parity():
         layer = _QkvLayer().cuda()
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
-                f_cpu_store=0.20, f_prefetch=0.20, kv_biased=True,
+                f_cpu_store=0.20, f_prefetch=0.20,
                 cpu_runner="python",
             )
         )
@@ -455,7 +453,7 @@ def _build_mlp_full_offload(f_prefetch):
         layer = _MlpLayer().cuda()
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
-                f_cpu_store=1.0, f_prefetch=f_prefetch, kv_biased=True,
+                f_cpu_store=1.0, f_prefetch=f_prefetch,
                 cpu_runner="python",
             )
         )
@@ -504,7 +502,7 @@ def test_full_offload_qkv_with_cuda_custom_ops(f_prefetch):
         layer = _QkvLayer().cuda()
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
-                f_cpu_store=1.0, f_prefetch=f_prefetch, kv_biased=True,
+                f_cpu_store=1.0, f_prefetch=f_prefetch,
                 cpu_runner="python",
             )
         )
@@ -548,7 +546,7 @@ def test_factory_prefetch_installs_machinery_even_with_config_zero():
         # "no prefetch"). Factory: emit f_prefetch=0.20 per bucket.
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
-                f_cpu_store=0.50, f_prefetch=0.0, kv_biased=True,
+                f_cpu_store=0.50, f_prefetch=0.0,
                 cpu_runner="python",
             ),
             dispatch_table_factory=lambda buckets: {b: (0.30, 0.20) for b in buckets},

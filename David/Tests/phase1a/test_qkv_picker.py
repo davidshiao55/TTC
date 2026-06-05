@@ -5,8 +5,8 @@ Q tail. Maps to `weight_offload_design.md §WQKV Column Choice` and the
 `kv_biased_cpu_columns` reference in `bench_split_correctness.py`.
 
 Head-group alignment (per `weight_offload_design.md §201-205`): K and V cols
-on CPU are whole head groups, never sub-head splits. The picker rounds the
-requested n_cpu_cols to the nearest KV head pair below the boundary.
+on CPU are whole head groups, never sub-head splits. The production picker
+floors the requested n_cpu_cols to the largest valid head-aligned split.
 """
 
 import pytest
@@ -25,10 +25,10 @@ KV_SIZE_7B = 4 * HEAD_DIM_7B  # 512
 TOTAL_7B = Q_SIZE_7B + 2 * KV_SIZE_7B  # 4608
 
 
-def _pick(n_cpu, *, kv_biased=True):
+def _pick(n_cpu):
     return _qkv_kv_biased_indices(
         Q_SIZE_7B, KV_SIZE_7B, n_cpu,
-        head_dim=HEAD_DIM_7B, kv_biased=kv_biased,
+        head_dim=HEAD_DIM_7B,
     )
 
 
@@ -45,14 +45,14 @@ def test_picker_full_assignment():
 
 
 def test_picker_below_kv_boundary_snaps_to_head_pair():
-    """At requested f=0.09 (raw n_cpu=414), head-aligned picker snaps to 2 KV
-    head pairs = 512 cols (effective f≈11.1%). All assigned indices come from
+    """At requested f=0.09 (raw n_cpu=414), head-aligned picker snaps to 1 KV
+    head pair = 256 cols (effective f≈5.6%). All assigned indices come from
     the K+V range and form whole heads.
     """
     requested = round(0.09 * TOTAL_7B)  # 414
     idx = _pick(requested)
-    # 2 head pairs = 2 * 2 * 128 = 512.
-    assert idx.numel() == 2 * 2 * HEAD_DIM_7B
+    # 1 head pair = 2 * 128 = 256.
+    assert idx.numel() == 2 * HEAD_DIM_7B
     assert (idx >= Q_SIZE_7B).all(), (
         "below kv boundary: all indices must be in K+V range"
     )
@@ -92,29 +92,6 @@ def test_picker_above_kv_boundary_dips_into_q_tail():
     assert q_picks == list(range(Q_SIZE_7B - n_q_tail_expected, Q_SIZE_7B))
 
 
-def test_picker_unbiased_ablation():
-    """kv_biased=False = TP-style proportional, no head alignment. Each shard
-    contributes round(f * shard) LAST cols; Q absorbs rounding residual.
-    """
-    n_cpu = 256
-    idx = _pick(n_cpu, kv_biased=False)
-    assert idx.numel() == n_cpu
-    assert len(set(idx.tolist())) == n_cpu  # disjoint
-
-    n_k = round(n_cpu * KV_SIZE_7B / TOTAL_7B)
-    n_v = round(n_cpu * KV_SIZE_7B / TOTAL_7B)
-    n_q_tail = n_cpu - n_k - n_v
-
-    expected_q = torch.arange(Q_SIZE_7B - n_q_tail, Q_SIZE_7B)
-    expected_k = torch.arange(
-        Q_SIZE_7B + KV_SIZE_7B - n_k, Q_SIZE_7B + KV_SIZE_7B
-    )
-    expected_v = torch.arange(
-        Q_SIZE_7B + 2 * KV_SIZE_7B - n_v, Q_SIZE_7B + 2 * KV_SIZE_7B
-    )
-    assert torch.equal(idx, torch.cat([expected_q, expected_k, expected_v]))
-
-
 def test_picker_no_duplicates():
     for f in (0.05, 0.09, 0.22, 0.30, 0.50, 0.75):
         n_cpu = round(f * TOTAL_7B)
@@ -148,19 +125,24 @@ def test_picker_head_alignment():
 
 def test_picker_head_alignment_specific_values():
     """Concrete snap targets for the comparison-relevant f values."""
-    # f=0.09 → 414 raw → 2 pairs = 512 cols (effective 11.1%)
+    # f=0.09 -> 414 raw -> 1 pair = 256 cols (effective 5.6%)
     _, n_k, n_v = _qkv_kv_biased_counts(
         Q_SIZE_7B, KV_SIZE_7B, 414, head_dim=HEAD_DIM_7B
     )
-    assert (n_k, n_v) == (256, 256)
-    # f=0.05 → 230 raw → 1 pair = 256 cols (effective 5.55%)
+    assert (n_k, n_v) == (128, 128)
+    # f=0.05 -> 230 raw -> suppressed until a full K/V pair fits.
     _, n_k, n_v = _qkv_kv_biased_counts(
         Q_SIZE_7B, KV_SIZE_7B, 230, head_dim=HEAD_DIM_7B
     )
-    assert (n_k, n_v) == (128, 128)
-    # f=0.22 → 1014 raw → snaps to full K+V at boundary
+    assert (n_k, n_v) == (0, 0)
+    # f=0.22 -> 1014 raw -> floors to 3 K/V pairs.
     n_q_tail, n_k, n_v = _qkv_kv_biased_counts(
         Q_SIZE_7B, KV_SIZE_7B, 1014, head_dim=HEAD_DIM_7B
+    )
+    assert (n_q_tail, n_k, n_v) == (0, 384, 384)
+    # Exact K+V boundary still keeps all K/V and no Q.
+    n_q_tail, n_k, n_v = _qkv_kv_biased_counts(
+        Q_SIZE_7B, KV_SIZE_7B, 1024, head_dim=HEAD_DIM_7B
     )
     assert (n_q_tail, n_k, n_v) == (0, 512, 512)
 

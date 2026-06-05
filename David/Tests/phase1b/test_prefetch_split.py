@@ -149,7 +149,7 @@ def test_qkv_split_invariants_above_kv_boundary():
     """f_cpu_store=0.50 → K+V + Q-tail on CPU. Prefetch is the contiguous
     prefix of cpu_indices (Q_tail first, then K, then V)."""
     f_cpu = 0.50
-    n_cpu_raw = round(f_cpu * QKV_OUT_7B)
+    n_cpu_raw = int(f_cpu * QKV_OUT_7B)
     handle = _make_qkv(n_cpu_raw)
     assert handle.n_q_tail > 0
     assert handle.n_k > 0 and handle.n_v > 0

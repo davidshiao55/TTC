@@ -804,8 +804,8 @@ def _runtime_accounting_plan(*, gpu_buffer_bytes=75_000_000):
 
 def _runtime_accounting_log():
     return """
-[CotsOffloader] dispatch policy: f_cpu_store=0.200000, dispatch_table={8: (0.1, 0.1)}, dispatch_table_by_module={}
-[CotsOffloader] ready: runner=native, sync=wait_kernel, modules=['mlp', 'qkv'], linears=10, mlp_blocks=1, wo_ops=0, weights_saved=0.2000 GB, buffers=0.0100 GB pinned_in + 0.0200 GB pinned_out + 0.0500 GB gpu_uva, prefetch_pool=0.0250 GB, graph_buckets=(8,), dispatch_buckets=(8,)
+[CotsOffloader] dispatch policy: f_cpu_store=0.200000, dispatch_table={8: (0.1, 0.1)}
+[CotsOffloader] ready: runner=native, sync=wait_kernel, modules=['mlp', 'qkv', 'wo'], wo_qkvo_granularity_multiplier=2, linears=10, mlp_blocks=1, wo_ops=0, weights_saved=0.2000 GB, buffers=0.0100 GB pinned_in + 0.0200 GB pinned_out + 0.0500 GB gpu_uva, prefetch_pool=0.0250 GB, graph_buckets=(8,), dispatch_buckets=(8,)
 Initial free memory 9.0 GiB, reserved 1.15 GiB (kv_cache_memory_bytes=1234567890) memory for KV Cache as specified by kv_cache_memory_bytes config and skipped memory profiling.
 Initialized COTS hybrid CPU KV store: split_blocks=8, block_size=16, split_tokens=128, cpu_blocks=42, layers=28, cpu_pool_bytes=987654321
 """

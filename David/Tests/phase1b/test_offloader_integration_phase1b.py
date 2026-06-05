@@ -154,7 +154,6 @@ def _build_phase1b(f_cpu_store, f_prefetch):
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
                 f_prefetch=f_prefetch,
-                kv_biased=True,
                 cpu_runner="python",
             )
         )

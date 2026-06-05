@@ -241,7 +241,6 @@ def test_mini_decoder_offload_e2e(f_cpu_store):
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
-                kv_biased=True,
                 cpu_runner="python",
             )
         )
@@ -343,7 +342,7 @@ def test_post_init_python_runner_requires_enforce_eager():
         layer = MiniDecoderLayer().cuda()
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
-                f_cpu_store=0.1, kv_biased=True, cpu_runner="python"
+                f_cpu_store=0.1, cpu_runner="python"
             )
         )
         set_offloader(offloader)
@@ -365,7 +364,6 @@ def test_lookup_dispatch_rounds_up():
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
                 f_cpu_store=0.1,
-                kv_biased=True,
                 cpu_runner="python",
             )
         )
@@ -407,7 +405,6 @@ def test_quantized_layer_rejected():
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
                 f_cpu_store=0.1,
-                kv_biased=True,
                 cpu_runner="python",
             )
         )

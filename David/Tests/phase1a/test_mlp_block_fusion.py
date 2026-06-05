@@ -110,7 +110,6 @@ def _build_block(f_cpu_store: float):
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
                 f_cpu_store=f_cpu_store,
-                kv_biased=True,
                 cpu_runner="python",
             )
         )
@@ -247,7 +246,6 @@ def test_orphan_col_row_raises():
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
                 f_cpu_store=0.25,
-                kv_biased=True,
                 cpu_runner="python",
             )
         )
