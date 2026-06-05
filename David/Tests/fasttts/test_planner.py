@@ -563,6 +563,22 @@ def test_cots_gpu_buffer_geometry_derives_full_store_coefficient():
     )
 
 
+def test_cots_gpu_buffer_geometry_default_includes_wo():
+    geometry = CotsGPUBufferGeometry(
+        hidden_size=10,
+        intermediate_size=20,
+        qkv_output_size=30,
+        dtype_bytes=2,
+        prefetch_buffer_slots=2,
+        max_num_batched_tokens=5,
+    )
+
+    assert geometry.modules == frozenset({"qkv", "mlp", "wo"})
+    assert geometry.prefetch_buffer_bytes_per_store_fraction == 4000
+    assert geometry.output_scratch_bytes_per_store_fraction == 400
+    assert geometry.gpu_buffer_bytes_per_store_fraction == 4400
+
+
 def _frontier_candidate(*, f_cpu_store, expected_s, gpu_bytes, cpu_bytes):
     return WeightKVCandidateScore(
         f_cpu_store=f_cpu_store,
@@ -1058,6 +1074,26 @@ def test_manual_planner_derives_weight_thread_policy_from_dispatch_table():
     }
 
 
+def test_manual_planner_rejects_incomplete_dispatch_table_entry():
+    config = FastTTSConfig(
+        planner_enabled=True,
+        generator_vllm_config={"model": "gen"},
+        planner_config={
+            "generator": {
+                "weight": {
+                    "f_cpu_store": 0.05,
+                    "dispatch_table": {
+                        "8": [0.02, 0.02],
+                    },
+                },
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="must sum to f_cpu_store"):
+        ManualTTCPlanner(config).plan(SearchConfig(n=4))
+
+
 def test_manual_planner_derives_dispatch_table_from_weight_cost_profile(tmp_path):
     profile_path = tmp_path / "weight_dispatch_profile.json"
     profile_path.write_text(
@@ -1244,7 +1280,7 @@ def test_manual_planner_global_model_memory_assigns_spare_gpu_to_kv(tmp_path):
         verifier_vllm_config={"model": "ver"},
         planner_config={
             "global": {
-                "gpu_budget_bytes": 3400,
+                "gpu_budget_bytes": 3560,
                 "cpu_budget_bytes": 1000,
                 "engine_gpu_budget_step_bytes": 100,
             },
@@ -1288,7 +1324,7 @@ def test_manual_planner_global_model_memory_assigns_spare_gpu_to_kv(tmp_path):
     plan = ManualTTCPlanner(config).plan(SearchConfig(n=4))
     apply_ttc_plan_to_config(config, plan)
 
-    assert plan.search["model_memory_gpu_bytes"] == 3400
+    assert plan.search["model_memory_gpu_bytes"] == 3560
     assert plan.search["model_memory_cpu_bytes"] == 400
     total_gpu_kv = config.generator_vllm_config.get(
         "kv_cache_memory_bytes", 0

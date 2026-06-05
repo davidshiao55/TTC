@@ -481,13 +481,13 @@ For `num_tokens > max_cudagraph_capture_size`, vLLM falls back to eager executio
 
 - `|B_prefetch_m| = layer-ahead buffer` — sized by the engine-local resolver to
   hold the enabled COTS prefetched slices for one layer (default
-  WQKV/MLP1/MLP2; optional WO) (see `pcie_bandwidth_allocation_design.md
+  WQKV/MLP1/MLP2/WO) (see `pcie_bandwidth_allocation_design.md
   §Prefetch Distance`).
 - **Prefetch distance = layer-ahead** — one prefetch queue per layer, one sync per layer boundary. Committed (not an option). Empirically validated in `phase0_findings.md §0.10.1d`: under uniform spread (G=4 N=1) on Qwen2.5-7B at decode B=64, K=2 buys only 2.9% over K=1 and K=4 OOMs because the buffer pool grows linearly with K.
 - KV placement policy — fixed two-pool mechanism: shared prefix KV on GPU,
   per-beam suffix KV on CPU. The Planner sizes the pools; it does not choose a
   different KV split mechanism.
-- Per-sub-module split axis — `{WQKV: output-col, MLP1: output-col, MLP2: input-row, WO: output-col}` is hardcoded across all models and buckets (see `weight_offload_design.md §Per-Sub-Module Split Axis`). WO is runtime-supported but planner-disabled by default.
+- Per-sub-module split axis — `{WQKV: output-col, MLP1: output-col, MLP2: input-row, WO: output-col}` is hardcoded across all models and buckets (see `weight_offload_design.md §Per-Sub-Module Split Axis`). WO is enabled by default, but the runtime's coarser WO snap delays tiny WO CPU/prefetch slices until they are large enough to amortize their fixed cost.
 - PCIe allocation — 100% weight prefetch (see `pcie_bandwidth_allocation_design.md`).
 
 These appear in the output for completeness so the Scheduler has one place to read the plan, but the Planner does not optimize over them.
@@ -847,6 +847,59 @@ bottleneck; the best split is set by balancing CPU compute against H2D prefetch.
 The Planner rule is therefore: keep the three-lane model, solve per bucket, and
 profile prefill-heavy buckets separately before applying the same rule there.
 
+**Updated production checkpoint (2026-06-05, floor snap + WO default).** After
+the runtime switched to always floor-snapping and the production module set
+became WQKV/MLP1/MLP2/WO, the decode calibration was rerun with the same
+`input_len=8`, `output_len=32`, graph-mode, decode-only harness. Source
+artifacts:
+
+- Real grid:
+  `results/planner/dispatch_model_validation/20260605_floor_wo_decode_grid_b8_b16_b32_b64_s015_s018_out32/summary.json`
+- Dry-run route grid:
+  `results/planner/dispatch_model_validation/20260605_floor_wo_decode_grid_b8_b16_b32_b64_s015_s018_out32_dryrun_routes/summary.json`
+- Fitted profile:
+  `results/planner/dispatch_cost_model_fit/20260605_floor_wo_b8_b16_b32_b64_s015_s018_out32/weight_dispatch_profile.json`
+- Solver validation:
+  `results/planner/weight_dispatch_solver_validation/20260605_floor_wo_b8_b16_b32_b64_s015_s018_out32/solver_validation.md`
+
+The solver matched the measured best split exactly for all calibrated cases
+(`8/8 exact`, `8/8` within one grid step):
+
+| decode B | s | measured/planner `u` | measured/planner `p` | best latency |
+|---:|---:|---:|---:|---:|
+| 8 | 0.15 | 0.09375 | 0.05625 | 1.5181 s |
+| 8 | 0.18 | 0.11250 | 0.06750 | 1.7394 s |
+| 16 | 0.15 | 0.07500 | 0.07500 | 1.6291 s |
+| 16 | 0.18 | 0.09000 | 0.09000 | 1.9905 s |
+| 32 | 0.15 | 0.05625 | 0.09375 | 1.9282 s |
+| 32 | 0.18 | 0.06750 | 0.11250 | 2.3002 s |
+| 64 | 0.15 | 0.03750 | 0.11250 | 2.2418 s |
+| 64 | 0.18 | 0.04500 | 0.13500 | 2.7030 s |
+
+Against the previous recorded `s=0.15` decode grid, the WO-inclusive production
+path is slightly slower at small and mid buckets and faster at B=64:
+
+| decode B | previous best | floor+WO best | ratio |
+|---:|---:|---:|---:|
+| 8 | 1.4888 s | 1.5181 s | 1.020 |
+| 16 | 1.5811 s | 1.6291 s | 1.030 |
+| 32 | 1.9064 s | 1.9282 s | 1.011 |
+| 64 | 2.4204 s | 2.2418 s | 0.926 |
+
+This is acceptable as the production checkpoint because the new path stores WO
+on CPU too, freeing more GPU weight memory while preserving the bucket-wise
+solver behavior. A strict runtime-regression A/B should force
+`--cots-weight-modules qkv mlp` under the new runtime, but it is not necessary
+for the current planner calibration.
+
+The fitted profile records snapped CPU weight bytes for the profiled
+`f_cpu_store` values, but intentionally uses the conservative full-store
+`gpu_buffer_bytes_per_store_fraction` for buffer accounting. Individual
+runtime `cots_snap` logs report GPU buffer bytes for the specific temporary
+dispatch table being measured; those table-dependent values should not be used
+as static placement facts unless the future resource model also conditions on
+the compiled dispatch table.
+
 **Planner hook (2026-06-03).** `fit_dispatch_cost_model.py` now exports a
 `weight_dispatch_profile.json` artifact with schema
 `weight_three_lane_v1`, containing `G_B`, `C_B`, `H_B`, optional `K(B,s)`
@@ -942,8 +995,9 @@ candidates and compiles the dispatch table for the selected storage fraction.
 The current exact-bucket solver does not interpolate unprofiled buckets; production configs
 must either provide a coefficient row for each dispatch bucket or intentionally
 restrict the dispatch bucket grid to the calibrated set. The measured-grid
-regression is `validate_weight_dispatch_solver.py`: the current B=8/16/32/64
-decode profile matches 17/18 best cells exactly and 18/18 within one grid step.
+regression is `validate_weight_dispatch_solver.py`: the floor-snap + WO
+production decode profile matches all calibrated B=8/16/32/64, s=0.15/0.18
+best cells exactly.
 
 The planner also has a first config-facing Stage-0 path: if `planner_config`
 contains a `global` block with shared `gpu_budget_bytes` and `cpu_budget_bytes`,

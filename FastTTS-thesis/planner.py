@@ -26,7 +26,7 @@ from config import FastTTSConfig, SearchConfig
 
 EngineRole = Literal["generator", "verifier"]
 VALID_WEIGHT_MODULES = frozenset({"qkv", "mlp", "wo"})
-DEFAULT_COTS_WEIGHT_MODULES = frozenset({"qkv", "mlp"})
+DEFAULT_COTS_WEIGHT_MODULES = frozenset({"qkv", "mlp", "wo"})
 DEFAULT_DISPATCH_LAYER_OPS = ("qkv", "attention", "wo", "mlp1", "mlp2")
 DispatchBottleneck = Literal["compute", "prefetch"]
 WeightDispatchLane = Literal["gpu", "cpu", "h2d"]
@@ -3411,9 +3411,9 @@ class WeightPlacementPlan:
         if self.dispatch_table is None:
             return
         for bucket, (f_cpu_compute, f_prefetch) in self.dispatch_table.items():
-            if f_cpu_compute + f_prefetch > self.f_cpu_store + 1e-9:
+            if abs((f_cpu_compute + f_prefetch) - self.f_cpu_store) > 1e-9:
                 raise ValueError(
-                    "dispatch_table entry exceeds f_cpu_store: "
+                    "dispatch_table entry must sum to f_cpu_store: "
                     f"bucket={bucket}, entry={(f_cpu_compute, f_prefetch)}, "
                     f"f_cpu_store={self.f_cpu_store}"
                 )
