@@ -424,7 +424,13 @@ Every CPU-stored byte is dispatched each forward — either CPU-computed or pref
 
 **MLP1↔MLP2 matched-index invariant is automatic.** Because the same `(f_cpu_compute, f_prefetch_compute)` pair applies to both MLP1 and MLP2, and `f_cpu_store_m` is uniform across them, the col→row pipelining's index-matching requirement (MLP1's CPU output columns must equal MLP2's CPU input columns) is satisfied by construction — not an enforced Planner constraint, just a consequence of uniform dispatch.
 
-**WQKV K/V positioning is the Planner's responsibility.** The runtime applies the dispatch table verbatim across all sub-modules; there is no K/V-pin override. To avoid K/V-output PCIe round-trips when the per-bucket `f_cpu_compute` lands below the K/V fraction, the Planner's cost model (§7.3) charges the round-trip and naturally biases toward `f_cpu_compute ≥ K/V fraction` when the budget allows. See `weight_offload_design.md §Implementation Note: WQKV K/V Positioning`.
+**WQKV K/V positioning is the Planner's responsibility.** The runtime applies
+one dispatch row across all sub-modules and snaps CPU-compute counts to legal
+module quanta; there is no K/V-pin override. To avoid K/V-output PCIe
+round-trips when the per-bucket `f_cpu_compute` lands below the K/V fraction,
+the Planner's cost model (§7.3) charges the round-trip and naturally biases
+toward `f_cpu_compute >= K/V fraction` when the budget allows. See
+`weight_offload_design.md §Implementation Note: WQKV K/V Positioning`.
 
 The current simple interface supports this through vLLM's
 `cots_dispatch_table` config. If the table is set, it must contain every
@@ -542,21 +548,13 @@ Planner reports infeasibility (caller must reduce `n` or `max_context`).
 Per model, per `BatchDescriptor`:
 
 ```
-f_cpu_compute + f_prefetch_compute ≤ f_cpu_store_m
-```
-
-Can't compute on a path that doesn't have storage backing it.
-
-For the default v1 dispatch table, the Planner targets equality:
-
-```
 f_cpu_compute + f_prefetch_compute = f_cpu_store_m
 ```
 
 Every CPU-stored slice is either computed on CPU or streamed back to GPU for
-that forward pass. The `≤` form remains the validation rule because snapped
-geometry may create small legal remainders that the engine-local resolver must
-either assign or reject.
+that forward pass. The runtime snaps `f_cpu_compute` down to legal module
+geometry and assigns the remaining CPU-stored rows to prefetch, so incomplete
+dispatch rows are rejected rather than silently creating hidden CPU work.
 
 ---
 
@@ -1022,7 +1020,7 @@ uses the measured grid and end-to-end benchmark runs.
 
 **Layer-ahead prefetch feasibility check**: the total prefetch per layer is `f_prefetch × Σ_m W_m` (sum over {WQKV, MLP1, MLP2}). Cap `f_prefetch` if it exceeds `layer_time × pcie_h2d_bw`; excess falls back to `f_cpu`.
 
-**WQKV K/V round-trip cost**: when `f_cpu` falls below WQKV's K/V-fraction, the residual K/V columns flow through prefetch — incurring a Phase 2 D2H back to the CPU suffix cache after K/V is computed on GPU. The Planner's objective charges this round-trip explicitly: subtract `max(0, K/V-fraction − f_cpu) × W_WQKV` bytes from the effective prefetch budget for the MLP block. This nudges the optimum toward `f_cpu ≥ K/V-fraction` when PCIe budget is tight, *via the cost model* — there is no runtime K/V-pin override; the dispatch table is applied verbatim. See `weight_offload_design.md §Implementation Note: WQKV K/V Positioning`.
+**WQKV K/V round-trip cost**: when `f_cpu` falls below WQKV's K/V-fraction, the residual K/V columns flow through prefetch — incurring a Phase 2 D2H back to the CPU suffix cache after K/V is computed on GPU. The Planner's objective charges this round-trip explicitly: subtract `max(0, K/V-fraction − f_cpu) × W_WQKV` bytes from the effective prefetch budget for the MLP block. This nudges the optimum toward `f_cpu ≥ K/V-fraction` when PCIe budget is tight, *via the cost model* — there is no runtime K/V-pin override; the runtime applies one dispatch row uniformly and then snaps CPU-compute counts to module-local legal quanta. See `weight_offload_design.md §Implementation Note: WQKV K/V Positioning`.
 
 The snapped dispatch search is the reference solver for validation. The
 closed-form rule is accepted only if it matches the reference within a small

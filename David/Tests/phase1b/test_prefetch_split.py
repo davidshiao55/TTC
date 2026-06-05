@@ -10,11 +10,11 @@ Per-bucket geometry must satisfy:
   * `prefetch_indices ∪ cpu_compute_indices == cpu_indices` (set equality).
   * Disjoint subsets — no double-routing of any output column.
   * For `qkv`: prefetch is the contiguous prefix of cpu_indices in
-    `[Q_tail | K | V]` order; spills into K/V at high f_prefetch.
+    `[Q_tail | K | V]` order; spills into K/V as CPU-compute rows shrink.
   * For `mlp_gate_up`: prefetch picks the FIRST `n_prefetch_per_half` of each
     half's CPU range — preserves the matched-index invariant with paired
     `mlp_down`.
-  * For matched MLP output-split/input-split pair under uniform `f_prefetch`:
+  * For matched MLP output-split/input-split pair under uniform dispatch:
     `gu.n_prefetch_by_bucket[b] // 2 == dn.n_prefetch_by_bucket[b]`.
 """
 
@@ -134,8 +134,8 @@ def _check_invariants(handle, bucket):
 # QKV — split invariants
 # ---------------------------------------------------------------------------
 def test_qkv_split_invariants_below_kv_boundary():
-    """f_cpu_store=0.22 → exactly K+V on CPU (n_q_tail=0). Prefetch consumes
-    rows from cpu_indices in order [K | V]."""
+    """f_cpu_store=0.22 -> exactly K+V on CPU (n_q_tail=0). Runtime snaps
+    CPU-compute rows and prefetches the remaining prefix."""
     n_cpu = 2 * KV_SIZE_7B  # exactly all K+V
     handle = _make_qkv(n_cpu)
     assert handle.n_q_tail == 0
@@ -146,7 +146,7 @@ def test_qkv_split_invariants_below_kv_boundary():
 
 
 def test_qkv_split_invariants_above_kv_boundary():
-    """f_cpu_store=0.50 → K+V + Q-tail on CPU. Prefetch is the contiguous
+    """f_cpu_store=0.50 -> K+V + Q-tail on CPU. Prefetch is the contiguous
     prefix of cpu_indices (Q_tail first, then K, then V)."""
     f_cpu = 0.50
     n_cpu_raw = int(f_cpu * QKV_OUT_7B)
@@ -174,12 +174,13 @@ def test_qkv_pure_prefetch_consumes_all_cpu_rows():
 # Col (MergedCol gate_up)
 # ---------------------------------------------------------------------------
 def test_col_split_picks_first_n_per_half():
-    """Prefetch picks the FIRST n_prefetch_per_half of each half's CPU range.
-    Total n_prefetch = 2 * n_prefetch_per_half."""
+    """Runtime floors CPU-compute rows; prefetch gets the FIRST remaining
+    rows of each half. Total n_prefetch = 2 * n_prefetch_per_half."""
     n_cpu_per_half = 1024
     handle = _make_col(n_cpu_per_half)
 
-    # f_prefetch=0.05 → n_pref_per_half ≈ 947 at half=18944
+    # f_cpu_compute=0.05 -> n_cpu_compute_per_half=896 at half=18944,
+    # so each half prefetches the remaining 128 stored rows.
     table = {16: (0.05, 0.05)}
     handle.apply_prefetch_split_per_bucket(table)
     _check_invariants(handle, 16)
@@ -197,7 +198,7 @@ def test_col_split_picks_first_n_per_half():
 
 
 def test_col_caps_at_n_cpu_per_half():
-    """f_prefetch large enough to demand more than n_cpu_per_half — capped."""
+    """Zero CPU compute prefetches the full stored slice."""
     n_cpu_per_half = 256
     handle = _make_col(n_cpu_per_half)
     handle.apply_prefetch_split_per_bucket({1: (0.0, 1.0)})
@@ -232,17 +233,16 @@ def test_row_caps_at_n_cpu():
 # Matched-index invariant: col gate_up + paired row down
 # ---------------------------------------------------------------------------
 def test_matched_index_col_row_under_uniform_dispatch():
-    """Under uniform `f_prefetch` applied to both MLP1 (col) and MLP2 (row),
-    the prefetched intermediate-dim index sets must match: MLP1's prefetched
-    output cols (per half) == MLP2's prefetched input cols.
+    """Under uniform runtime CPU-compute snapping, MLP1 and MLP2 still
+    prefetch matching intermediate indices.
     """
     half = INTERMEDIATE_7B  # 18944
     n_cpu_per_half = 1024
-    f_prefetch = 0.03  # n_per_half ≈ 568
+    f_cpu_compute = 0.025  # floors to 448 CPU-compute rows per half
 
     gu = _make_col(n_cpu_per_half=n_cpu_per_half)
     dn = _make_row(n_cpu=n_cpu_per_half, in_dim=half)
-    table = {16: (0.0, f_prefetch)}
+    table = {16: (f_cpu_compute, 0.03)}
     gu.apply_prefetch_split_per_bucket(table)
     dn.apply_prefetch_split_per_bucket(table)
 
@@ -263,7 +263,7 @@ def test_matched_index_col_row_under_uniform_dispatch():
 # ---------------------------------------------------------------------------
 def test_max_n_prefetch_tracks_full_cpu_stored_capacity():
     handle = _make_row(1024)
-    table = {1: (0.10, 0.01), 16: (0.05, 0.02), 64: (0.0, 0.04)}
+    table = {1: (0.10, 0.01), 16: (0.05, 0.02), 64: (0.02, 0.02)}
     handle.apply_prefetch_split_per_bucket(table)
     assert max(handle.n_prefetch_by_bucket.values()) < handle.n_cpu
     assert handle.max_n_prefetch == handle.n_cpu

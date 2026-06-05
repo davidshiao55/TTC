@@ -6,7 +6,8 @@ Q tail. Maps to `weight_offload_design.md §WQKV Column Choice` and the
 
 Head-group alignment (per `weight_offload_design.md §201-205`): K and V cols
 on CPU are whole head groups, never sub-head splits. The production picker
-floors the requested n_cpu_cols to the largest valid head-aligned split.
+floors the requested n_cpu_cols to the largest valid `2 * head_dim` QKVO
+quantum, preserving exact full placement.
 """
 
 import pytest
@@ -72,10 +73,9 @@ def test_picker_at_exact_kv_boundary():
 def test_picker_above_kv_boundary_dips_into_q_tail():
     """f=0.5: 2304 cols. K+V (1024) full + 1280 from Q tail.
 
-    Above the K+V boundary, K and V are full (head-aligned trivially), so
-    head-alignment doesn't change the count. Q tail picks the LAST n_q_tail
-    cols of Q (Q has no head-boundary requirement at the layer-shape level —
-    only K/V pair preservation matters per design `§201-205`).
+    Above the K+V boundary, K and V are full. Q tail picks the LAST
+    n_q_tail cols of Q, with the total QKVO count snapped to the same
+    `2 * head_dim` quantum used below the boundary.
     """
     n_cpu = round(0.5 * TOTAL_7B)
     n_q_tail_expected = n_cpu - 2 * KV_SIZE_7B
@@ -101,11 +101,12 @@ def test_picker_no_duplicates():
         )
 
 
-def test_picker_head_alignment():
+def test_picker_qkvo_alignment():
     """For every f in the planner-relevant range, K, V, AND Q-tail CPU column
-    counts are multiples of `head_dim`. K and V are equal (paired KV heads)
-    and Q tail is whole heads — required by `weight_offload_design.md` and
-    Phase 2's per-head suffix-attention iteration.
+    counts are multiples of `head_dim`, and the total CPU slice is a
+    `2 * head_dim` QKVO quantum unless placement is full. K and V are equal
+    (paired KV heads) — required by `weight_offload_design.md` and Phase 2's
+    per-head suffix-attention iteration.
     """
     for f in (0.0, 0.03, 0.05, 0.09, 0.15, 0.22, 0.30, 0.50, 0.75, 1.0):
         n_cpu = round(f * TOTAL_7B)
@@ -120,7 +121,24 @@ def test_picker_head_alignment():
         assert n_q_tail % HEAD_DIM_7B == 0, (
             f"f={f}: n_q_tail={n_q_tail} not a multiple of head_dim={HEAD_DIM_7B}"
         )
+        total = n_q_tail + n_k + n_v
+        assert total == TOTAL_7B or total % (2 * HEAD_DIM_7B) == 0
         assert 0 <= n_q_tail <= Q_SIZE_7B
+
+
+def test_picker_q_tail_uses_qkvo_quantum():
+    """Q tail does not start until a full 2 * head_dim QKVO quantum fits."""
+    n_q_tail, n_k, n_v = _qkv_kv_biased_counts(
+        Q_SIZE_7B, KV_SIZE_7B, 2 * KV_SIZE_7B + HEAD_DIM_7B,
+        head_dim=HEAD_DIM_7B,
+    )
+    assert (n_q_tail, n_k, n_v) == (0, 512, 512)
+
+    n_q_tail, n_k, n_v = _qkv_kv_biased_counts(
+        Q_SIZE_7B, KV_SIZE_7B, 2 * KV_SIZE_7B + 2 * HEAD_DIM_7B,
+        head_dim=HEAD_DIM_7B,
+    )
+    assert (n_q_tail, n_k, n_v) == (256, 512, 512)
 
 
 def test_picker_head_alignment_specific_values():

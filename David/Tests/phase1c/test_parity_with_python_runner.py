@@ -257,11 +257,11 @@ def _dispatch(offloader: CotsOffloader, n: int = MAX_NUM_TOKENS) -> None:
 
 @pytest.mark.parametrize(
     "f_cpu_store",
-    [0.10, 0.25, 0.50],
-    ids=["fcpu_010", "fcpu_025", "fcpu_050"],
+    [0.25, 0.50],
+    ids=["fcpu_025", "fcpu_050"],
 )
 def test_qkv_native_matches_python(f_cpu_store: float) -> None:
-    """QKV operator forward, f_prefetch=0 (no streamer path). The native
+    """QKV operator forward with zero active prefetch rows. The native
     runner's strided/contiguous slab dispatch must produce the same
     values as PythonCotsWeightRunner's F.linear closure."""
     torch.manual_seed(123)
@@ -296,7 +296,7 @@ def test_qkv_native_matches_python(f_cpu_store: float) -> None:
     ids=["fcpu_010", "fcpu_025", "fcpu_050"],
 )
 def test_mlp_native_matches_python(f_cpu_store: float) -> None:
-    """MLP-block operator forward at f_prefetch=0. Exercises the native
+    """MLP-block operator forward with zero active prefetch rows. Exercises the native
     runner's strided down-proj view (`at::from_blob` with non-trivial
     row stride when the column-narrow has a positive offset) end-to-end
     through the fused gate+up+silu*up+down dispatch."""
@@ -338,13 +338,13 @@ def test_default_weight_modules_do_not_wrap_wo() -> None:
         offloader._runner.close()
 
 
-def test_wo_output_split_uses_qkv_head_granularity() -> None:
+def test_wo_output_split_uses_two_qkvo_quantum() -> None:
     vc = _make_vllm_config()
     with set_current_vllm_config(vc):
         layer = _WoLayerWithQkv().cuda()
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
-                f_cpu_store=0.10,
+                f_cpu_store=0.50,
                 weight_modules={"wo"},
                 cpu_runner="python",
             )
@@ -352,8 +352,8 @@ def test_wo_output_split_uses_qkv_head_granularity() -> None:
         offloader.wrap_modules(iter([layer]))
 
     handle = layer.o_proj._cots_handle
-    assert handle.output_granularity == HEAD_DIM
-    assert handle.n_cpu == HEAD_DIM
+    assert handle.qkvo_head_dim == HEAD_DIM
+    assert handle.n_cpu == 2 * (2 * HEAD_DIM)
     assert all(h.role != "qkv" for h in offloader._handles)
     if offloader._runner is not None:
         offloader._runner.close()
@@ -361,8 +361,8 @@ def test_wo_output_split_uses_qkv_head_granularity() -> None:
 
 @pytest.mark.parametrize(
     "f_cpu_store",
-    [0.25, 0.50, 0.75],
-    ids=["fcpu_025", "fcpu_050", "fcpu_075"],
+    [0.50, 0.75],
+    ids=["fcpu_050", "fcpu_075"],
 )
 def test_wo_native_matches_python(f_cpu_store: float) -> None:
     """WO uses the generic output-split linear path, but its native slab
@@ -391,19 +391,20 @@ def test_wo_native_matches_python(f_cpu_store: float) -> None:
 
 @pytest.mark.parametrize(
     "f_cpu_store",
-    [0.10, 0.50],
-    ids=["fcpu_010", "fcpu_050"],
+    [0.25, 0.50],
+    ids=["fcpu_025", "fcpu_050"],
 )
-def test_no_streamer_native_forward_succeeds(f_cpu_store: float) -> None:
-    """At f_prefetch=0 the streamer is None, but final native COTS still
-    runs once the production OOG dispatch boundary has published the
-    active bucket."""
+def test_zero_prefetch_native_forward_succeeds(f_cpu_store: float) -> None:
+    """At f_prefetch=0 the active route has no prefetched rows, but final
+    native COTS still runs once the production OOG dispatch boundary has
+    published the active bucket."""
     torch.manual_seed(7)
     x = torch.randn(MAX_NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device="cuda")
     _, off, _ = _build_qkv(
         f_cpu_store=f_cpu_store, f_prefetch=0.0, cpu_runner="native"
     )
-    assert off._streamer is None  # f_prefetch=0
+    bucket = off._dispatch_buckets[0]
+    assert all(h.n_prefetch_by_bucket[bucket] == 0 for h in off._handles)
     assert off._current_bucket is None
     _dispatch(off)
     out, _ = off._layer_modules[0].qkv_proj(x)

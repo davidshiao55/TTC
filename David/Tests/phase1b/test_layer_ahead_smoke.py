@@ -2,9 +2,9 @@
 
 End-to-end forward pass through a 2-layer mini stub. Two assertions:
 
-  1. **Regression sentinel** — at `f_prefetch=0`, the Phase 1b path is
-     bit-identical to Phase 1a. Same `f_cpu_store`, no streamer / pool
-     / hooks → identical numerics.
+  1. **Regression sentinel** — at `f_prefetch=0`, the active route has no
+     prefetched rows and remains bit-identical to Phase 1a at the same
+     `f_cpu_store`.
 
   2. **Phase 1b parity** — at `f_prefetch>0`, the layer-ahead path
      produces output matching the unsplit reference within BF16

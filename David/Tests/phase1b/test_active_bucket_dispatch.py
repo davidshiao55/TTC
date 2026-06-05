@@ -235,7 +235,7 @@ def _setup_synthetic(n_layers=N_LAYERS, table=None, n_cpu=64):
     pool + transposed row source. Returns (layer_handles, streamer).
     """
     if table is None:
-        table = {1: (0.20, 0.10), 64: (0.20, 0.20)}
+        table = {1: (0.0, 0.20), 64: (0.0, 0.20)}
     layer_handles: list[list[CotsLinearHandle]] = []
     flat: list[CotsLinearHandle] = []
     for i in range(n_layers):
@@ -274,7 +274,7 @@ def test_prepare_before_forward_fills_only_layer0_for_active_bucket():
 
     _dispatch(offloader)
     offloader._streamer.copy_stream.synchronize()
-    bucket = offloader._bucket_for(MAX_NUM_TOKENS)
+    bucket = offloader._dispatch_bucket_for(MAX_NUM_TOKENS)
 
     for idx, _ in enumerate(offloader._layer_handles):
         if idx > 1:
@@ -312,7 +312,7 @@ def test_layer0_precompute_hook_starts_layer1_prefetch():
 
     layers, offloader = _build(f_cpu_store=0.20, f_prefetch=0.05)
     assert len(layers) > 1
-    bucket = offloader._bucket_for(MAX_NUM_TOKENS)
+    bucket = offloader._dispatch_bucket_for(MAX_NUM_TOKENS)
 
     for h in offloader._layer_handles[1]:
         if h.max_n_prefetch > 0:
@@ -386,8 +386,8 @@ def test_owner_mismatch_raises():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
-    # f_prefetch=0.20 ensures qkv max_n_prefetch > 0 even after the
-    # head-alignment snap at this small mini-stub geometry.
+    # f_prefetch=0.20 ensures qkv has active prefetched rows after snapping at
+    # this small mini-stub geometry.
     layers, offloader = _build(f_cpu_store=0.30, f_prefetch=0.20)
     streamer = offloader._streamer
     assert streamer is not None
@@ -419,7 +419,7 @@ def test_available_less_than_required_copies_suffix():
     # Two buckets with DIFFERENT n_prefetch; need that to exercise
     # avail < required. Phase 1b uniform fill doesn't normally produce
     # this; we hand-craft a per-bucket dispatch table here.
-    table = {1: (0.20, 0.05), 64: (0.20, 0.20)}
+    table = {1: (0.10, 0.10), 64: (0.0, 0.20)}
     layer_handles, streamer = _setup_synthetic(table=table, n_cpu=192)
     h = layer_handles[0][0]  # MLP gate/up handle
     assert h.n_prefetch_by_bucket[1] < h.n_prefetch_by_bucket[64]
@@ -457,7 +457,7 @@ def test_available_greater_than_required_consumes_only_active():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
-    table = {1: (0.20, 0.05), 64: (0.20, 0.20)}
+    table = {1: (0.10, 0.10), 64: (0.0, 0.20)}
     layer_handles, streamer = _setup_synthetic(table=table)
     h_col = layer_handles[0][0]
     h_row = layer_handles[0][1]
@@ -519,7 +519,7 @@ def test_gate_up_active_bucket_fill_layout():
         h for h in offloader._layer_handles[0]
         if h.role == MLP_GATE_UP_ROLE and h.max_n_prefetch > 0
     )
-    bucket = offloader._bucket_for(MAX_NUM_TOKENS)
+    bucket = offloader._dispatch_bucket_for(MAX_NUM_TOKENS)
     active_half = h.n_prefetch_by_bucket[bucket] // 2
     n_cpu_per_half_total = h.n_cpu // 2
     slot = h.w_prefetch_slots[h.slot_idx]

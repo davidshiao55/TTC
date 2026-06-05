@@ -169,7 +169,8 @@ headroom instead of invisible extra allocation.
 MLP granularity is the final production granularity:
 
 - Gate/up half channels and down input channels snap to multiples of `64`.
-- The snap applies to both `f_cpu_store` and bucket-level `f_prefetch`.
+- Load-time storage snaps `f_cpu_store`; runtime dispatch snaps
+  `f_cpu_compute` and assigns the remaining CPU-stored rows to prefetch.
 - There is no hard `128` minimum.
 - The reason is empirical: arbitrary narrow MLP shapes such as ~96 channels hit
   bad GEMM shapes; 64-channel multiples avoided the cliff while keeping enough
@@ -186,7 +187,7 @@ spend small CPU-compute budgets on MLP first.
 For each bucket and each offloaded module:
 
 ```text
-f_cpu_compute + f_prefetch <= f_cpu_store
+f_cpu_compute + f_prefetch = f_cpu_store
 ```
 
 Runtime geometry is computed once from the dispatch table:

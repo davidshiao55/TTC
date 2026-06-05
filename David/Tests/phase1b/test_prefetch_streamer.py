@@ -84,7 +84,7 @@ def _setup_layers(n_layers=4, table=None):
     table to populate per-bucket geometry, and allocate a buffer pool.
     Returns (layer_handles, streamer)."""
     if table is None:
-        table = {1: (0.20, 0.20)}
+        table = {1: (0.0, 0.20)}
 
     layer_handles: list[list[CotsLinearHandle]] = []
     flat_handles: list[CotsLinearHandle] = []
@@ -113,7 +113,7 @@ def test_start_h2d_copies_correct_bytes():
       mlp_down    : slot[:n, :] == w_cpu[:n, :]
                     (Stage 7-C unified transposed source)
     """
-    layers, streamer = _setup_layers(n_layers=4, table={1: (0.20, 0.20)})
+    layers, streamer = _setup_layers(n_layers=4, table={1: (0.0, 0.20)})
 
     torch.manual_seed(0)
     for handles in layers:
@@ -221,7 +221,7 @@ def test_consecutive_layer_starts_use_distinct_slots():
 
 def test_set_current_bucket_drives_h2d_size():
     """At a smaller bucket, less is copied — narrow is per-bucket."""
-    table = {1: (0.05, 0.05), 64: (0.20, 0.20)}
+    table = {1: (0.20, 0.0), 64: (0.0, 0.20)}
     layers, streamer = _setup_layers(n_layers=4, table=table)
     h = layers[0][0]
     assert h.n_prefetch_by_bucket[1] < h.n_prefetch_by_bucket[64]
@@ -247,7 +247,7 @@ def test_available_rows_records_active_bucket():
     the per-half row count for MLP gate/up handles or the total prefix row
     count for input/output-split handles. Initialized to 0; only the targeted
     slot is touched."""
-    table = {1: (0.05, 0.05), 64: (0.20, 0.20)}
+    table = {1: (0.20, 0.0), 64: (0.0, 0.20)}
     layers, streamer = _setup_layers(n_layers=4, table=table)
     h = layers[0][0]  # MLP gate/up handle
     # Slots initialize with available_rows == 0 for all K slots.
@@ -271,7 +271,7 @@ def test_available_rows_preserved_across_no_op_start():
     bucket's compute shape regardless; this test only asserts the
     bookkeeping survives."""
     # Two buckets: A=64 has n_prefetch>0, B=1 has n_prefetch=0.
-    table = {1: (0.20, 0.0), 64: (0.20, 0.20)}
+    table = {1: (0.20, 0.0), 64: (0.0, 0.20)}
     layers, streamer = _setup_layers(n_layers=4, table=table)
     h = layers[0][0]
     assert h.n_prefetch_by_bucket[1] == 0

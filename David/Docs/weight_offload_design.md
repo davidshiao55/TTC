@@ -24,7 +24,7 @@ Before describing the three-way split, an important distinction: this thesis sep
 
 The same `W_cpu` bytes feed both the prefetch path and the CPU-compute path at different times in different buckets. Nothing moves between storage tiers at runtime.
 
-Per bucket, the Planner's dispatch table specifies `(f_cpu_compute, f_prefetch_compute)` under the invariant `f_cpu_compute + f_prefetch_compute ≤ f_cpu_store`. See `planner_design.md` for how this table is produced.
+Per bucket, the Planner's dispatch table specifies `(f_cpu_compute, f_prefetch_compute)` under the invariant `f_cpu_compute + f_prefetch_compute = f_cpu_store`. Runtime snaps the CPU-compute side down to legal tensor geometry and assigns the remaining CPU-stored rows to prefetch. See `planner_design.md` for how this table is produced.
 
 ---
 
@@ -338,7 +338,7 @@ All three granularities can use f_cpu to compute on CPU in parallel. But finer g
 
 *This is a Planner concern, not a runtime guard.*
 
-WQKV's CPU-stored output columns are laid out by the K/V-biased picker as `[Q_tail | K | V]` — K/V groups are assigned to CPU storage first, Q columns last. The runtime applies the dispatch table verbatim across all enabled sub-modules (WQKV / MLP1 / MLP2, and optional WO): prefetch consumes the contiguous prefix of cpu_indices, CPU compute takes the residual.
+WQKV's CPU-stored output columns are laid out by the K/V-biased picker as `[Q_tail | K | V]` — K/V groups are assigned to CPU storage first, Q columns last. The runtime applies one dispatch row across all enabled sub-modules: CPU compute is snapped down to each module's legal quantum, and prefetch consumes the remaining contiguous prefix of `cpu_indices`.
 
 **K/V round-trip cost belongs in the Planner's objective.** If the per-bucket `f_cpu_compute` lands below the K/V fraction (the K/V portion of out_dim, e.g. ~22% of WQKV at Qwen2.5-7B), the residual K/V columns flow through the prefetch path: weight H2D to GPU, K/V computed on GPU, K/V output D2H back to the CPU suffix cache (Phase 2). That's a PCIe round-trip the Planner can avoid by biasing the WQKV-bucket cost model toward `f_cpu_compute ≥ K/V fraction`. See `planner_design.md §7.3`.
 

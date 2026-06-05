@@ -191,11 +191,11 @@ def _prime_prefetch(offloader):
 
 
 def test_mlp_counts_snap_to_64_channel_grid():
-    """MLP store/prefetch counts use the profiled 64-channel snap grid.
+    """MLP store/runtime counts use the profiled 64-channel snap grid.
 
     For this test model, raw f_cpu_store=0.20 requests ~205 channels and
-    raw f_prefetch=0.10 requests ~102 channels. They should snap to 192 and
-    128, respectively, for both the gate/up half and matched down input.
+    raw f_cpu_compute=0.10 requests ~102 channels. Storage snaps to 192,
+    CPU compute snaps to 64, and the remaining 128 rows per MLP half prefetch.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -250,15 +250,22 @@ def test_mlp_three_way_matches_unsplit(f_cpu_store, f_prefetch):
     torch.testing.assert_close(out, ref, rtol=BF16_RTOL, atol=atol)
 
 
-def test_mlp_phase1a_regression_at_zero_prefetch():
-    """Sentinel: f_prefetch=0 → behaves identically to Phase 1a (no
-    streamer / pool / hooks allocated)."""
+def test_mlp_zero_prefetch_has_no_active_prefetch_rows():
+    """Sentinel: f_prefetch=0 leaves no active prefetch work.
+
+    The production option-A accounting may still reserve the prefetch pool
+    capacity for planner/runtime accounting; this test cares about the active
+    per-bucket route.
+    """
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
     _, offloader, _, _, _ = _build_mlp(f_cpu_store=0.25, f_prefetch=0.0)
-    assert offloader._streamer is None
-    assert offloader._prefetch_buffer_pool is None
+    bucket = offloader._dispatch_buckets[0]
+    assert all(h.n_prefetch_by_bucket[bucket] == 0 for h in offloader._handles)
+    assert all(
+        h.n_cpu_compute_by_bucket[bucket] == h.n_cpu for h in offloader._handles
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +274,8 @@ def test_mlp_phase1a_regression_at_zero_prefetch():
 @pytest.mark.parametrize(
     "f_cpu_store,f_prefetch",
     [
-        # f_cpu_store at K/V boundary — n_q_tail=0, prefetch consumes K/V.
+        # f_cpu_store at K/V boundary — n_q_tail=0, prefetch consumes K/V as
+        # CPU-compute rows shrink.
         (0.25, 0.10),
         # f_cpu_store > K/V — n_q_tail > 0, prefetch consumes Q-tail then K/V.
         (0.50, 0.10),
@@ -294,9 +302,9 @@ def test_qkv_three_way_matches_unsplit(f_cpu_store, f_prefetch):
 # ---------------------------------------------------------------------------
 def test_pure_prefetch_zero_cpu_compute_no_residual_qkv():
     """At `f_cpu_store == f_prefetch`, QKV's `n_cpu_compute` must be exactly
-    0 — no residual rows from head-aligned snapping. Repro for Codex
-    Finding 1: raw prefetch count < snapped `n_cpu` left a few rows on the CPU
-    compute path."""
+    0 — no residual rows from snapped CPU-compute geometry. Repro for Codex
+    Finding 1: independent prefetch snapping could leave a few rows on the
+    CPU-compute path."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
@@ -543,7 +551,8 @@ def test_factory_prefetch_installs_machinery_even_with_config_zero():
     with set_current_vllm_config(vc):
         layer = _MlpLayer().cuda()
         # Config: f_cpu_store=0.50, f_prefetch=0.0 (manual fallback says
-        # "no prefetch"). Factory: emit f_prefetch=0.20 per bucket.
+        # "no prefetch"). Factory lowers CPU compute so each bucket gets a
+        # prefetch remainder.
         offloader = CotsOffloader(
             config=CotsOffloadConfig(
                 f_cpu_store=0.50, f_prefetch=0.0,

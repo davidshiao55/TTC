@@ -7,9 +7,9 @@ Exercises the full Phase 1b path on a 2-layer mini stub:
   3. A forward pass through the layer chain triggers wait_prefetch /
      start_prefetch hooks, which delegate to the streamer's H2D + sync.
 
-Phase 1a test_offloader_integration covers `f_prefetch=0`; this file
-verifies the Phase 1b additions: streamer allocated, hooks installed,
-slot indices stamped, multi-layer prefetch chain works.
+This file verifies the Phase 1b additions: option-A streamer allocation, hook
+installation, slot indices, active zero-prefetch routes, and the multi-layer
+prefetch chain.
 """
 
 from collections import Counter

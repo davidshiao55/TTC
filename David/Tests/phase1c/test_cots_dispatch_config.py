@@ -50,6 +50,14 @@ def test_cots_dispatch_table_rejects_entries_above_storage_fraction():
         )
 
 
+def test_cots_dispatch_table_rejects_incomplete_partition():
+    with pytest.raises(ValueError, match="entry must sum to f_cpu_store"):
+        CotsOffloadConfig(
+            f_cpu_store=0.10,
+            dispatch_table={64: (0.04, 0.04)},
+        )
+
+
 def test_cots_dispatch_table_factory_requires_all_dispatch_buckets():
     cots = CotsOffloadConfig(
         f_cpu_store=0.10,

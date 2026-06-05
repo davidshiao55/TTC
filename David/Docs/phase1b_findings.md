@@ -14,14 +14,16 @@ Phase 1b turned the static Phase 1a CPU-compute split into a three-way dispatch:
 GPU permanent slice + GPU-prefetched slice + CPU-computed slice
 ```
 
-The per-bucket invariant is:
+The production per-bucket invariant is:
 
 ```text
-f_cpu_compute + f_prefetch <= f_cpu_store
+f_cpu_compute + f_prefetch = f_cpu_store
 ```
 
-This is the final Planner-facing abstraction. Storage is static at engine load;
-dispatch is per bucket.
+Early Phase 1b notes allowed `<=`, but the final Planner-facing abstraction uses
+equality. Storage is static at engine load; dispatch is per bucket. Runtime
+snapping floors the CPU-compute side to legal module geometry and assigns the
+remaining CPU-stored rows to prefetch.
 
 ## Production Pieces That Survived
 
