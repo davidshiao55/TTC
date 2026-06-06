@@ -7,20 +7,9 @@
 **Workload**: Test-time compute (TTC) inference — beam search, tree search, best-of-N sampling.
 **Computing Platform**: Consumer GPU (NVIDIA RTX 4090, 24 GB GDDR6X)
 
-**Existing Methods**: Locality-Aware Beam Scheduling, FastTTS — these optimize KV-cache handling (movement, scheduling, reuse), but assume model weights and KV cache of current computing batch stay GPU-resident throughout inference.
+**Existing Methods**: Locality-Aware Beam Scheduling, FastTTS — these improve TTC scheduling and runtime efficiency, but they assume model weights stay GPU-resident throughout inference. That limits the deployment of larger models on a consumer GPU.
 
-**Limitations**:
-- **Model size**: Max model size ≤ VRAM.
-- **Batch size / throughput**: With GPU-resident weights, batch size is bounded by leftover GPU VRAM, so throughput is fundamentally constrained.
-
-**Objective**: Maximize utilization of all resources (GPU compute/memory, CPU compute/memory, PCIe bandwidth) to achieve maximum TTC throughput.
-
-| Resource | Capacity | Used in GPU-only inference? |
-|---|---|---|
-| GPU memory bandwidth | 1,008 GB/s | Yes (primary) |
-| CPU memory bandwidth | ~80 GB/s DDR5 | **Idle** |
-| PCIe 4.0 x16 | ~22 GB/s per direction | **Idle** |
-| System RAM | 32–128 GB | **Idle** |
+**Objective**: Use the full local system — GPU compute/memory, CPU compute/memory, and PCIe bandwidth — to run larger TTC model pairs efficiently on a consumer GPU.
 
 ---
 
@@ -34,7 +23,7 @@ Rather than relying on ever-larger pretraining budgets, test-time methods use dy
 - Beam search
 - Diverse verifier tree search (DVTS)
 
-However, the new computing paradigm also introduce new challenge for edge deployment.
+However, this new computing paradigm also introduces new challenges for edge deployment.
 
 
 ### Edge Deployment for TTC
@@ -43,52 +32,36 @@ Existing work has attempted to improve test-time scaling at the edge through:
 
 - speculative execution
 - request scheduling
-- kv cache offloading
+- memory offloading
 - memory partitioning
 
-But they assume model weights and active KV cache (i.e. the KV cache of the current computing batch) stay GPU-resident throughout inference.
+But these systems still tend to assume that model weights stay GPU-resident throughout inference. That assumption limits deployable model size on a consumer GPU.
 
 #### Model Size Limitation
 
 A consumer GPU like the RTX 4090 has only 24 GB of memory, which can fit models under ~12B parameters. TTC pipelines typically require two models (a generator and a verifier), further limiting deployable model size.
 
-#### Throughput Limitation
-
-With vLLM's continuous batching, maximum batch size is constrained by GPU memory available for KV cache. FastTTS submits all beams in one `generate()` call; vLLM's scheduler (`scheduler.py:541`) allocates KV blocks per request and processes excess beams round by round:
-
-```
-wall_time ≈ ⌈total_beams / batch_capacity⌉ × time_per_step
-```
 
 ### Challenges
 
-The standard mechanisms for enabling larger models and higher throughput on a single device — **weight offloading** and **attention offloading** — do not transfer directly to TTC.
+#### Multiple Reasoning Path Throughput
 
-#### Existing Weight Offloading Methods
+Previous local LLM inference work usually optimizes a single stream: a request produces one sequence, and latency is the only concern.
 
-Existing edge weight offloading methods typically target online interactive serving — small batches, low-frequency requests, with per-token latency as the binding constraint — and do not exploit the multi-path parallelism that TTC produces.
+TTC changes the workload shape. One request expands into many candidate reasoning paths. To keep end-to-end latency low, the system needs enough throughput to advance these paths efficiently.
 
-While there are also methods aimed at offline batch inference that exploit large batches at the cost of latency, they fit TTC no better: TTC is still a single-request workload — its batch comes from multi-path exploration, not independent requests — so end-to-end latency remains the user-facing metric.
+In modern LLM serving, batching throughput is largely determined by how many active sequences the KV cache can hold. This makes TTC offloading harder than standard weight offloading: instead of focusing only on weight placement, the system has to decide how memory is split between weights and KV.
 
-#### Existing Attention Offloading Methods
+#### Two Asymmetric Models
 
-Existing attention offloading methods assume the model fits in GPU memory and overlap CPU/GPU compute by splitting the batch in two. This does not transfer to TTC:
+A TTC pipeline requires a generator and a verifier to be resident simultaneously, doubling the resource pools that must be budgeted: model weights and KV state.
+The two models also have different compute patterns, which further amplifies the variation already present in standard inference. Three concurrent axes contribute:
 
-1. Batch splitting conflicts with our goal of maximizing batch size.
-2. Once weights are partitioned across CPU and GPU, every sub-module already engages both devices concurrently — a batch-split scheme on top is strictly inferior.
+- **Intra-request** — prefill vs. decode within a single request.
+- **Inter-request** — continuous batching mixes prefill and decode tokens across requests.
+- **Inter-model** — generator runs autoregressive decode (one token per beam); verifier runs step scoring (many tokens per step).
 
-#### The TTC Workload
-
-TTC compounds the offloading problem in two ways:
-
-1. **Two models, not one.** A TTC pipeline requires a generator and a verifier to be resident simultaneously, doubling the resources — model weights and KV pools — that must be partitioned across CPU, GPU, and PCIe.
-2. **Complex computing pattern.** 
-Computing pattern are already diverse in standard inference; TTC amplifies this further. Three concurrent axes contribute:
-   - **Intra-request** — prefill vs. decode within a single request.
-   - **Inter-request** — continuous batching mixes prefill and decode tokens across requests.
-   - **Inter-model** — generator runs autoregressive decode (one token per beam); verifier runs step scoring (many tokens per step).
-
-   Each axis produces forward calls with different arithmetic intensity, and therefore different optimal CPU/GPU/PCIe splits. A single static configuration cannot cover them.
+Each axis produces forward calls with different arithmetic intensity, and therefore different optimal CPU/GPU/PCIe splits. A single static configuration cannot cover the full TTC workload well.
 
 ---
 
@@ -124,11 +97,11 @@ Each component writes data the next one reads; runtime never changes the plan.
 
 ### 3.2 Offloading Strategy
 
-Transformer inference is fundamentally sequential — each layer feeds the next, and within a layer each sub-module (WQKV → attention → WO → MLP1 → MLP2) feeds the next. There are no independent branches that could be naively scheduled onto separate devices. For GPU + CPU + PCIe to run concurrently, each sequential operation must be split internally.
+Prior weight-offloading strategies mainly target model fit under single-stream latency constraints: keep as many weights as possible on GPU, and use CPU memory as overflow storage for the rest. That is enough when offloading is primarily a memory-capacity problem. TTC breaks this assumption. It is compute-intensive and jointly weight/KV-memory-intensive, so sustaining this workload requires using all available resources in a consumer system. COTS therefore partitions all computation three ways so GPU compute, CPU compute, and PCIe bandwidth all contribute to each forward pass.
 
 Three fundamental partitions follow:
 
-**Weight computation: 3-way split.** Every matmul sub-module (WQKV, WO, MLP1, MLP2) has three concurrent computation paths so that GPU compute, CPU compute, and PCIe can all contribute to the same operation:
+**Weight computation: 3-way split.** Every production matmul sub-module (WQKV, WO, MLP1, MLP2) has three concurrent computation paths so that GPU compute, CPU compute, and PCIe can all contribute to the same operation:
 
 - GPU path — weights resident on GPU, computed on GPU
 - Prefetch path — weights streamed CPU→GPU on demand, computed on GPU
@@ -136,7 +109,7 @@ Three fundamental partitions follow:
 
 A 2-way split (no prefetch) leaves PCIe idle. A pure-prefetch split wastes CPU compute. 3-way is the minimum that engages all three resources concurrently.
 
-The split axis is **per-sub-module**, chosen to match vLLM's tensor-parallel conventions so the same mechanism applies across the device boundary as it does across GPU ranks: **WQKV and MLP1 are column-parallel** (shard the output dim); **MLP2 is row-parallel** (shard the input dim). The col→row pairing between MLP1 and MLP2 keeps the intermediate activation device-local automatically — under the Planner's uniform per-bucket `(f_cpu, f_prefetch)` applied to both, MLP1's CPU output-column set matches MLP2's CPU input-column set by construction, so each device holds its own intermediate slice and SwiGLU runs locally. **WO is not offloaded in Phase 1/2** — fully GPU-resident (see `weight_offload_design.md §WO Split Axis Decision`). For **WQKV**, columns are assigned K/V-biased (KV-head groups placed on the CPU slice before Q heads), aligning weight offload with attention offload: the new K/V produced by the CPU slice lands directly on the CPU side where the suffix cache lives, and PCIe H2D (reserved for weight prefetch) is not competed for. For the other sub-modules, any slice within the chosen axis is mathematically equivalent. See `weight_offload_design.md`.
+The split axis is **per-sub-module**, chosen to match vLLM's tensor-parallel conventions so the same mechanism applies across the device boundary as it does across GPU ranks: **WQKV, WO, and MLP1 are column-parallel** (shard the output dim); **MLP2 is row-parallel** (shard the input dim). The col→row pairing between MLP1 and MLP2 keeps the intermediate activation device-local automatically — under the Planner's uniform per-bucket `(f_cpu, f_prefetch)` applied to both, MLP1's CPU output-column set matches MLP2's CPU input-column set by construction, so each device holds its own intermediate slice and SwiGLU runs locally. **WO uses the same production dispatch policy as the rest of the module set**, but with a coarser dense-output snap quantum so tiny WO slices do not pay a fixed sync/activation-return cliff. For **WQKV**, columns are assigned K/V-biased (KV-head groups placed on the CPU slice before Q heads), aligning weight offload with attention offload: the new K/V produced by the CPU slice lands directly on the CPU side where the suffix cache lives, and PCIe H2D (reserved for weight prefetch) is not competed for. For the other sub-modules, any slice within the chosen axis is mathematically equivalent. See `weight_offload_design.md`.
 
 **Attention (KV cache): 2-way split.** KV partitions naturally by sharing pattern, enabling prefix and suffix attention to run concurrently on different devices:
 
@@ -185,9 +158,9 @@ runtime surface minimal.
 
 The Planner's output structure follows directly from *when* each decision is best made.
 
-**Storage (load-time).** The fraction of each model's weights on CPU (`f_cpu_store_m`) and the per-tier KV pool sizes (`KV_gpu_bytes_m`, `KV_cpu_bytes_m`) set VRAM/RAM allocations for the entire serving session. Changing them at runtime would trigger reallocation stalls and cache thrashing, so they are decided once at engine launch. `f_cpu_store_m` is a single scalar applied uniformly to WQKV, MLP1, and MLP2 (WO is fully GPU-resident in Phase 1/2).
+**Storage (load-time).** The fraction of each model's weights on CPU (`f_cpu_store_m`) and the per-tier KV pool sizes (`KV_gpu_bytes_m`, `KV_cpu_bytes_m`) set VRAM/RAM allocations for the entire serving session. Changing them at runtime would trigger reallocation stalls and cache thrashing, so they are decided once at engine launch. `f_cpu_store_m` is a single scalar applied uniformly to the production module set: WQKV, WO, MLP1, and MLP2.
 
-**Compute dispatch (pre-computed at plan time, looked up at runtime).** The compute split `(f_cpu_compute, f_prefetch_compute)` depends on the bucket's `num_tokens`, and the bucket distribution is not under our control (vLLM decides batch composition). Rather than re-solve at runtime, the Planner pre-computes the full table `(f_cpu_compute, f_prefetch_compute)[BatchDescriptor]` at plan time — a single pair per bucket, applied uniformly across WQKV/MLP1/MLP2. Runtime dispatch is a table lookup, not an optimization.
+**Compute dispatch (pre-computed at plan time, looked up at runtime).** The compute split `(f_cpu_compute, f_prefetch_compute)` depends on the bucket's `num_tokens`, and the bucket distribution is not under our control (vLLM decides batch composition). Rather than re-solve at runtime, the Planner pre-computes the full table `(f_cpu_compute, f_prefetch_compute)[BatchDescriptor]` at plan time — a single pair per bucket, applied uniformly across WQKV/WO/MLP1/MLP2. Runtime dispatch is a table lookup, not an optimization.
 
 The two levels are tied by the invariant `f_cpu_compute + f_prefetch_compute = f_cpu_store_m`: storage decides which weights are CPU-resident; dispatch decides how those bytes are used each forward — CPU-computed or streamed to GPU via the prefetch path. The matched-index invariant between MLP1 (col-parallel) and MLP2 (row-parallel) is satisfied automatically under uniform dispatch, so the intermediate activation stays device-local through the MLP block.
 
@@ -195,10 +168,10 @@ The two levels are tied by the invariant `f_cpu_compute + f_prefetch_compute = f
 
 Per model `m ∈ {generator, verifier}`:
 
-- `f_cpu_store_m ∈ [0, 1]` — single scalar applied uniformly to {WQKV, MLP1, MLP2}; WO is fixed at 0 (not offloaded in Phase 1/2)
+- `f_cpu_store_m ∈ [0, 1]` — single scalar applied uniformly to {WQKV, WO, MLP1, MLP2}; WO uses a coarser runtime snap quantum
 - `KV_gpu_bytes_m`, `KV_cpu_bytes_m` — per-tier KV pool sizes
 
-Plus a derived dispatch table: one `(f_cpu_compute, f_prefetch_compute)` pair per `BatchDescriptor` per model, applied uniformly across WQKV/MLP1/MLP2.
+Plus a derived dispatch table: one `(f_cpu_compute, f_prefetch_compute)` pair per `BatchDescriptor` per model, applied uniformly across WQKV/WO/MLP1/MLP2.
 
 ### 5.4 Constraints
 
@@ -238,16 +211,23 @@ given workload contract:
 T_TTC(plan) ≈ Σ_m N_rounds_m(plan, workload) × L_round_m(plan)
 ```
 
-Weight residency mostly changes per-round latency. KV capacity mostly changes
-the number of scheduler/admission rounds needed by the TTC workload. A plan
-wins only when the scheduling gain from freed VRAM outweighs the per-round
-latency cost of CPU compute, prefetch, and CPU suffix attention.
+Weight residency mostly changes per-round latency and model-fit feasibility.
+KV placement determines whether the multi-path workload can be admitted under
+the remaining memory budget, and secondarily how many scheduler/admission waves
+are needed. A plan wins when its memory-placement benefit — fitting a larger
+model pair, avoiding an otherwise bad weight/KV budget split, or producing a
+useful scheduling gain — outweighs the per-round latency cost of CPU compute,
+prefetch, and CPU suffix attention.
 
-The implementation uses deterministic bounded search over snapped placement
-candidates and a small snapped per-bucket dispatch search. The thesis
-contribution is the constrained performance model, not a particular continuous
-optimizer. A closed-form idle-budget dispatch heuristic can become a fast path
-after it matches the snapped reference search on the profiled bucket set. See
+The implementation follows a frontier-based hierarchy: `ModelMemoryPartitioner`
+enumerates generator/verifier budget splits, `WeightKVPartitioner` scores
+engine-local weight/KV placement candidates, and `DispatchCompiler`
+materializes the per-bucket dispatch table for the chosen placement. The
+current prototype implements the weight-placement subset and leaves final
+hybrid-KV policy selection profile-gated. The thesis contribution is the
+constrained performance model, not a particular continuous optimizer. A
+closed-form idle-budget dispatch heuristic can become a fast path after it
+matches the snapped reference search on the profiled bucket set. See
 `planner_design.md` for the full formulation.
 
 ---
@@ -304,27 +284,30 @@ The ~40× ratio is the fundamental constraint: **pure prefetch cannot hide laten
 | CUDA graph dispatcher | `cudagraph_dispatcher.py` |
 | QKVParallelLinear, MergedColumnParallelLinear | `layers/linear.py` |
 
-### 8.2 Engineering Gaps
+### 8.2 Implementation Status
 
-1. Mixed col/row weight split at tensor granularity: col-parallel for WQKV/MLP1 (partial-result concat), row-parallel for MLP2 (add-reduce), CPU matmul on both axes, with MLP1↔MLP2 index-set matching for the col→row pipelining save
-2. CPU attention kernel returning per-head LSE (for online softmax merge)
-3. `cudaLaunchHostFunc` glue for CUDA Graph + CPU task co-scheduling (Phase 1c)
-4. Per-model, per-bucket `(f_cpu_compute, f_prefetch_compute)` configuration and dispatch
-5. Profiler implementation (schema → cached tables)
-6. Planner implementation (two-stage optimization)
+The core mechanism work has largely landed in the thesis vLLM fork:
+
+1. Mixed col/row tensor-granularity weight split: WQKV/WO/MLP1 use output-column splits, MLP2 uses an input-row split, and the MLP1↔MLP2 index match keeps the intermediate activation device-local.
+2. Three-way weight dispatch: GPU-resident compute, layer-ahead prefetch-to-GPU, and native CPU compute share one per-bucket `(f_cpu_compute, f_prefetch_compute)` table.
+3. Native COTS runner: CPU work uses C++ task runners and `cudaLaunchHostFunc` submit/sync glue; the Python runner remains an eager-only diagnostic path.
+4. Hybrid KV: GPU prefix attention and CPU suffix attention run in parallel and merge via online softmax using output plus per-head LSE.
+5. FastTTS planner wiring: manual/config-driven plans and the current weight-placement prototype can emit COTS weight, dispatch, thread-policy, and hybrid-KV runtime kwargs.
+
+Remaining thesis work is primarily policy and evaluation: calibrated Profiler tables, Planner selection of weight/KV placement under realistic workload contracts, and end-to-end RTX 4090 experiments for the target model matrix.
 
 ### 8.3 CUDA Graph Integration
 
-vLLM's default `FULL_AND_PIECEWISE` mode captures per-bucket graphs. Our mechanisms integrate via `cudaLaunchHostFunc`:
+vLLM's default `FULL_AND_PIECEWISE` mode captures per-bucket graphs. COTS integrates with that policy through piecewise graph boundaries and CUDA/host handoff points:
 
-- Non-attention regions (MLP, QKV/O projections) — CPU-compute and prefetch paths captured inline.
-- Attention regions — same technique for CPU suffix attention; `merge_attn_states` on GPU joins prefix + suffix.
+- Non-attention regions (QKV/WO/MLP projections) — native COTS weight submit/sync operations become split points; graph-mode weight sync uses the `wait_kernel` path, while eager uses the host-callback path.
+- Attention regions — hybrid KV uses the normal piecewise attention boundaries; `merge_attn_states` on GPU joins prefix and suffix attention outputs.
 
-Prototype Phase 1a/1b with `enforce_eager=True`; `cudaLaunchHostFunc` retrofit is a localized swap in `CpuComputeDispatcher` (Phase 1c, gating Phase 2 per `phase1a_findings.md §1.14`).
+The current production path is native COTS with piecewise graphs. Phase 2 hybrid KV does not add Phase 1 weight split points unless weight offload is also active.
 
 ### 8.4 Roadmap
 
-See `implementation_roadmap.md`.
+See `implementation_roadmap.md`, with `phase1_findings.md` and `phase2_findings.md` as the current source of truth for landed weight and hybrid-KV behavior.
 
 ---
 
@@ -340,8 +323,8 @@ systems claim.
 | Tier | Generator | Verifier | Purpose |
 |---|---|---|---|
 | Smoke only | `Qwen/Qwen2.5-1.5B-Instruct` | `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B` | Fast correctness/debug run; not part of the main size claim. |
-| Main throughput | `Qwen/Qwen2.5-7B-Instruct` | `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B` | Tests whether offloading increases usable batch/KV enough to reduce TTC latency even when the models fit in VRAM. |
-| KV-pressure fallback | `meta-llama/Llama-3.1-8B-Instruct` | `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B` | Same broad size class as Qwen 7B, but higher KV pressure; use if Qwen 7B leaves too much VRAM headroom to show the throughput claim. |
+| Fit-model policy probe | `Qwen/Qwen2.5-7B-Instruct` | `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B` | Tests whether the Planner avoids harmful offload when the models already fit; any throughput win from extra KV capacity is secondary upside. |
+| Higher-KV-pressure probe | `meta-llama/Llama-3.1-8B-Instruct` | `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B` | Same broad size class as Qwen 7B, but higher KV pressure; use if we need a stronger stress test for joint weight/KV placement. |
 | Main capacity | `Qwen/Qwen2.5-14B-Instruct` | `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B` | First clear forced-fit / enlarged-KV regime on a 24 GB GPU. |
 | Upper stress | `Qwen/Qwen2.5-32B-Instruct` | `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-1.5B` | Stretch run for the largest-generator claim if memory, load time, and experiment budget allow it. |
 | Large-verifier secondary | `Qwen/Qwen2.5-7B-Instruct` or `Qwen/Qwen2.5-14B-Instruct` | `Skywork/Skywork-o1-Open-PRM-Qwen-2.5-7B` | Isolates whether the Planner still behaves well when the verifier also becomes a meaningful memory consumer. |
@@ -352,12 +335,12 @@ secondary axis, not a full cross product with every generator. Similarly,
 `1.5B + 1.5B` is a smoke/debug tier only; it is too small to support the thesis'
 larger-model offloading claim.
 
-For the throughput claim, run Qwen 7B first. If it shows little or no benefit,
-keep that result and then run Llama 8B as the higher-KV-pressure comparison.
-The claim should be framed as conditional on the measured pressure regime:
-offloading helps when the saved VRAM converts into fewer scheduler/admission
-rounds or larger effective TTC batches, and it can lose when the workload is
-not memory-constrained enough.
+For already-fit models, run Qwen 7B first as a policy sanity check. If it shows
+little or no benefit, keep that result and optionally run Llama 8B as the
+higher-KV-pressure comparison. The thesis claim should not require a fit-model
+speedup: offloading helps primarily when it enables a model pair or avoids a
+bad weight/KV memory split, with throughput gains treated as profile-gated
+upside when the measured pressure regime supports them.
 
 ### 9.2 Ablations
 
@@ -383,7 +366,7 @@ Attribute gains by enabling one component at a time:
 
 ### 9.5 Accuracy
 
-MATH-500 accuracy across all configurations. Expected: unchanged (mathematical exactness of col-parallel and row-parallel splits, and of the online-softmax merge).
+MATH-500 accuracy across all configurations. Expected: unchanged at the benchmark level. The col/row decompositions and online-softmax merge are mathematically equivalent to the GPU-only computation, while BF16 CPU/GPU kernel-order differences are handled through numerical-parity tests rather than exact greedy-token identity.
 
 ---
 
@@ -393,8 +376,8 @@ MATH-500 accuracy across all configurations. Expected: unchanged (mathematical e
 |---|---|
 | CPU GEMM below theoretical bandwidth | Profile measures directly; Planner adapts. |
 | CPU attention bottleneck at long contexts | Batch size clamping via Scheduler; Planner can reduce `KV_cpu_bytes` to force shorter effective suffix. |
-| Column-parallel numerical differences | Mathematically exact; unit tests assert bit-identical. |
-| CUDA Graph incompatibility with CPU compute | `cudaLaunchHostFunc` (KTransformers pattern) is graph-capturable. Prototype Phase 1a/1b with `enforce_eager=True`, retrofit in Phase 1c. |
+| Column/row split numerical differences | The decomposition is mathematically exact; tests assert numerical parity within the expected BF16 CPU/GPU tolerance. |
+| CUDA Graph incompatibility with CPU compute | Native COTS uses piecewise graphs, `cudaLaunchHostFunc` submit points, and `wait_kernel` graph sync; the Python runner remains eager-only. |
 | Planner solver runtime dominates launch | Bounded snapped candidate search; measured runtime reported. |
 
 ---
@@ -411,3 +394,5 @@ MATH-500 accuracy across all configurations. Expected: unchanged (mathematical e
 | `pcie_bandwidth_allocation_design.md` | Why 100% PCIe → weight prefetch |
 | `implementation_roadmap.md` | Phased implementation plan |
 | `phase0_findings.md` | First-iteration Profiler output on RTX 4090 + Qwen2.5-7B |
+| `phase1_findings.md` | Production COTS weight-offload path and Phase 1 results |
+| `phase2_findings.md` | Hybrid CPU/GPU KV implementation and profile-gated policy results |
